@@ -9,7 +9,7 @@ LDFLAGS=-ldflags "-X main.version=$(VERSION)"
 all: test build
 
 build:
-	$(GO) build $(GOFLAGS) $(LDFLAGS) -o bin/$(BINARY_NAME) ./cmd/s3vault
+	CGO_ENABLED=0 $(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_NAME) ./cmd/s3vault
 
 clean:
 	rm -rf bin/ coverage.out coverage.html
