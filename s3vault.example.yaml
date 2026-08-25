@@ -1,0 +1,41 @@
+log:
+  level: info
+s3:
+  region: us-east-1
+  bucket: my-bucket
+  prefix: backups
+  path_style: false
+  tls: true
+encryption:
+  mode: none
+  # CryptoPro CSP (ГОСТ): provider + SHA-1 thumbprint → S3VCTR01 header;
+  # download uses header (CRYPTOPRO_THUMBPRINT) so old objects stay decryptable after key rotation.
+  # PIN — only CRYPTOPRO_PIN in the process environment, not in this file.
+  # mode: command
+  # command:
+  #   provider: cryptopro
+  #   thumbprint: "afa43c43975fbfc700f051fd62016e1571e7e025"
+  #   encrypt: ["/usr/local/libexec/s3vault/cryptcp-encrypt"]
+  #   decrypt: ["/usr/local/libexec/s3vault/cryptcp-decrypt"]
+  #   timeout: 30m
+cache:
+  ttl: 168h
+  soft_ttl: 20s  # serve hits without S3 HEAD; then stale-while-revalidate
+  sweep_interval: 15m  # drop hard-TTL expired entries; 0 = disable
+  max_bytes: 10737418240
+server:
+  listen: "127.0.0.1:8080"
+  metrics_listen: "127.0.0.1:9090"
+  # token: set via S3VAULT_SERVER_TOKEN, not in this file
+# Client without CryptoPro/S3: send plaintext to a configured s3vault server.
+# remote:
+#   url: "https://s3vault.example:8080"
+#   rate_limit_bps: 10485760  # 10 MiB/s aggregate; 0 = unlimited
+# Auth: same S3VAULT_SERVER_TOKEN as the server.
+archive:
+  older_than: 7d
+  workers: 4
+  on_change: overwrite
+  follow_symlinks: false
+  # delete_after_upload: false
+  # delete_if_exists: false

@@ -1,0 +1,22 @@
+#!/bin/sh
+# stdin → CryptoPro cryptcp -encr → stdout
+# Recipient SHA-1: CRYPTOPRO_THUMBPRINT (preferred) or $1. Not a .cer path.
+# -der: binary CMS (default cryptcp output is base64, ~+33% size).
+set -eu
+
+CRYPTCP="${CRYPTCP:-/opt/cprocsp/bin/amd64/cryptcp}"
+thumbprint="${CRYPTOPRO_THUMBPRINT:-${1:-}}"
+thumbprint=$(printf '%s' "$thumbprint" | tr -d ' :')
+if [ -z "$thumbprint" ]; then
+	echo "set recipient SHA-1 thumbprint: CRYPTOPRO_THUMBPRINT or argv" >&2
+	exit 1
+fi
+
+umask 077
+in=$(mktemp)
+out=$(mktemp)
+trap 'rm -f "$in" "$out"' EXIT
+
+cat >"$in"
+"$CRYPTCP" -encr -der -thumbprint "$thumbprint" "$in" "$out" >&2
+cat "$out"

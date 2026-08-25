@@ -1,0 +1,26 @@
+#!/bin/sh
+# stdin (cryptcp ciphertext) → cryptcp -decr → stdout
+# Recipient SHA-1: CRYPTOPRO_THUMBPRINT (preferred; set by s3vault from object metadata) or $1.
+# Container PIN: CRYPTOPRO_PIN (optional). Never pass the PIN as wrapper argv.
+set -eu
+
+CRYPTCP="${CRYPTCP:-/opt/cprocsp/bin/amd64/cryptcp}"
+thumbprint="${CRYPTOPRO_THUMBPRINT:-${1:-}}"
+thumbprint=$(printf '%s' "$thumbprint" | tr -d ' :')
+if [ -z "$thumbprint" ]; then
+	echo "set recipient SHA-1 thumbprint: CRYPTOPRO_THUMBPRINT or argv" >&2
+	exit 1
+fi
+
+umask 077
+in=$(mktemp)
+out=$(mktemp)
+trap 'rm -f "$in" "$out"' EXIT
+
+cat >"$in"
+if [ -n "${CRYPTOPRO_PIN:-}" ]; then
+	"$CRYPTCP" -decr -nochain -thumbprint "$thumbprint" -pin "$CRYPTOPRO_PIN" "$in" "$out" >&2
+else
+	"$CRYPTCP" -decr -nochain -thumbprint "$thumbprint" "$in" "$out" >&2
+fi
+cat "$out"

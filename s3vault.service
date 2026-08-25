@@ -1,0 +1,41 @@
+# /etc/systemd/system/s3vault.service
+[Unit]
+Description=s3vault
+After=network.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+ExecStart=/opt/s3vault/s3vault server
+ExecReload=/bin/kill -SIGUSR1 $MAINPID
+Restart=always
+RestartSec=5
+
+EnvironmentFile=/opt/s3vault/.env
+
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+# Limits
+MemoryHigh=192M
+MemoryMax=256M
+LimitNOFILE=1048576
+Environment=GOMAXPROCS=2
+
+# Безопасность
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+ReadWritePaths=/tmp /opt/s3vault/tmp
+WorkingDirectory=/opt/s3vault
+
+SyslogIdentifier=s3vault
+
+[Install]
+WantedBy=multi-user.target
