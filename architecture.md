@@ -40,9 +40,12 @@ CLI (cobra) ──► ArchiveService ──► (optional) RemoteIngest HTTP PUT
                               PlaintextCache (disk)
 
 HTTP PUT /files ──► ArchiveService (same encrypt + Put as upload)
+S3 API (SigV4) ──► same Fetch/Archive via S3Identity
 ```
 
 Interfaces live in `internal/port` (multiple consumers). Adapters return concrete types. Compile-time checks: `var _ port.Scanner = (*scanner.FS)(nil)`.
+
+`ObjectStore` includes `Head`/`Put`/`Get`/`GetRange`/`Delete`/`List`. Frontend S3 auth uses `port.S3Identity` (`Lookup`, `Allow`).
 
 ## Layout
 
@@ -60,7 +63,9 @@ Interfaces live in `internal/port` (multiple consumers). Adapters return concret
 | `internal/adapter/remote` | HTTP client for remote ingest (`PUT /files/...`) |
 | `internal/adapter/cache` | Disk plaintext cache (`os.Root`, lockfile, LRU) |
 | `internal/httpserver` | Loopback HTTP, Range via cached plaintext, PUT ingest |
-| `internal/metrics` | Prometheus collectors (files, bytes, transfer histograms, cache, HTTP) |
+| `internal/s3api` | Path-style S3 SigV4 facade (Get/Put/Delete/List + Head) over Fetch/Archive |
+| `internal/adapter/s3auth` | Static `S3Identity` (access/secret → principal / Allow bucket) |
+| `internal/metrics` | Prometheus collectors (files, bytes, transfer histograms, cache, HTTP, S3) |
 | `internal/keying` | Local path → object key |
 | `internal/period` | `7d` / `24h` / `1w` parser |
 | `internal/identity` | Skip / overwrite / fail from HEAD metadata or S3VCTR01 Range |
@@ -82,6 +87,8 @@ type ObjectStore interface {
     Put(ctx context.Context, key string, r io.Reader, meta domain.PutMeta) error
     Get(ctx context.Context, key string) (io.ReadCloser, domain.ObjectMeta, error)
     GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error)
+    Delete(ctx context.Context, key string) error
+    List(ctx context.Context, opts domain.ListOptions) (domain.ListPage, error)
 }
 
 type Encryptor interface {
@@ -273,7 +280,7 @@ Store **decrypted** files on disk.
 
 ## HTTP server
 
-Listen `127.0.0.1:8080` by default. Empty bearer token + non-loopback listen → refuse to start.
+Listen `127.0.0.1:8080` by default. Empty bearer token + non-loopback listen → refuse to start unless S3 frontend credentials are set (multiplexed S3 API).
 
 - `GET`/`HEAD /files/{path...}` — same keying as upload; max path 2048.
 - `PUT /files/{path...}` — ingest plaintext: spool temp (`0600`) while hashing SHA-256 → same Archive identity/encrypt/Put as CLI `upload` (precomputed hash, no second hash pass). Status: `201` uploaded, `200` identical skip, `204` policy omit (`on_change=skip` with different content), `409` on_change=fail conflict. Optional header `X-S3Vault-Mtime` (RFC3339). Requires Archive wired into the server (always on `s3vault server`).
@@ -283,6 +290,17 @@ Listen `127.0.0.1:8080` by default. Empty bearer token + non-loopback listen →
 - v1 Range is on **plaintext cache only**. First miss fully decrypts into cache. Seekable ciphertext decrypt is a follow-up (chunk index already supports it).
 
 Graceful `Shutdown` on SIGTERM.
+
+### S3 API gateway (SigV4 plaintext facade)
+
+Optional path-style S3 API for standard clients (`aws-cli`, SDKs). Enabled when `server.s3_access_key` and `server.s3_secret_key` are set (prefer env `S3VAULT_SERVER_S3_*`).
+
+- **Semantics:** same as `/files` — Put encrypts into backend; Get/Head decrypt into plaintext cache via `Fetch.Materialize` (soft-TTL / SWR: no backend call on fresh hit).
+- **Auth:** AWS SigV4 via `amwolff/awsig`; credentials resolved through `port.S3Identity` (`Lookup` + `Allow`). v1 adapter is static single principal + one virtual bucket (`server.s3_bucket`, default `s3.bucket`). Optional `server.s3_bucket_as_prefix`: any client bucket is allowed and prepended to the object key under backend `s3.bucket` / `s3.prefix` (`s3://reports/a.log` → `{prefix}/reports/a.log`). Future: multi-key / bucket bindings without changing handlers.
+- **Listen:** `server.s3_listen` empty → multiplex on `server.listen` (reserved first segments `health`, `ready`, `files` stay on HTTP Bearer API). Non-empty → dedicated listener (+ `/health` without auth).
+- **Ops:** GetObject, PutObject, DeleteObject, ListObjectsV2, HeadObject, HeadBucket, ListBuckets. No multipart / CreateBucket / virtual-host in v1.
+- **Metrics:** existing HTTP instrumentation plus `s3vault_s3_requests_total{op,result}` (low cardinality).
+- Frontend S3 keys are **not** backend `s3.access_key`.
 
 ### Remote archive client
 
@@ -300,6 +318,7 @@ Prometheus (low cardinality — no full path labels) on `metrics_listen` (server
 - `s3vault_download_duration_seconds`, `s3vault_download_size_bytes` (S3 Get+decrypt, not cache hits)
 - `s3vault_cache_hits_total`, `s3vault_cache_misses_total`, `s3vault_cache_entries`, `s3vault_cache_bytes`
 - `s3vault_http_request_duration_seconds`, `s3vault_http_requests_total`, `s3vault_http_requests_in_flight`, `s3vault_http_response_size_bytes` (`code`, `method` only)
+- `s3vault_s3_requests_total{op,result}` — S3 API ops (`get`, `put`, `delete`, `list`, `head`, …)
 - Go/process collectors on `s3vault server`
 
 ## Security constraints
@@ -315,6 +334,7 @@ Prometheus (low cardinality — no full path labels) on `metrics_listen` (server
 | Library | Why | Not chosen |
 | --- | --- | --- |
 | aws-sdk-go-v2 + s3 + manager | Retry, multipart, custom endpoint | minio-go |
+| amwolff/awsig | Server-side SigV4 for S3 API facade (UNSIGNED-PAYLOAD / streaming) | hand-roll; SeaweedFS/MinIO server packages; gofakes3 |
 | cobra + viper | Subcommands + layered config | urfave/cli, koanf |
 | log/slog | Stdlib structured logs | zap/zerolog |
 | prometheus/client_golang | HTTP, cache, archive/upload/download metrics | — |
@@ -345,4 +365,5 @@ CI (planned): `go test -race`, golangci-lint, gosec, govulncheck.
 | `server` / `cache` commands | Done |
 | `upload` command | Done |
 | Remote ingest (`PUT /files`, `remote.url`) | Done |
+| S3 API gateway (SigV4, Get/Put/Delete/ListV2 + Head) | Done |
 | Docker, MinIO tests, CI | Not started |

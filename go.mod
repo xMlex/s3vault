@@ -3,6 +3,7 @@ module github.com/xMlex/s3vault
 go 1.26.6
 
 require (
+	github.com/amwolff/awsig v0.0.0-20260427205242-5ad7e9e1912b
 	github.com/aws/aws-sdk-go-v2 v1.43.7
 	github.com/aws/aws-sdk-go-v2/config v1.32.38
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.37

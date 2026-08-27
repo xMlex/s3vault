@@ -20,6 +20,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, "overwrite", cfg.Archive.OnChange)
 	assert.Equal(t, "none", cfg.Encryption.Mode)
 	assert.NotEmpty(t, cfg.Cache.Dir)
+	assert.False(t, cfg.Server.S3BucketAsPrefix)
 }
 
 func TestLoadInvalidOlderThan(t *testing.T) {
@@ -82,6 +83,7 @@ func TestEnvWithoutYAMLDefault(t *testing.T) {
 	t.Setenv("S3VAULT_S3_BUCKET", "env-bucket")
 	t.Setenv("S3VAULT_S3_SECRET_KEY", "env-secret")
 	t.Setenv("S3VAULT_REMOTE_URL", "https://remote.example:8080/")
+	t.Setenv("S3VAULT_SERVER_S3_BUCKET_AS_PREFIX", "true")
 
 	v := viper.New()
 	SetDefaults(v)
@@ -96,6 +98,7 @@ func TestEnvWithoutYAMLDefault(t *testing.T) {
 	assert.Equal(t, "env-bucket", cfg.S3.Bucket)
 	assert.Equal(t, "env-secret", cfg.S3.SecretKey)
 	assert.Equal(t, "https://remote.example:8080", cfg.Remote.URL)
+	assert.True(t, cfg.Server.S3BucketAsPrefix)
 }
 
 func TestEnvIgnoredWithoutBindEnv(t *testing.T) {

@@ -46,7 +46,7 @@ Fix typos as soon as they show up (code, comments, docs, `.env` keys). Do not ke
 - After successful archive, keep local files unless `--delete-after-upload`. On identical skip, keep unless `--delete-if-exists`.
 - Symlinks: skip by default; follow only inside the scan root.
 - Cache stores plaintext: `0600`/`0700`, hex paths, atomic rename, `singleflight` + lockfile. Soft TTL (`cache.soft_ttl`, default 20s) serves hits without S3 HEAD; then stale-while-revalidate. Server sweeper (`cache.sweep_interval`, default 15m) drops hard-TTL expired entries.
-- HTTP (when added): default bind `127.0.0.1`; Range via `http.ServeContent` on cached plaintext. `PUT /files/{path...}` ingest for remote archive clients (`remote.url` + `S3VAULT_SERVER_TOKEN`).
+- HTTP (when added): default bind `127.0.0.1`; Range via `http.ServeContent` on cached plaintext. `PUT /files/{path...}` ingest for remote archive clients (`remote.url` + `S3VAULT_SERVER_TOKEN`). Optional S3 SigV4 facade (`S3VAULT_SERVER_S3_*`, multiplex or `s3_listen`) shares Fetch/Archive/cache with `/files`.
 - Cobra: `RunE`, `SilenceUsage`/`SilenceErrors`, `cmd.OutOrStdout()`, no `os.Exit` inside commands.
 - Tests: table-driven, `t.Parallel` where safe, integration behind `//go:build integration`. `go test -race`.
 - New dependencies: only if stdlib is insufficient; justify in architecture.md.

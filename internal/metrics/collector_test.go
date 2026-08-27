@@ -23,6 +23,7 @@ func TestCollectorRecords(t *testing.T) {
 	c.ObserveUpload(50*time.Millisecond, 64)
 	c.CacheHit()
 	c.CacheMiss()
+	c.S3("get", "ok")
 	c.ObserveDownload(10*time.Millisecond, 32)
 	c.AddBytes(metrics.DirDownload, 32)
 	c.File(metrics.OpDownload, metrics.ResultDownloaded)
@@ -46,6 +47,7 @@ func TestCollectorRecords(t *testing.T) {
 		"s3vault_download_size_bytes",
 		"s3vault_cache_hits_total",
 		"s3vault_cache_misses_total",
+		"s3vault_s3_requests_total",
 		"s3vault_cache_entries",
 		"s3vault_cache_bytes",
 	} {
@@ -63,5 +65,6 @@ func TestNilCollectorIsNoop(t *testing.T) {
 	c.ObserveDownload(time.Second, 1)
 	c.CacheHit()
 	c.CacheMiss()
+	c.S3("put", "ok")
 	assert.Nil(t, c.Gatherer())
 }

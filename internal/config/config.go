@@ -81,6 +81,13 @@ type ServerConfig struct {
 	Listen        string `mapstructure:"listen"`
 	MetricsListen string `mapstructure:"metrics_listen"`
 	Token         string `mapstructure:"token"`
+	// S3 API (SigV4 plaintext facade). Enabled when both access and secret are set.
+	S3Listen         string `mapstructure:"s3_listen"` // empty = multiplex on listen
+	S3AccessKey      string `mapstructure:"s3_access_key"`
+	S3SecretKey      string `mapstructure:"s3_secret_key"`
+	S3Region         string `mapstructure:"s3_region"`
+	S3Bucket         string `mapstructure:"s3_bucket"`           // virtual bucket; default = s3.bucket
+	S3BucketAsPrefix bool   `mapstructure:"s3_bucket_as_prefix"` // client bucket → key prefix under s3.bucket
 }
 
 // RemoteConfig is used by archive/upload clients that send plaintext to a
@@ -116,6 +123,8 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("cache.max_bytes", int64(10*1024*1024*1024))
 	v.SetDefault("server.listen", "127.0.0.1:8080")
 	v.SetDefault("server.metrics_listen", "127.0.0.1:9090")
+	v.SetDefault("server.s3_region", "us-east-1")
+	v.SetDefault("server.s3_bucket_as_prefix", false)
 	v.SetDefault("archive.older_than", "7d")
 	v.SetDefault("archive.workers", 4)
 	v.SetDefault("archive.on_change", "overwrite")
@@ -154,6 +163,12 @@ var envKeys = []string{
 	"server.listen",
 	"server.metrics_listen",
 	"server.token",
+	"server.s3_listen",
+	"server.s3_access_key",
+	"server.s3_secret_key",
+	"server.s3_region",
+	"server.s3_bucket",
+	"server.s3_bucket_as_prefix",
 	"remote.url",
 	"remote.rate_limit_bps",
 	"archive.older_than",
@@ -285,7 +300,12 @@ func SecretsInPlainConfig(v *viper.Viper) bool {
 	if v.GetBool("s3.allow_secrets_in_config") {
 		return false
 	}
-	return v.InConfig("s3.secret_key") || v.InConfig("server.token")
+	return v.InConfig("s3.secret_key") || v.InConfig("server.token") || v.InConfig("server.s3_secret_key")
+}
+
+// S3APIEnabled reports whether the SigV4 S3 facade should start.
+func (c ServerConfig) S3APIEnabled() bool {
+	return c.S3AccessKey != "" && c.S3SecretKey != ""
 }
 
 // WarnSecrets is the user-facing warning for secrets in a config file.

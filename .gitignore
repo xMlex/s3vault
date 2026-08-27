@@ -34,6 +34,7 @@ go.work.sum
 .env.local
 .env.*.local
 s3vault.yaml
+/kek.bin
 
 # Build artifacts
 /tmp/

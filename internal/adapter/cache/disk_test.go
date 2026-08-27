@@ -39,6 +39,11 @@ func TestDiskPopulateGet(t *testing.T) {
 	assert.True(t, hit)
 	assert.Equal(t, "abc", meta.SHA256)
 	assert.False(t, meta.ValidatedAt.IsZero())
+
+	require.NoError(t, d.Remove(context.Background(), id))
+	_, hit, err = d.Get(context.Background(), id)
+	require.NoError(t, err)
+	assert.False(t, hit)
 }
 
 func TestDiskMarkValidated(t *testing.T) {

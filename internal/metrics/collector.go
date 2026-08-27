@@ -47,6 +47,7 @@ type Collector struct {
 	httpCount    *prometheus.CounterVec
 	httpInFlight prometheus.Gauge
 	httpRespSize *prometheus.HistogramVec
+	s3Requests   *prometheus.CounterVec
 }
 
 // New registers collectors on reg. A nil reg creates a private registry.
@@ -111,6 +112,10 @@ func New(reg prometheus.Registerer) (*Collector, error) {
 			Help:    "HTTP response body size (Range-aware)",
 			Buckets: sizeBuckets,
 		}, []string{"code", "method"}),
+		s3Requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "s3vault_s3_requests_total",
+			Help: "S3 API gateway requests by operation and result",
+		}, []string{"op", "result"}),
 	}
 
 	all := []prometheus.Collector{
@@ -118,6 +123,7 @@ func New(reg prometheus.Registerer) (*Collector, error) {
 		c.uploadDur, c.downloadDur, c.uploadSize, c.downloadSize,
 		c.cacheHits, c.cacheMisses,
 		c.httpDur, c.httpCount, c.httpInFlight, c.httpRespSize,
+		c.s3Requests,
 	}
 	for _, col := range all {
 		if err := register(reg, col); err != nil {
@@ -226,4 +232,13 @@ func (c *Collector) CacheMiss() {
 		return
 	}
 	c.cacheMisses.Inc()
+}
+
+// S3 increments s3vault_s3_requests_total.
+// op: get|put|delete|list|head|head_bucket|list_buckets; result: ok|denied|not_found|error|…
+func (c *Collector) S3(op, result string) {
+	if c == nil {
+		return
+	}
+	c.s3Requests.WithLabelValues(op, result).Inc()
 }

@@ -14,4 +14,6 @@ type ObjectStore interface {
 	Get(ctx context.Context, key string) (io.ReadCloser, domain.ObjectMeta, error)
 	// GetRange returns bytes [start, end] inclusive (S3 Range semantics).
 	GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error)
+	Delete(ctx context.Context, key string) error
+	List(ctx context.Context, opts domain.ListOptions) (domain.ListPage, error)
 }

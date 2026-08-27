@@ -27,6 +27,13 @@ server:
   listen: "127.0.0.1:8080"
   metrics_listen: "127.0.0.1:9090"
   # token: set via S3VAULT_SERVER_TOKEN, not in this file
+  # S3 API (SigV4 plaintext facade). Both keys required to enable.
+  # s3_listen: ""  # empty = multiplex on listen (reserved: /health /ready /files)
+  # s3_listen: "127.0.0.1:8333"  # or separate port
+  # s3_access_key / s3_secret_key: prefer S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY
+  # s3_region: us-east-1
+  # s3_bucket: my-bucket  # virtual bucket name; default = s3.bucket
+  # s3_bucket_as_prefix: false  # true = client bucket name becomes key prefix under s3.bucket
 # Client without CryptoPro/S3: send plaintext to a configured s3vault server.
 # remote:
 #   url: "https://s3vault.example:8080"

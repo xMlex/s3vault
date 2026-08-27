@@ -23,4 +23,6 @@ type PlaintextCache interface {
 	Lookup(ctx context.Context, id CacheID) (path string, meta EntryMeta, hit bool, err error)
 	Populate(ctx context.Context, id CacheID, meta EntryMeta, fill func(w io.Writer) error) (path string, err error)
 	MarkValidated(ctx context.Context, id CacheID, meta EntryMeta) error
+	// Remove drops a plaintext entry if present (best-effort after DeleteObject).
+	Remove(ctx context.Context, id CacheID) error
 }

@@ -6,8 +6,13 @@ import (
 	"strings"
 )
 
-// ErrTokenRequired is returned when listen is not loopback and the bearer token is empty.
-var ErrTokenRequired = errors.New("server.token is required when listen is not loopback")
+// ErrTokenRequired is returned when listen is not loopback and neither bearer
+// token nor S3 frontend credentials are configured.
+var ErrTokenRequired = errors.New("server.token or server.s3 credentials are required when listen is not loopback")
+
+// ErrS3CredsRequired is returned when S3 listen is non-loopback (or requested)
+// without frontend S3 access/secret keys.
+var ErrS3CredsRequired = errors.New("server.s3_access_key and server.s3_secret_key are required for S3 API on non-loopback listen")
 
 // ListenIsLoopback reports whether addr binds only to a loopback address.
 func ListenIsLoopback(addr string) bool {
@@ -26,9 +31,25 @@ func ListenIsLoopback(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func checkBind(listen, token string) error {
-	if token == "" && !ListenIsLoopback(listen) {
-		return ErrTokenRequired
+func checkBind(listen, token string, s3API bool) error {
+	if ListenIsLoopback(listen) {
+		return nil
+	}
+	if token != "" || s3API {
+		return nil
+	}
+	return ErrTokenRequired
+}
+
+func checkS3Listen(s3Listen string, s3API bool) error {
+	if s3Listen == "" {
+		return nil
+	}
+	if !s3API {
+		return ErrS3CredsRequired
+	}
+	if !ListenIsLoopback(s3Listen) && !s3API {
+		return ErrS3CredsRequired
 	}
 	return nil
 }

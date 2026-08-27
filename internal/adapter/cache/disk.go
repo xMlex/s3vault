@@ -207,6 +207,18 @@ func (d *Disk) Lookup(ctx context.Context, id port.CacheID) (string, port.EntryM
 	return d.abs(dataRel), entryMetaFromSidecar(sc), true, nil
 }
 
+// Remove drops a plaintext cache entry if present (best-effort after DeleteObject).
+func (d *Disk) Remove(ctx context.Context, id port.CacheID) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	dataRel, metaRel, _, _, err := d.rel(id)
+	if err != nil {
+		return err
+	}
+	return d.removeEntry(string(id), dataRel, metaRel)
+}
+
 // MarkValidated refreshes soft-TTL identity fields without rewriting plaintext.
 func (d *Disk) MarkValidated(ctx context.Context, id port.CacheID, meta port.EntryMeta) error {
 	if err := ctx.Err(); err != nil {

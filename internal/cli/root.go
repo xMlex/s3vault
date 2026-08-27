@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/xMlex/s3vault/internal/adapter/encrypt"
 	"github.com/xMlex/s3vault/internal/adapter/remote"
 	"github.com/xMlex/s3vault/internal/adapter/s3"
+	"github.com/xMlex/s3vault/internal/adapter/s3auth"
 	"github.com/xMlex/s3vault/internal/adapter/scanner"
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/domain"
@@ -29,6 +31,7 @@ import (
 	"github.com/xMlex/s3vault/internal/metrics"
 	"github.com/xMlex/s3vault/internal/period"
 	"github.com/xMlex/s3vault/internal/port"
+	"github.com/xMlex/s3vault/internal/s3api"
 	"github.com/xMlex/s3vault/internal/service"
 )
 
@@ -373,10 +376,10 @@ func newDownloadCmd(state *runState) *cobra.Command {
 }
 
 func newServerCmd(state *runState) *cobra.Command {
-	var listen, metricsListen string
+	var listen, metricsListen, s3Listen string
 	cmd := &cobra.Command{
 		Use:   "server",
-		Short: "Serve decrypted S3 objects over HTTP",
+		Short: "Serve decrypted objects over HTTP and optional S3 API",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg := state.cfg
@@ -385,6 +388,9 @@ func newServerCmd(state *runState) *cobra.Command {
 			}
 			if cmd.Flags().Changed("metrics-listen") {
 				cfg.Server.MetricsListen = metricsListen
+			}
+			if cmd.Flags().Changed("s3-listen") {
+				cfg.Server.S3Listen = s3Listen
 			}
 			enc, err := encrypt.New(cfg.Encryption)
 			if err != nil {
@@ -423,8 +429,9 @@ func newServerCmd(state *runState) *cobra.Command {
 			}); err != nil {
 				return err
 			}
+			encFP := encrypt.Fingerprint(cfg.Encryption)
 			fetch := service.NewFetch(store, enc).
-				WithCache(disk, cfg.S3.Bucket, encrypt.Fingerprint(cfg.Encryption)).
+				WithCache(disk, cfg.S3.Bucket, encFP).
 				WithSoftTTL(cfg.Cache.SoftTTL).
 				WithMetrics(met)
 			keys := keying.Mapper{Prefix: cfg.S3.Prefix}
@@ -437,9 +444,52 @@ func newServerCmd(state *runState) *cobra.Command {
 			if !ok {
 				return fmt.Errorf("invalid archive.on_change %q", cfg.Archive.OnChange)
 			}
+
+			var s3Handler http.Handler
+			if cfg.Server.S3APIEnabled() {
+				virtBucket := cfg.Server.S3Bucket
+				if virtBucket == "" {
+					virtBucket = cfg.S3.Bucket
+				}
+				region := cfg.Server.S3Region
+				if region == "" {
+					region = cfg.S3.Region
+				}
+				idBucket := virtBucket
+				if cfg.Server.S3BucketAsPrefix {
+					idBucket = "" // Allow any client bucket; name becomes key prefix
+				}
+				id := &s3auth.Static{
+					AccessKey: cfg.Server.S3AccessKey,
+					SecretKey: cfg.Server.S3SecretKey,
+					Bucket:    idBucket,
+				}
+				api, err := s3api.New(s3api.Config{
+					Identity:       id,
+					Region:         region,
+					Bucket:         virtBucket,
+					Fetch:          fetch,
+					Archive:        arch,
+					OnChange:       onChange,
+					Keys:           keys,
+					Store:          store,
+					Cache:          disk,
+					BucketBackend:  cfg.S3.Bucket,
+					BucketAsPrefix: cfg.Server.S3BucketAsPrefix,
+					EncFP:          encFP,
+					Logger:         state.logger,
+					Metrics:        met,
+				})
+				if err != nil {
+					return err
+				}
+				s3Handler = api.Handler()
+			}
+
 			srv, err := httpserver.New(httpserver.Config{
 				Listen:        cfg.Server.Listen,
 				MetricsListen: cfg.Server.MetricsListen,
+				S3Listen:      cfg.Server.S3Listen,
 				Token:         cfg.Server.Token,
 				Logger:        state.logger,
 				Fetch:         fetch,
@@ -448,16 +498,26 @@ func newServerCmd(state *runState) *cobra.Command {
 				Keys:          keys,
 				Store:         store,
 				Metrics:       met,
+				S3Handler:     s3Handler,
 			})
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "listening http=%s metrics=%s\n", cfg.Server.Listen, cfg.Server.MetricsListen)
+			s3Addr := cfg.Server.S3Listen
+			if s3Handler != nil && s3Addr == "" {
+				s3Addr = cfg.Server.Listen + " (multiplex)"
+			}
+			if s3Handler == nil {
+				s3Addr = "off"
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "listening http=%s s3=%s metrics=%s\n",
+				cfg.Server.Listen, s3Addr, cfg.Server.MetricsListen)
 			return srv.Run(ctx)
 		},
 	}
 	cmd.Flags().StringVar(&listen, "listen", "", "bind address (default 127.0.0.1:8080)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "prometheus bind address")
+	cmd.Flags().StringVar(&s3Listen, "s3-listen", "", "S3 API bind (empty=multiplex on --listen when S3 keys set)")
 	return cmd
 }
 

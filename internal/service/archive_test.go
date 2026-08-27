@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,6 +112,32 @@ func (m *memStore) GetRange(_ context.Context, key string, start, end int64) (io
 		to = int64(len(b))
 	}
 	return io.NopCloser(bytes.NewReader(b[start:to])), m.meta[key], nil
+}
+
+func (m *memStore) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.body, key)
+	delete(m.meta, key)
+	return nil
+}
+
+func (m *memStore) List(_ context.Context, opts domain.ListOptions) (domain.ListPage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var contents []domain.ListObject
+	for key, meta := range m.meta {
+		if opts.Prefix != "" && !strings.HasPrefix(key, opts.Prefix) {
+			continue
+		}
+		contents = append(contents, domain.ListObject{
+			Key:          key,
+			Size:         meta.Size,
+			ETag:         meta.ETag,
+			LastModified: meta.LastModified,
+		})
+	}
+	return domain.ListPage{Contents: contents, KeyCount: int32(len(contents))}, nil
 }
 
 // putContained stores S3VCTR01 || plaintext (enc=none) for tests that skip Archive.
