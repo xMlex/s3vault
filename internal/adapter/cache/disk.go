@@ -357,16 +357,44 @@ func (d *Disk) writeMeta(rel string, sc sidecar) error {
 }
 
 func (d *Disk) removeEntry(key, dataRel, metaRel string) error {
+	lockRel := dataRel + ".lock"
+	tmpRel := dataRel + ".tmp"
 	err1 := d.root.Remove(dataRel)
 	err2 := d.root.Remove(metaRel)
+	err3 := d.root.Remove(lockRel)
+	err4 := d.root.Remove(tmpRel)
 	d.forget(key)
+	d.pruneShardIfEmpty(dataRel)
 	if err1 != nil && !os.IsNotExist(err1) {
 		return err1
 	}
 	if err2 != nil && !os.IsNotExist(err2) {
 		return err2
 	}
+	if err3 != nil && !os.IsNotExist(err3) {
+		return err3
+	}
+	if err4 != nil && !os.IsNotExist(err4) {
+		return err4
+	}
 	return nil
+}
+
+func (d *Disk) pruneShardIfEmpty(dataRel string) {
+	shard := path.Dir(dataRel)
+	if shard == "." || shard == "" {
+		return
+	}
+	sf, err := d.root.Open(shard)
+	if err != nil {
+		return
+	}
+	names, err := sf.ReadDir(-1)
+	_ = sf.Close()
+	if err != nil || len(names) > 0 {
+		return
+	}
+	_ = d.root.Remove(shard)
 }
 
 func (d *Disk) remember(key, dataRel, metaRel string, sc sidecar) {
@@ -479,6 +507,7 @@ func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMet
 	defer func() {
 		_ = unlockExclusive(lf)
 		_ = lf.Close()
+		_ = d.root.Remove(lockRel)
 	}()
 
 	if p, stored, hit, err := d.Lookup(ctx, id); err != nil {

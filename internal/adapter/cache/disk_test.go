@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -282,6 +283,61 @@ func TestDiskStartSweeper(t *testing.T) {
 		st, err := d.Usage()
 		return err == nil && st.Entries == 0
 	}, time.Second, 10*time.Millisecond)
+}
+
+func TestDiskRemoveCleansLockAndShard(t *testing.T) {
+	t.Parallel()
+	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
+	id := ID("b", "k", "fp")
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+		_, err := io.WriteString(w, "hello")
+		return err
+	})
+	require.NoError(t, err)
+
+	dataRel, _, lockRel, _, err := d.rel(id)
+	require.NoError(t, err)
+	shard := path.Dir(dataRel)
+
+	// Simulate stale lock left by an older version or crashed populate.
+	require.NoError(t, d.root.WriteFile(lockRel, nil, 0o600))
+
+	require.NoError(t, d.Remove(context.Background(), id))
+
+	_, err = d.root.Stat(dataRel)
+	require.True(t, os.IsNotExist(err))
+	_, err = d.root.Stat(lockRel)
+	require.True(t, os.IsNotExist(err))
+	_, err = d.root.Open(shard)
+	require.True(t, os.IsNotExist(err), "empty shard directory should be removed")
+}
+
+func TestDiskSweepExpiredCleansLockAndShard(t *testing.T) {
+	t.Parallel()
+	d := newTestDisk(t, Options{TTL: 20 * time.Millisecond, MaxBytes: 1 << 20})
+	id := ID("b", "drop", "fp")
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+		_, err := io.WriteString(w, "drop")
+		return err
+	})
+	require.NoError(t, err)
+
+	dataRel, _, lockRel, _, err := d.rel(id)
+	require.NoError(t, err)
+	shard := path.Dir(dataRel)
+
+	// Lock is removed after Populate; sweep must still drop stale locks.
+	require.NoError(t, d.root.WriteFile(lockRel, nil, 0o600))
+
+	time.Sleep(40 * time.Millisecond)
+	assert.Equal(t, 1, d.SweepExpired())
+
+	_, err = d.root.Stat(dataRel)
+	require.True(t, os.IsNotExist(err))
+	_, err = d.root.Stat(lockRel)
+	require.True(t, os.IsNotExist(err))
+	_, err = d.root.Open(shard)
+	require.True(t, os.IsNotExist(err), "empty shard directory should be removed after sweep")
 }
 
 func TestDiskRejectsBadID(t *testing.T) {
