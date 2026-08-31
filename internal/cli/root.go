@@ -103,29 +103,57 @@ func NewRootCommand(opt Options) *cobra.Command {
 
 func initViper(v *viper.Viper, cfgFile string) error {
 	config.SetDefaults(v)
-	if cfgFile != "" {
-		v.SetConfigFile(cfgFile)
-	} else {
-		v.AddConfigPath(".")
-		if dir, err := os.UserConfigDir(); err == nil {
-			v.AddConfigPath(dir + "/s3vault")
-		}
-		v.SetConfigName("s3vault")
-		v.SetConfigType("yaml")
-	}
 	v.SetEnvPrefix(envPrefix)
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	if err := config.BindEnv(v); err != nil {
 		return err
 	}
 	v.AutomaticEnv()
+
+	configPath := cfgFile
+	if configPath == "" {
+		configPath = findYAMLConfigFile()
+	}
+	if configPath == "" {
+		return nil
+	}
+
+	v.SetConfigFile(configPath)
 	if err := v.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
-			return fmt.Errorf("reading config: %w", err)
+		if cfgFile != "" {
+			return fmt.Errorf("reading config %s: %w", configPath, err)
 		}
+		_, _ = fmt.Fprintf(os.Stderr, "warning: ignoring unreadable config file %s: %v\n", configPath, err)
 	}
 	return nil
+}
+
+// findYAMLConfigFile locates s3vault.yaml or s3vault.yml in standard search paths.
+// Viper's SetConfigName also matches a bare "s3vault" file, which would pick up the
+// s3vault binary when run from the build directory.
+func findYAMLConfigFile() string {
+	for _, dir := range configSearchDirs() {
+		for _, name := range []string{"s3vault.yaml", "s3vault.yml"} {
+			path := filepath.Join(dir, name)
+			info, err := os.Stat(path)
+			if err == nil && !info.IsDir() {
+				abs, err := filepath.Abs(path)
+				if err == nil {
+					return abs
+				}
+				return path
+			}
+		}
+	}
+	return ""
+}
+
+func configSearchDirs() []string {
+	dirs := []string{"."}
+	if dir, err := os.UserConfigDir(); err == nil {
+		dirs = append(dirs, filepath.Join(dir, "s3vault"))
+	}
+	return dirs
 }
 
 func newLogger(w io.Writer, level string) *slog.Logger {
