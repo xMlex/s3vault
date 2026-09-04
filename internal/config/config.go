@@ -90,11 +90,15 @@ type CommandEnc struct {
 }
 
 type CacheConfig struct {
-	Dir string        `mapstructure:"dir"`
-	TTL time.Duration `mapstructure:"ttl"`
+	// Enabled turns on the persistent plaintext disk cache for HTTP/S3 Materialize.
+	// Default false: each request decrypts to an ephemeral temp file.
+	Enabled bool          `mapstructure:"enabled"`
+	Dir     string        `mapstructure:"dir"`
+	TTL     time.Duration `mapstructure:"ttl"`
 	// SoftTTL is how long Materialize may serve a cache hit without S3 HEAD.
 	// After SoftTTL, the stale entry is served while revalidation runs in the
 	// background (stale-while-revalidate). Zero forces a synchronous HEAD each time.
+	// Only applies when Enabled.
 	SoftTTL time.Duration `mapstructure:"soft_ttl"`
 	// SweepInterval is how often the server drops hard-TTL expired entries.
 	// Zero disables the background sweeper (lazy delete on Get still applies).
@@ -144,6 +148,7 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("encryption.native.chunk_size", 65536)
 	v.SetDefault("encryption.command.provider", "cryptopro")
 	v.SetDefault("encryption.command.timeout", "30m")
+	v.SetDefault("cache.enabled", false)
 	v.SetDefault("cache.ttl", "168h")
 	v.SetDefault("cache.soft_ttl", "20s")
 	v.SetDefault("cache.sweep_interval", "15m")
@@ -185,6 +190,7 @@ var envKeys = []string{
 	"encryption.command.provider",
 	"encryption.command.thumbprint",
 	"encryption.command.timeout",
+	"cache.enabled",
 	"cache.dir",
 	"cache.ttl",
 	"cache.soft_ttl",

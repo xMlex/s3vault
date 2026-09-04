@@ -29,6 +29,8 @@ encryption:
   #   decrypt: ["/usr/local/libexec/s3vault/cryptcp-decrypt"]
   #   timeout: 30m
 cache:
+  enabled: false  # true = persistent plaintext disk cache for HTTP/S3
+  # dir: /var/cache/s3vault
   ttl: 168h
   soft_ttl: 20s  # serve hits without S3 HEAD; then stale-while-revalidate
   sweep_interval: 15m  # drop hard-TTL expired entries; 0 = disable

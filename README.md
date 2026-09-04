@@ -68,6 +68,7 @@ go test -tags=integration -count=1 ./internal/integration/   # нужен дос
 | `S3VAULT_S3_TLS` | Проверка TLS (по умолчанию включена) |
 | `S3VAULT_ENCRYPTION_MODE` | `none`, `native`, `command` |
 | `S3VAULT_LOG_LEVEL` | `debug`, `info`, `warn`, `error` |
+| `S3VAULT_CACHE_ENABLED` | `true` — persistent plaintext disk cache for HTTP/S3 (default `false`) |
 | `S3VAULT_SERVER_TOKEN` | Bearer для HTTP `/files` |
 | `S3VAULT_SERVER_S3_ACCESS_KEY` | Frontend SigV4 access key (включает S3 API вместе с secret) |
 | `S3VAULT_SERVER_S3_SECRET_KEY` | Frontend SigV4 secret |
@@ -417,9 +418,9 @@ go test -tags=integration -count=1 -v ./internal/integration/
 
 ## HTTP-сервер
 
-`s3vault server` слушает `127.0.0.1:8080` по умолчанию и отдаёт **plaintext** после полной расшифровки в локальный кэш (`http.ServeContent`, включая Range). Тот же процесс принимает **PUT** plaintext для архивации (шифрование CryptoPro/S3 — на сервере).
+`s3vault server` слушает `127.0.0.1:8080` по умолчанию и отдаёт **plaintext** через `Fetch.Materialize` + `http.ServeContent` (включая Range). По умолчанию диск-кэш **выключен** (`cache.enabled: false`) — на запрос создаётся временный файл и удаляется после ответа. С `cache.enabled: true` / `S3VAULT_CACHE_ENABLED=true` plaintext хранится в `cache.dir` (soft-TTL / SWR). Тот же процесс принимает **PUT** plaintext для архивации (шифрование CryptoPro/S3 — на сервере).
 
-Опционально — **S3-совместимый API** (SigV4, path-style): те же Get/Put/Delete/List через `Fetch`/`Archive` и кэш (soft-TTL без лишнего HEAD в backend).
+Опционально — **S3-совместимый API** (SigV4, path-style): те же Get/Put/Delete/List через `Fetch`/`Archive` (и кэш, если включён).
 
 ```bash
 export S3VAULT_SERVER_TOKEN=...   # обязателен, если listen не loopback (или включите S3 keys)
@@ -472,7 +473,7 @@ aws --endpoint-url http://127.0.0.1:8080 s3 cp ./file s3://my-bucket/logs/file -
 # клиенту нужен path-style (UsePathStyle / s3ForcePathStyle)
 ```
 
-Ключи `S3VAULT_SERVER_S3_*` — **frontend** (SigV4 к vault), не путать с `S3VAULT_S3_*` к backend storage. Virtual bucket: `server.s3_bucket` (по умолчанию = `s3.bucket`, а при локальном бэкенде без него — `s3vault`). При `server.s3_bucket_as_prefix` / `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` любое имя bucket в path-style URL допускается и становится префиксом ключа в backend (`s3://reports/a.log` → `{s3.prefix}/reports/a.log` в `s3.bucket`). Multipart upload в v1 нет.
+Ключи `S3VAULT_SERVER_S3_*` — **frontend** (SigV4 к vault), не путать с `S3VAULT_S3_*` к backend storage. Virtual bucket: `server.s3_bucket` (по умолчанию = `s3.bucket`, а при локальном бэкенде без него — `s3vault`). При `server.s3_bucket_as_prefix` / `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` любое имя bucket в path-style URL допускается и становится префиксом ключа в backend (`s3://reports/a.log` → `{s3.prefix}/reports/a.log` в `s3.bucket`). Head/Get/Put отдают `x-amz-checksum-sha256` (base64 plaintext SHA-256). Multipart upload в v1 нет.
 
 На хосте **без** CryptoPro / S3-ключей:
 
@@ -489,7 +490,7 @@ s3vault upload /var/log/app/app.log --key logs/app.log
 - `GET /health` — процесс жив (без токена).
 - `GET /ready` — дешёвый HEAD в бэкенде хранения.
 - Prometheus: отдельный `server.metrics_listen` (по умолчанию `127.0.0.1:9090`), путь `/metrics`. Без меток с полным path. На `archive`/`upload`/`download` тот же endpoint можно поднять на время команды через `--metrics-listen`.
-- Кэш: каталог `0700`, файлы `0600`, id = SHA-256(namespace бэкенда, key, enc fingerprint). `s3vault cache stats` / `cache clear`.
+- Кэш: по умолчанию выкл. (`cache.enabled` / `S3VAULT_CACHE_ENABLED`). Вкл.: каталог `0700`, файлы `0600`, id = SHA-256(namespace бэкенда, key, enc fingerprint). `s3vault cache stats` / `cache clear`.
 - Пустой `server.token` и bind не на loopback — процесс не стартует (достаточно S3 frontend keys, если включён S3 API). См. «Доступ извне: аутентификация обязательна».
 
 SIGTERM/SIGINT — graceful `Shutdown` (HTTP + optional S3 listen + metrics).

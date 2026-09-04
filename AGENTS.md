@@ -8,7 +8,7 @@ Read [architecture.md](architecture.md) before changing pipelines, encryption, S
 
 ## What this repo is
 
-Go CLI (`github.com/xMlex/s3vault`) that archives files older than a period to S3-compatible storage, optionally encrypts client-side, downloads/decrypts, and can serve plaintext over HTTP from a local disk cache.
+Go CLI (`github.com/xMlex/s3vault`) that archives files older than a period to S3-compatible storage, optionally encrypts client-side, downloads/decrypts, and can serve plaintext over HTTP (optional persistent disk cache, off by default).
 
 Operator docs (build, deploy, encryption modes): [README.md](README.md).
 
@@ -45,8 +45,8 @@ Fix typos as soon as they show up (code, comments, docs, `.env` keys). Do not ke
 - Config: flags > `S3VAULT_*` > file > defaults. Config file optional.
 - After successful archive, keep local files unless `--delete-after-upload`. On identical skip, keep unless `--delete-if-exists`.
 - Symlinks: skip by default; follow only inside the scan root.
-- Cache stores plaintext: `0600`/`0700`, hex paths, atomic rename, `singleflight` + lockfile. Soft TTL (`cache.soft_ttl`, default 20s) serves hits without S3 HEAD; then stale-while-revalidate. Server sweeper (`cache.sweep_interval`, default 15m) drops hard-TTL expired entries.
-- HTTP (when added): default bind `127.0.0.1`; Range via `http.ServeContent` on cached plaintext. `PUT /files/{path...}` ingest for remote archive clients (`remote.url` + `S3VAULT_SERVER_TOKEN`). Optional S3 SigV4 facade (`S3VAULT_SERVER_S3_*`, multiplex or `s3_listen`) shares Fetch/Archive/cache with `/files`.
+- Cache: `cache.enabled` (default false). When on, stores plaintext (`0600`/`0700`, hex paths, atomic rename, `singleflight` + lockfile); soft TTL (`cache.soft_ttl`, default 20s) then SWR; sweeper (`cache.sweep_interval`, default 15m). When off, HTTP/S3 Materialize uses an ephemeral temp per request.
+- HTTP: default bind `127.0.0.1`; Range via `http.ServeContent` on Materialize plaintext. `PUT /files/{path...}` ingest for remote archive clients (`remote.url` + `S3VAULT_SERVER_TOKEN`). Optional S3 SigV4 facade (`S3VAULT_SERVER_S3_*`, multiplex or `s3_listen`) shares Fetch/Archive with `/files`.
 - Cobra: `RunE`, `SilenceUsage`/`SilenceErrors`, `cmd.OutOrStdout()`, no `os.Exit` inside commands.
 - Tests: table-driven, `t.Parallel` where safe, integration behind `//go:build integration`. `go test -race`.
 - New dependencies: only if stdlib is insufficient; justify in architecture.md.

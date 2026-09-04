@@ -194,6 +194,37 @@ func TestServeFileAndRange(t *testing.T) {
 	assert.Equal(t, []byte("cdef"), rec.Body.Bytes())
 }
 
+func TestServeFileWithoutCache(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	payload := []byte("abcdefghij")
+	sum := sha256.Sum256(payload)
+	hdr, err := container.Marshal(container.Header{
+		Version:       container.VersionV1,
+		PlaintextSize: int64(len(payload)),
+		SHA256:        sum[:],
+		Enc:           container.EncNone,
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.Put(context.Background(), "backups/hello.txt",
+		io.MultiReader(bytes.NewReader(hdr), bytes.NewReader(payload)), domain.PutMeta{}))
+
+	srv, err := httpserver.New(httpserver.Config{
+		Listen: "127.0.0.1:0",
+		Fetch:  service.NewFetch(store, encrypt.Passthrough{}),
+		Keys:   keying.Mapper{Prefix: "backups"},
+		Store:  store,
+	})
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/files/hello.txt", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusPartialContent, rec.Code)
+	assert.Equal(t, []byte("cdef"), rec.Body.Bytes())
+}
+
 func TestServeNotFoundAndTraversal(t *testing.T) {
 	t.Parallel()
 	store := newMemStore()

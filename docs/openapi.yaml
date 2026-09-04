@@ -5,10 +5,11 @@ info:
   description: |
     HTTP surface of `s3vault server`.
 
-    Serves **plaintext** from the local disk cache (`http.ServeContent`, including
-    HTTP Range) after decrypting objects from S3-compatible storage. Accepts
-    **PUT** plaintext for remote archive clients; encryption and S3 Put run on
-    the server.
+    Serves **plaintext** via `Fetch.Materialize` + `http.ServeContent` (including
+    HTTP Range) after decrypting objects from storage. Persistent disk cache is
+    optional (`cache.enabled`, default false); when off, each request uses an
+    ephemeral temp file. Accepts **PUT** plaintext for remote archive clients;
+    encryption and backend Put run on the server.
 
     Default listen: `127.0.0.1:8080`. Empty bearer token with a non-loopback
     bind refuses to start. Prometheus metrics are on a **separate** listen
@@ -94,7 +95,7 @@ paths:
       tags: [files]
       summary: Download plaintext file
       description: |
-        Materializes the object into the plaintext cache (full decrypt on miss),
+        Materializes the object (disk cache when enabled, else ephemeral temp),
         then serves via `http.ServeContent` (supports `Range`, sets
         `Content-Length`, `Last-Modified`, `ETag`).
 

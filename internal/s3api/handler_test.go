@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -185,6 +187,7 @@ func TestSDKPutHeadGet(t *testing.T) {
 	payload := []byte("hello-s3api")
 	sum := sha256.Sum256(payload)
 	wantETag := `"` + hex.EncodeToString(sum[:]) + `"`
+	wantChecksum := base64.StdEncoding.EncodeToString(sum[:])
 
 	_, err := client.PutObject(context.Background(), &s3.PutObjectInput{
 		Bucket: aws.String("vault"),
@@ -199,6 +202,8 @@ func TestSDKPutHeadGet(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, wantETag, aws.ToString(head.ETag))
+	assert.Equal(t, wantChecksum, aws.ToString(head.ChecksumSHA256))
+	assert.Equal(t, types.ChecksumTypeFullObject, head.ChecksumType)
 
 	got, err := client.GetObject(context.Background(), &s3.GetObjectInput{
 		Bucket: aws.String("vault"),
@@ -210,6 +215,8 @@ func TestSDKPutHeadGet(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, body)
 	assert.Equal(t, wantETag, aws.ToString(got.ETag))
+	assert.Equal(t, wantChecksum, aws.ToString(got.ChecksumSHA256))
+	assert.Equal(t, types.ChecksumTypeFullObject, got.ChecksumType)
 }
 
 func TestListBucketsXML(t *testing.T) {

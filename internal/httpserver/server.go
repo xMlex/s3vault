@@ -273,6 +273,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusBadGateway)
 		return
 	}
+	defer cached.Release()
 	f, err := os.Open(cached.Path)
 	if err != nil {
 		s.log.ErrorContext(r.Context(), "open cache", slog.String("op", "http"), slog.String("err", err.Error()))

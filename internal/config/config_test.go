@@ -21,6 +21,7 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, "overwrite", cfg.Archive.OnChange)
 	assert.Equal(t, "none", cfg.Encryption.Mode)
 	assert.NotEmpty(t, cfg.Cache.Dir)
+	assert.False(t, cfg.Cache.Enabled)
 	assert.False(t, cfg.Server.S3BucketAsPrefix)
 	assert.Equal(t, BackendS3, cfg.Backend.Type)
 }
@@ -84,6 +85,16 @@ func TestBackendInvalid(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+}
+
+func TestCacheEnabled(t *testing.T) {
+	t.Parallel()
+	v := viper.New()
+	SetDefaults(v)
+	v.Set("cache.enabled", true)
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.True(t, cfg.Cache.Enabled)
 }
 
 func TestCacheNamespaceS3(t *testing.T) {

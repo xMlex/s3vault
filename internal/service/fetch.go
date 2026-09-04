@@ -39,6 +39,17 @@ type CachedPlaintext struct {
 	ModTime time.Time
 	Hit     bool
 	ETag    string
+	SHA256  string // plaintext hex digest when known (from S3VCTR01 / cache sidecar)
+	// Ephemeral is true when Path is a per-request temp file (cache disabled).
+	// Caller must Release after serving.
+	Ephemeral bool
+}
+
+// Release removes an ephemeral Materialize temp file. No-op for disk-cache paths.
+func (c CachedPlaintext) Release() {
+	if c.Ephemeral && c.Path != "" {
+		_ = os.Remove(c.Path)
+	}
 }
 
 // NewFetch constructs a downloader.
@@ -145,12 +156,11 @@ func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer
 	return cw.n, nil
 }
 
-// Materialize decrypts key into the plaintext cache (full object on miss).
-// Within soft_ttl a hit needs no S3 call. After soft_ttl, the stale entry is
-// served immediately while a background HEAD (+ Get on change) revalidates.
+// Materialize decrypts key into a seekable plaintext file for HTTP/S3 ServeContent.
+// With a disk cache: soft_ttl / SWR as configured. Without: ephemeral temp (caller Release).
 func (f *Fetch) Materialize(ctx context.Context, key string) (CachedPlaintext, error) {
 	if f.cache == nil {
-		return CachedPlaintext{}, fmt.Errorf("plaintext cache is not configured")
+		return f.materializeEphemeral(ctx, key)
 	}
 	id := cache.ID(f.bucket, key, f.encFP)
 
@@ -180,6 +190,68 @@ func (f *Fetch) Materialize(ctx context.Context, key string) (CachedPlaintext, e
 	return f.materializeMiss(ctx, key, id)
 }
 
+func (f *Fetch) materializeEphemeral(ctx context.Context, key string) (CachedPlaintext, error) {
+	remote, err := identity.ResolveRemote(ctx, f.store, key)
+	if err != nil {
+		return CachedPlaintext{}, err
+	}
+	if !remote.Exists {
+		return CachedPlaintext{}, domain.ErrNotFound
+	}
+
+	tmp, err := os.CreateTemp("", "s3vault-serve-*")
+	if err != nil {
+		return CachedPlaintext{}, fmt.Errorf("temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = tmp.Close()
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	started := time.Now()
+	body, getMeta, err := f.store.Get(ctx, key)
+	if err != nil {
+		return CachedPlaintext{}, err
+	}
+	defer body.Close()
+	decCtx, payload, err := unwrapForDecrypt(ctx, body, getMeta)
+	if err != nil {
+		return CachedPlaintext{}, err
+	}
+	cw := &countWriter{w: tmp}
+	if err := encrypt.DecryptAuto(decCtx, f.enc, cw, payload); err != nil {
+		f.recordDownload(started, cw.n, err)
+		return CachedPlaintext{}, err
+	}
+	if err := tmp.Sync(); err != nil {
+		return CachedPlaintext{}, fmt.Errorf("fsync: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return CachedPlaintext{}, fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0o600); err != nil {
+		_ = os.Remove(tmpName)
+		return CachedPlaintext{}, fmt.Errorf("chmod: %w", err)
+	}
+	cleanup = false
+	f.recordDownload(started, cw.n, nil)
+
+	meta := entryMetaFromRemote(remote)
+	return CachedPlaintext{
+		Path:      tmpName,
+		Name:      path.Base(key),
+		ModTime:   meta.LastModified,
+		Hit:       false,
+		ETag:      etagForHTTP(meta, ""),
+		SHA256:    meta.SHA256,
+		Ephemeral: true,
+	}, nil
+}
+
 func cachedPlaintext(key string, id port.CacheID, p string, meta port.EntryMeta, hit bool) CachedPlaintext {
 	mod := meta.LastModified
 	return CachedPlaintext{
@@ -188,6 +260,7 @@ func cachedPlaintext(key string, id port.CacheID, p string, meta port.EntryMeta,
 		ModTime: mod,
 		Hit:     hit,
 		ETag:    etagForHTTP(meta, id),
+		SHA256:  meta.SHA256,
 	}
 }
 

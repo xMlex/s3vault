@@ -66,6 +66,30 @@ func TestFetchMaterialize(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotFound)
 }
 
+func TestFetchMaterializeEphemeral(t *testing.T) {
+	t.Parallel()
+	store := newMemStore()
+	plain := []byte("ephemeral-body")
+	putContained(t, store, "k", plain)
+	sum := sha256.Sum256(plain)
+
+	f := service.NewFetch(store, encrypt.Passthrough{})
+	got, err := f.Materialize(context.Background(), "k")
+	require.NoError(t, err)
+	assert.True(t, got.Ephemeral)
+	assert.False(t, got.Hit)
+	assert.Equal(t, hex.EncodeToString(sum[:]), got.ETag)
+	b, err := os.ReadFile(got.Path)
+	require.NoError(t, err)
+	assert.Equal(t, plain, b)
+	got.Release()
+	_, err = os.Stat(got.Path)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	_, err = f.Materialize(context.Background(), "missing")
+	require.ErrorIs(t, err, domain.ErrNotFound)
+}
+
 func TestFetchMaterializeSoftTTLSkipsHead(t *testing.T) {
 	t.Parallel()
 	inner := newMemStore()

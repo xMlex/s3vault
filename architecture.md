@@ -1,6 +1,6 @@
 # s3vault architecture
 
-s3vault is a Go CLI and HTTP server that archives local files to S3-compatible object storage or a local directory, optionally encrypts them client-side, downloads and decrypts them, and serves plaintext from a local cache.
+s3vault is a Go CLI and HTTP server that archives local files to S3-compatible object storage or a local directory, optionally encrypts them client-side, downloads and decrypts them, and serves plaintext over HTTP (optional persistent disk cache, off by default).
 
 This document is the source of truth for component boundaries, object identity, encryption format, and security constraints. Implementation status is marked per section.
 
@@ -280,11 +280,13 @@ Summary fields: `found`, `uploaded`, `skipped`, `failed`, `bytes_uploaded`, `dur
 
 ## Download
 
-Implemented: `Get` → `DecryptAuto` → file or stdout. HTTP: cache Lookup → soft-TTL / SWR → `http.ServeContent` (Range on plaintext). Stdout downloads are not cached.
+Implemented: `Get` → `DecryptAuto` → file or stdout. HTTP/S3 Get/Head: `Fetch.Materialize` then `http.ServeContent` (Range on seekable plaintext). Stdout downloads are never cached.
 
 ## Cache
 
-Store **decrypted** files on disk.
+`cache.enabled` (default **false**, env `S3VAULT_CACHE_ENABLED`) gates the persistent plaintext disk cache. When disabled, each HTTP/S3 Get/Head decrypts into an ephemeral temp file (`0600`), serves via `ServeContent`, then deletes it — no soft-TTL staleness, no leftover plaintext after the response. CLI `download` is unchanged (never used the disk cache).
+
+When **enabled**, store **decrypted** files on disk:
 
 - Cache id = SHA-256(`Config.CacheNamespace()`, object key, enc fingerprint), so S3 and local entries never collide. Object version (ETag / plaintext SHA-256) is stored in the sidecar, not in the id.
 - Paths: `cache/ab/<hex>` plus sidecar meta (TTL, size, etag, sha256, `validated_at`). Hex-only names; open via `os.Root`.
@@ -292,13 +294,13 @@ Store **decrypted** files on disk.
 - `Populate`: `singleflight` in-process + lockfile across processes; write `*.tmp` → fsync → rename. Identity change for the same id rewrites plaintext.
 - Sidecar `.meta`: unique `*.tmp` → rename (atomic); concurrent Get atime bumps must not tear JSON.
 - Hard TTL (`cache.ttl`, default 168h) + max bytes LRU (atime in meta). Get rewrites atime at most once per minute (not every hit). Expired entries are also dropped lazily on Get/Lookup.
-- Soft TTL (`cache.soft_ttl`, default **20s**): within the window a Materialize hit needs **no S3** call. After soft TTL, stale-while-revalidate serves the entry immediately and runs HEAD in the background; unchanged SHA-256/ETag only bumps `validated_at`, changed identity re-Populates. `soft_ttl: 0` forces a synchronous HEAD on every request.
+- Soft TTL (`cache.soft_ttl`, default **20s**): within the window a Materialize hit needs **no S3** call. After soft TTL, the stale entry is served immediately and runs HEAD in the background; unchanged SHA-256/ETag only bumps `validated_at`, changed identity re-Populates. `soft_ttl: 0` forces a synchronous HEAD on every request.
 - Background sweeper (`cache.sweep_interval`, default **15m**, `0` = off): on `s3vault server`, periodically removes hard-TTL expired entries so unused objects do not linger until LRU pressure. First sweep runs at start.
 - In-memory index (loaded at open, updated on Populate/Get/remove/Clear): O(1) `Usage`, in-memory LRU eviction, Get hits without re-reading JSON. Index miss still falls back to disk (other processes).
 - Corrupt meta → drop entry and miss (re-Populate).
 - Stampede: one download per id+identity; waiters use the same result.
 
-**Risk:** plaintext on disk. Mitigations: loopback server bind, `0700` cache dir, short TTL, optional tmpfs, `cache clear`, do not cache stdout downloads. Soft TTL trades up to `soft_ttl` of possible staleness for fewer S3 HEADs.
+**Risk (when enabled):** plaintext on disk. Mitigations: loopback server bind, `0700` cache dir, short TTL, optional tmpfs, `cache clear`. Soft TTL trades up to `soft_ttl` of possible staleness for fewer backend HEADs. Leave `cache.enabled: false` unless you need hit latency / fewer backend Gets.
 
 ## HTTP server
 
@@ -308,8 +310,8 @@ Listen `127.0.0.1:8080` by default. Empty bearer token + non-loopback listen →
 - `PUT /files/{path...}` — ingest plaintext: spool temp (`0600`) while hashing SHA-256 → same Archive identity/encrypt/Put as CLI `upload` (precomputed hash, no second hash pass). Status: `201` uploaded, `200` identical skip, `204` policy omit (`on_change=skip` with different content), `409` on_change=fail conflict. Optional header `X-S3Vault-Mtime` (RFC3339). Requires Archive wired into the server (always on `s3vault server`).
 - `GET /health`, `GET /ready` (cheap S3 check).
 - Metrics on a **separate** `metrics_listen` (`/metrics`).
-- Serve via `http.ServeContent` after cache populate → Range, `Content-Length`, `Last-Modified`, `ETag`.
-- v1 Range is on **plaintext cache only**. First miss fully decrypts into cache. Seekable ciphertext decrypt is a follow-up (chunk index already supports it).
+- Serve via `http.ServeContent` after `Materialize` → Range, `Content-Length`, `Last-Modified`, `ETag`.
+- With `cache.enabled`: first miss fully decrypts into the disk cache; soft-TTL / SWR as above. With cache disabled: ephemeral temp per request (still seekable for Range). Seekable ciphertext decrypt without spooling is a follow-up (chunk index already supports it).
 
 Graceful `Shutdown` on SIGTERM.
 
@@ -317,10 +319,11 @@ Graceful `Shutdown` on SIGTERM.
 
 Optional path-style S3 API for standard clients (`aws-cli`, SDKs). Enabled when `server.s3_access_key` and `server.s3_secret_key` are set (prefer env `S3VAULT_SERVER_S3_*`).
 
-- **Semantics:** same as `/files` — Put encrypts into backend; Get/Head decrypt into plaintext cache via `Fetch.Materialize` (soft-TTL / SWR: no backend call on fresh hit). Works over either backend; with `backend.type: local` and no bucket configured the facade advertises `s3vault`.
+- **Semantics:** same as `/files` — Put encrypts into backend; Get/Head via `Fetch.Materialize` (disk cache + soft-TTL / SWR when `cache.enabled`, else ephemeral decrypt). Works over either backend; with `backend.type: local` and no bucket configured the facade advertises `s3vault`.
 - **Auth:** AWS SigV4 via `amwolff/awsig`; credentials resolved through `port.S3Identity` (`Lookup` + `Allow`). v1 adapter is static single principal + one virtual bucket (`server.s3_bucket`, default `s3.bucket`). Optional `server.s3_bucket_as_prefix`: any client bucket is allowed and prepended to the object key under backend `s3.bucket` / `s3.prefix` (`s3://reports/a.log` → `{prefix}/reports/a.log`). Future: multi-key / bucket bindings without changing handlers.
 - **Listen:** `server.s3_listen` empty → multiplex on `server.listen` (reserved first segments `health`, `ready`, `files` stay on HTTP Bearer API). Non-empty → dedicated listener (+ `/health` without auth).
 - **Ops:** GetObject, PutObject, DeleteObject, ListObjectsV2, HeadObject, HeadBucket, ListBuckets. No multipart / CreateBucket / virtual-host in v1.
+- **Checksum:** Get/Head/Put responses include `x-amz-checksum-sha256` (base64 of plaintext SHA-256) and `x-amz-checksum-type: FULL_OBJECT` when identity is known. Client request checksum headers are ignored in v1.
 - **Metrics:** existing HTTP instrumentation plus `s3vault_s3_requests_total{op,result}` (low cardinality).
 - Frontend S3 keys are **not** backend `s3.access_key`.
 

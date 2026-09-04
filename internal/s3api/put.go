@@ -69,11 +69,13 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 	case identity.ActionUpload, identity.ActionSkip:
 		w.Header().Set("ETag", strconv.Quote(sum))
 		w.Header().Set("x-amz-request-id", s3err.RequestID(r))
+		setChecksumSHA256(w, sum)
 		w.WriteHeader(http.StatusOK)
 		a.metric("put", "ok")
 	case identity.ActionOmit:
 		w.Header().Set("ETag", strconv.Quote(sum))
 		w.Header().Set("x-amz-request-id", s3err.RequestID(r))
+		setChecksumSHA256(w, sum)
 		w.WriteHeader(http.StatusOK)
 		a.metric("put", "ok")
 	default:

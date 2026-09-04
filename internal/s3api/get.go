@@ -37,6 +37,7 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request, bucket, clientKe
 		s3err.WriteError(w, r, s3err.InternalError, "")
 		return
 	}
+	defer cached.Release()
 	f, err := os.Open(cached.Path)
 	if err != nil {
 		a.metric(op, "error")
@@ -52,6 +53,7 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request, bucket, clientKe
 	w.Header().Set("x-amz-request-id", s3err.RequestID(r))
 	w.Header().Set("ETag", strconv.Quote(cached.ETag))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	setChecksumSHA256(w, cached.SHA256)
 	if headOnly {
 		st, err := f.Stat()
 		if err != nil {

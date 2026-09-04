@@ -441,16 +441,6 @@ func newServerCmd(state *runState) *cobra.Command {
 				return err
 			}
 			defer closeStore()
-			disk, err := cache.New(cache.Options{
-				Dir:      cfg.Cache.Dir,
-				TTL:      cfg.Cache.TTL,
-				MaxBytes: cfg.Cache.MaxBytes,
-			})
-			if err != nil {
-				return err
-			}
-			defer disk.Close()
-			disk.StartSweeper(ctx, cfg.Cache.SweepInterval, state.logger)
 
 			reg := prometheus.NewRegistry()
 			if err := metrics.RegisterRuntime(reg); err != nil {
@@ -460,17 +450,33 @@ func newServerCmd(state *runState) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := met.RegisterCacheUsage(func() (int, int64, error) {
-				st, err := disk.Usage()
-				return st.Entries, st.Bytes, err
-			}); err != nil {
-				return err
-			}
+
 			encFP := encrypt.Fingerprint(cfg.Encryption)
-			fetch := service.NewFetch(store, enc).
-				WithCache(disk, cfg.CacheNamespace(), encFP).
-				WithSoftTTL(cfg.Cache.SoftTTL).
-				WithMetrics(met)
+			fetch := service.NewFetch(store, enc).WithMetrics(met)
+			var disk port.PlaintextCache
+			if cfg.Cache.Enabled {
+				d, err := cache.New(cache.Options{
+					Dir:      cfg.Cache.Dir,
+					TTL:      cfg.Cache.TTL,
+					MaxBytes: cfg.Cache.MaxBytes,
+				})
+				if err != nil {
+					return err
+				}
+				defer d.Close()
+				d.StartSweeper(ctx, cfg.Cache.SweepInterval, state.logger)
+				if err := met.RegisterCacheUsage(func() (int, int64, error) {
+					st, err := d.Usage()
+					return st.Entries, st.Bytes, err
+				}); err != nil {
+					return err
+				}
+				fetch = fetch.WithCache(d, cfg.CacheNamespace(), encFP).WithSoftTTL(cfg.Cache.SoftTTL)
+				disk = d
+				state.logger.Info("plaintext cache enabled", "op", "cache", "dir", d.Dir())
+			} else {
+				state.logger.Info("plaintext cache disabled", "op", "cache")
+			}
 			keys := keying.Mapper{Prefix: cfg.KeyPrefix()}
 			scan := scanner.New(scanner.Options{
 				FollowSymlinks: cfg.Archive.FollowSymlinks,
