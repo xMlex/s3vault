@@ -104,6 +104,24 @@ func TestResolveRemoteLegacyHEADMeta(t *testing.T) {
 	assert.Equal(t, "none", got.Encrypted)
 }
 
+func TestResolveRemoteFallsBackWhenPeekCorruptButHeadHasIdentity(t *testing.T) {
+	t.Parallel()
+	// Magic matches but CRC is wrong — e.g. raw plaintext that starts like
+	// S3VCTR01. Head identity (sidecar / legacy metadata) must still win.
+	bad := make([]byte, container.HeaderSize)
+	copy(bad, container.Magic)
+	store := &rangeStore{
+		meta: map[string]domain.ObjectMeta{
+			"k": {Key: "k", Exists: true, SHA256: "from-sidecar", ContentSize: 3, Encrypted: "none"},
+		},
+		body: map[string][]byte{"k": bad},
+	}
+	got, err := identity.ResolveRemote(context.Background(), store, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "from-sidecar", got.SHA256)
+	assert.Equal(t, int64(3), got.ContentSize)
+}
+
 func TestResolveRemoteMissingObject(t *testing.T) {
 	t.Parallel()
 	store := &rangeStore{meta: map[string]domain.ObjectMeta{}, body: map[string][]byte{}}

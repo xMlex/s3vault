@@ -38,7 +38,7 @@ Fix typos as soon as they show up (code, comments, docs, `.env` keys). Do not ke
 
 - Interfaces: small, in `internal/port` or at the consumer. Return structs from adapters. `var _ port.X = (*T)(nil)`.
 - Stream I/O. No `ReadAll` of user files or S3 bodies.
-- Object identity: S3VCTR01 Range header (plaintext SHA-256 in body). Never treat ETag as content hash. Legacy `s3vault-*` user-metadata is read-only fallback.
+- Object identity: S3VCTR01 Range header (plaintext SHA-256 in body), or Head fields from legacy metadata / local `layout=raw` sidecar. Never treat ETag as content hash.
 - RSA must not encrypt payloads; envelope AES-256-GCM only (`S3VLT01`). Magic bytes, not extensions.
 - External encrypt/decrypt: `exec.CommandContext` with argv slices, never a shell. No secrets in argv.
 - Logs: `log/slog` JSON to stderr. Output/summaries to stdout. Redact keys, PEM, tokens, file contents.

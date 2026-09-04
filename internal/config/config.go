@@ -17,6 +17,7 @@ import (
 // Config is the resolved application configuration.
 type Config struct {
 	Log        LogConfig        `mapstructure:"log"`
+	Backend    BackendConfig    `mapstructure:"backend"`
 	S3         S3Config         `mapstructure:"s3"`
 	Encryption EncryptionConfig `mapstructure:"encryption"`
 	Cache      CacheConfig      `mapstructure:"cache"`
@@ -27,6 +28,30 @@ type Config struct {
 
 type LogConfig struct {
 	Level string `mapstructure:"level"`
+}
+
+// Object store backend types for BackendConfig.Type.
+const (
+	BackendS3    = "s3"
+	BackendLocal = "local"
+)
+
+// BackendConfig selects which ObjectStore adapter is built.
+type BackendConfig struct {
+	Type  string      `mapstructure:"type"`
+	Local LocalConfig `mapstructure:"local"`
+}
+
+// Local filesystem object layouts for LocalConfig.Layout.
+const (
+	LocalLayoutContainer = "container" // S3VCTR01 || payload (S3-parity default)
+	LocalLayoutRaw       = "raw"       // plaintext file + .s3vault-meta sidecar
+)
+
+// LocalConfig configures the local filesystem object store.
+type LocalConfig struct {
+	Dir    string `mapstructure:"dir"`
+	Layout string `mapstructure:"layout"` // container | raw
 }
 
 type S3Config struct {
@@ -110,6 +135,8 @@ type ArchiveConfig struct {
 // SetDefaults registers viper defaults (lowest precedence).
 func SetDefaults(v *viper.Viper) {
 	v.SetDefault("log.level", "info")
+	v.SetDefault("backend.type", BackendS3)
+	v.SetDefault("backend.local.layout", LocalLayoutContainer)
 	v.SetDefault("s3.region", "us-east-1")
 	v.SetDefault("s3.tls", true)
 	v.SetDefault("encryption.mode", "none")
@@ -136,6 +163,9 @@ func SetDefaults(v *viper.Viper) {
 // BindEnv registers those keys so Unmarshal sees them.
 var envKeys = []string{
 	"log.level",
+	"backend.type",
+	"backend.local.dir",
+	"backend.local.layout",
 	"s3.endpoint",
 	"s3.region",
 	"s3.bucket",
@@ -206,6 +236,9 @@ func Load(v *viper.Viper) (Config, error) {
 // Normalize fills derived fields and checks invariants.
 func (c *Config) Normalize() error {
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
+	if err := c.normalizeBackend(); err != nil {
+		return err
+	}
 	c.Encryption.Mode = strings.ToLower(strings.TrimSpace(c.Encryption.Mode))
 	c.Archive.OnChange = strings.ToLower(strings.TrimSpace(c.Archive.OnChange))
 	c.Remote.URL = strings.TrimRight(strings.TrimSpace(c.Remote.URL), "/")
@@ -233,6 +266,9 @@ func (c *Config) Normalize() error {
 	default:
 		return fmt.Errorf("encryption.mode: unknown value %q", c.Encryption.Mode)
 	}
+	if c.Backend.Type == BackendLocal && c.Backend.Local.Layout == LocalLayoutRaw && c.Encryption.Mode != "none" {
+		return fmt.Errorf("backend.local.layout=%q requires encryption.mode=none", LocalLayoutRaw)
+	}
 	c.Encryption.Command.Provider = strings.ToLower(strings.TrimSpace(c.Encryption.Command.Provider))
 	if c.Encryption.Mode == "command" && c.Encryption.Command.Provider == "" {
 		c.Encryption.Command.Provider = "cryptopro"
@@ -242,6 +278,51 @@ func (c *Config) Normalize() error {
 		c.Encryption.Command.Thumbprint = ThumbprintFromArgv(c.Encryption.Command.Encrypt)
 	}
 	return nil
+}
+
+func (c *Config) normalizeBackend() error {
+	c.Backend.Type = strings.ToLower(strings.TrimSpace(c.Backend.Type))
+	if c.Backend.Type == "" {
+		c.Backend.Type = BackendS3
+	}
+	switch c.Backend.Type {
+	case BackendS3:
+	case BackendLocal:
+		dir := strings.TrimSpace(c.Backend.Local.Dir)
+		if dir == "" {
+			return fmt.Errorf("backend.local.dir: required when backend.type is %q", BackendLocal)
+		}
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return fmt.Errorf("backend.local.dir: %w", err)
+		}
+		c.Backend.Local.Dir = abs
+		layout := strings.ToLower(strings.TrimSpace(c.Backend.Local.Layout))
+		if layout == "" {
+			layout = LocalLayoutContainer
+		}
+		switch layout {
+		case LocalLayoutContainer, LocalLayoutRaw:
+			c.Backend.Local.Layout = layout
+		default:
+			return fmt.Errorf("backend.local.layout: unknown value %q", c.Backend.Local.Layout)
+		}
+	default:
+		return fmt.Errorf("backend.type: unknown value %q", c.Backend.Type)
+	}
+	return nil
+}
+
+// KeyPrefix is the object key prefix for any backend. It lives under s3.prefix
+// for config compatibility (the --prefix flag and remote clients use it too).
+func (c Config) KeyPrefix() string { return c.S3.Prefix }
+
+// CacheNamespace isolates plaintext cache ids per backend (see cache.ID).
+func (c Config) CacheNamespace() string {
+	if c.Backend.Type == BackendLocal {
+		return "local:" + c.Backend.Local.Dir
+	}
+	return c.S3.Bucket
 }
 
 // NormalizeThumbprint strips spaces and colons from a SHA-1 hex thumbprint.

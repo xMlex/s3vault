@@ -48,7 +48,9 @@ func ResolveRemote(ctx context.Context, store ObjectIdentity, key string) (domai
 	}
 	hdr, err := container.Parse(buf)
 	if err != nil {
-		if errors.Is(err, container.ErrNotContainer) {
+		// Non-container body, or a corrupt peek while Head already carries
+		// identity (legacy user-metadata / local raw sidecar).
+		if errors.Is(err, container.ErrNotContainer) || meta.SHA256 != "" {
 			return mergeRangeMeta(meta, rangeMeta), nil
 		}
 		return domain.ObjectMeta{}, fmt.Errorf("identity parse %s: %w", key, err)

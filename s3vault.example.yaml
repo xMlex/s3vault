@@ -1,5 +1,15 @@
 log:
   level: info
+backend:
+  type: s3  # s3 | local
+  # local:
+  #   dir: /srv/s3vault/objects  # object tree on this host; s3.* is then unused
+  #   layout: container          # default: S3VCTR01 || payload (S3 parity)
+  #   # layout: raw              # plaintext as-is + *.s3vault-meta (encryption.mode=none only)
+  # Env equivalents (override this file, no YAML needed at all):
+  #   S3VAULT_BACKEND_TYPE=local
+  #   S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
+  #   S3VAULT_BACKEND_LOCAL_LAYOUT=raw
 s3:
   region: us-east-1
   bucket: my-bucket
@@ -26,10 +36,12 @@ cache:
 server:
   listen: "127.0.0.1:8080"
   metrics_listen: "127.0.0.1:9090"
-  # token: set via S3VAULT_SERVER_TOKEN, not in this file
+  # token: set via S3VAULT_SERVER_TOKEN, not in this file.
+  # Required once listen is not loopback (e.g. 0.0.0.0:8080), unless the S3 API
+  # keys below are set; otherwise the server refuses to start.
   # S3 API (SigV4 plaintext facade). Both keys required to enable.
   # s3_listen: ""  # empty = multiplex on listen (reserved: /health /ready /files)
-  # s3_listen: "127.0.0.1:8333"  # or separate port
+  # s3_listen: "127.0.0.1:8333"  # or separate port; needs the key pair below
   # s3_access_key / s3_secret_key: prefer S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY
   # s3_region: us-east-1
   # s3_bucket: my-bucket  # virtual bucket name; default = s3.bucket

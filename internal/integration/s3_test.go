@@ -23,8 +23,10 @@ import (
 	"github.com/xMlex/s3vault/internal/domain"
 	"github.com/xMlex/s3vault/internal/identity"
 	"github.com/xMlex/s3vault/internal/keying"
+	"github.com/xMlex/s3vault/internal/port"
 	"github.com/xMlex/s3vault/internal/s3test"
 	"github.com/xMlex/s3vault/internal/service"
+	"github.com/xMlex/s3vault/internal/storetest"
 )
 
 func TestS3PutHeadGetSkip(t *testing.T) {
@@ -139,6 +141,14 @@ func TestEncryptedUploadDownload(t *testing.T) {
 	got, err := os.ReadFile(dest)
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
+}
+
+// TestS3Conformance runs the same contract checks as the local backend.
+func TestS3Conformance(t *testing.T) {
+	storetest.RunConformance(t, func(t *testing.T) (port.ObjectStore, string) {
+		store, prefix := newStore(t)
+		return store, prefix
+	})
 }
 
 func newStore(t *testing.T) (*s3store.Store, string) {

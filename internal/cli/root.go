@@ -19,6 +19,7 @@ import (
 
 	"github.com/xMlex/s3vault/internal/adapter/cache"
 	"github.com/xMlex/s3vault/internal/adapter/encrypt"
+	"github.com/xMlex/s3vault/internal/adapter/local"
 	"github.com/xMlex/s3vault/internal/adapter/remote"
 	"github.com/xMlex/s3vault/internal/adapter/s3"
 	"github.com/xMlex/s3vault/internal/adapter/s3auth"
@@ -36,6 +37,10 @@ import (
 )
 
 const envPrefix = "S3VAULT"
+
+// defaultVirtualBucket names the bucket the S3 facade advertises when neither
+// server.s3_bucket nor s3.bucket is set (local backend).
+const defaultVirtualBucket = "s3vault"
 
 // Options are compile-time CLI parameters.
 type Options struct {
@@ -67,7 +72,7 @@ func NewRootCommand(opt Options) *cobra.Command {
 
 	root := &cobra.Command{
 		Use:           "s3vault",
-		Short:         "Archive files to S3-compatible object storage",
+		Short:         "Archive files to S3-compatible object storage or a local directory",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
@@ -196,7 +201,7 @@ func newArchiveCmd(state *runState) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "archive <dir>",
-		Short: "Find files older than a period and upload them to S3",
+		Short: "Find files older than a period and upload them to the object store",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := state.cfg
@@ -216,7 +221,7 @@ func newArchiveCmd(state *runState) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			keys := keying.Mapper{Prefix: cfg.S3.Prefix}
+			keys := keying.Mapper{Prefix: cfg.KeyPrefix()}
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
@@ -231,10 +236,11 @@ func newArchiveCmd(state *runState) *cobra.Command {
 			}
 			defer stop()
 
-			svc, err := newArchiveService(ctx, state, cfg, keys, dryRun)
+			svc, closeStore, err := newArchiveService(ctx, state, cfg, keys, dryRun)
 			if err != nil {
 				return err
 			}
+			defer closeStore()
 			svc = svc.WithMetrics(met)
 			st, err := svc.Run(ctx, service.ArchiveOptions{
 				Root:              args[0],
@@ -263,8 +269,8 @@ func newArchiveCmd(state *runState) *cobra.Command {
 	cmd.Flags().IntVar(&workers, "workers", 0, "parallel workers (default from config)")
 	cmd.Flags().BoolVar(&failFast, "fail-fast", false, "stop on the first file error")
 	cmd.Flags().StringVar(&output, "output", "text", "summary format: text|json")
-	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix joined with paths under <dir> (e.g. fs.auto-sopd)")
-	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket")
+	cmd.Flags().StringVar(&prefix, "prefix", "", "object key prefix joined with paths under <dir> (e.g. fs.auto-sopd)")
+	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket (backend.type=s3 only)")
 	cmd.Flags().BoolVar(&deleteAfter, "delete-after-upload", false, "delete local file after a successful upload")
 	cmd.Flags().BoolVar(&deleteIfExist, "delete-if-exists", false, "delete local file when remote already has identical content (skip)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "prometheus bind address for the duration of the run")
@@ -297,7 +303,7 @@ func newUploadCmd(state *runState) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "upload <file>",
-		Short: "Upload a single file to S3 (same identity and encryption as archive)",
+		Short: "Upload a single file to the object store (same identity and encryption as archive)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := state.cfg
@@ -322,7 +328,7 @@ func newUploadCmd(state *runState) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			keys := keying.Mapper{Prefix: cfg.S3.Prefix}
+			keys := keying.Mapper{Prefix: cfg.KeyPrefix()}
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
@@ -336,10 +342,11 @@ func newUploadCmd(state *runState) *cobra.Command {
 				return err
 			}
 			defer stop()
-			svc, err := newArchiveService(ctx, state, cfg, keys, dryRun)
+			svc, closeStore, err := newArchiveService(ctx, state, cfg, keys, dryRun)
 			if err != nil {
 				return err
 			}
+			defer closeStore()
 			svc = svc.WithMetrics(met)
 			st, _, err := svc.UploadFile(ctx, info, service.ArchiveOptions{
 				Root:              root,
@@ -358,8 +365,8 @@ func newUploadCmd(state *runState) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&key, "key", "", "object key relative to --prefix / s3.prefix (default: filename under --root)")
 	cmd.Flags().StringVar(&root, "root", "", "keying root (default: parent directory of the file)")
-	cmd.Flags().StringVar(&prefix, "prefix", "", "S3 key prefix joined with --key or filename (e.g. fs.auto-user-avatars)")
-	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket")
+	cmd.Flags().StringVar(&prefix, "prefix", "", "object key prefix joined with --key or filename (e.g. fs.auto-user-avatars)")
+	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket (backend.type=s3 only)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the object key without uploading")
 	cmd.Flags().BoolVar(&deleteAfter, "delete-after-upload", false, "delete local file after a successful upload")
 	cmd.Flags().BoolVar(&deleteIfExist, "delete-if-exists", false, "delete local file when remote already has identical content (skip)")
@@ -372,7 +379,7 @@ func newDownloadCmd(state *runState) *cobra.Command {
 	var metricsListen string
 	cmd := &cobra.Command{
 		Use:   "download <object-key> [destination]",
-		Short: "Download an object from S3 and decrypt if needed",
+		Short: "Download an object from the object store and decrypt if needed",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dest := "-"
@@ -387,10 +394,11 @@ func newDownloadCmd(state *runState) *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			store, err := s3store.New(ctx, state.cfg.S3)
+			store, closeStore, err := newObjectStore(ctx, state.cfg, state.logger)
 			if err != nil {
 				return err
 			}
+			defer closeStore()
 			met, stop, err := startMetrics(metricsListen)
 			if err != nil {
 				return err
@@ -428,10 +436,11 @@ func newServerCmd(state *runState) *cobra.Command {
 			if ctx == nil {
 				ctx = context.Background()
 			}
-			store, err := s3store.New(ctx, cfg.S3)
+			store, closeStore, err := newObjectStore(ctx, cfg, state.logger)
 			if err != nil {
 				return err
 			}
+			defer closeStore()
 			disk, err := cache.New(cache.Options{
 				Dir:      cfg.Cache.Dir,
 				TTL:      cfg.Cache.TTL,
@@ -459,10 +468,10 @@ func newServerCmd(state *runState) *cobra.Command {
 			}
 			encFP := encrypt.Fingerprint(cfg.Encryption)
 			fetch := service.NewFetch(store, enc).
-				WithCache(disk, cfg.S3.Bucket, encFP).
+				WithCache(disk, cfg.CacheNamespace(), encFP).
 				WithSoftTTL(cfg.Cache.SoftTTL).
 				WithMetrics(met)
-			keys := keying.Mapper{Prefix: cfg.S3.Prefix}
+			keys := keying.Mapper{Prefix: cfg.KeyPrefix()}
 			scan := scanner.New(scanner.Options{
 				FollowSymlinks: cfg.Archive.FollowSymlinks,
 				Logger:         state.logger,
@@ -477,7 +486,11 @@ func newServerCmd(state *runState) *cobra.Command {
 			if cfg.Server.S3APIEnabled() {
 				virtBucket := cfg.Server.S3Bucket
 				if virtBucket == "" {
+					// A local backend has no bucket of its own.
 					virtBucket = cfg.S3.Bucket
+				}
+				if virtBucket == "" {
+					virtBucket = defaultVirtualBucket
 				}
 				region := cfg.Server.S3Region
 				if region == "" {
@@ -502,7 +515,7 @@ func newServerCmd(state *runState) *cobra.Command {
 					Keys:           keys,
 					Store:          store,
 					Cache:          disk,
-					BucketBackend:  cfg.S3.Bucket,
+					BucketBackend:  cfg.CacheNamespace(),
 					BucketAsPrefix: cfg.Server.S3BucketAsPrefix,
 					EncFP:          encFP,
 					Logger:         state.logger,
@@ -538,8 +551,8 @@ func newServerCmd(state *runState) *cobra.Command {
 			if s3Handler == nil {
 				s3Addr = "off"
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "listening http=%s s3=%s metrics=%s\n",
-				cfg.Server.Listen, s3Addr, cfg.Server.MetricsListen)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "listening http=%s s3=%s metrics=%s backend=%s\n",
+				cfg.Server.Listen, s3Addr, cfg.Server.MetricsListen, cfg.Backend.Type)
 			return srv.Run(ctx)
 		},
 	}
@@ -629,15 +642,42 @@ func startMetrics(listen string) (*metrics.Collector, func(), error) {
 	return m, stop, nil
 }
 
-// newArchiveService builds archive/upload with either remote HTTP ingest or local S3+encrypt.
-func newArchiveService(ctx context.Context, state *runState, cfg config.Config, keys keying.Mapper, dryRun bool) (*service.Archive, error) {
+// newObjectStore builds the backend selected by backend.type and logs where
+// objects live. The returned closer releases backend resources and is always
+// safe to call.
+func newObjectStore(ctx context.Context, cfg config.Config, log *slog.Logger) (port.ObjectStore, func(), error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	if cfg.Backend.Type == config.BackendLocal {
+		store, err := localstore.New(cfg.Backend.Local)
+		if err != nil {
+			return nil, nil, err
+		}
+		log.Info("object store ready", "op", "backend", "backend", config.BackendLocal,
+			"dir", store.Dir(), "layout", store.Layout(), "prefix", cfg.KeyPrefix())
+		return store, func() { _ = store.Close() }, nil
+	}
+	store, err := s3store.New(ctx, cfg.S3)
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Info("object store ready", "op", "backend", "backend", config.BackendS3,
+		"bucket", cfg.S3.Bucket, "endpoint", cfg.S3.Endpoint, "prefix", cfg.KeyPrefix())
+	return store, func() {}, nil
+}
+
+// newArchiveService builds archive/upload with either remote HTTP ingest or a
+// local backend store plus encryptor. The returned closer releases the store.
+func newArchiveService(ctx context.Context, state *runState, cfg config.Config, keys keying.Mapper, dryRun bool) (*service.Archive, func(), error) {
+	noop := func() {}
 	scan := scanner.New(scanner.Options{
 		FollowSymlinks: cfg.Archive.FollowSymlinks,
 		Logger:         state.logger,
 	})
 	if cfg.Remote.URL != "" {
 		if dryRun {
-			return service.NewArchive(scan, keys, nil, encrypt.Passthrough{}, state.logger), nil
+			return service.NewArchive(scan, keys, nil, encrypt.Passthrough{}, state.logger), noop, nil
 		}
 		rc, err := remote.New(remote.Options{
 			BaseURL:      cfg.Remote.URL,
@@ -645,21 +685,20 @@ func newArchiveService(ctx context.Context, state *runState, cfg config.Config, 
 			RateLimitBPS: cfg.Remote.RateLimitBPS,
 		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return service.NewArchive(scan, keys, nil, encrypt.Passthrough{}, state.logger).WithRemote(rc), nil
+		return service.NewArchive(scan, keys, nil, encrypt.Passthrough{}, state.logger).WithRemote(rc), noop, nil
 	}
 	enc, err := encrypt.New(cfg.Encryption)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var store port.ObjectStore
-	if !dryRun {
-		st, err := s3store.New(ctx, cfg.S3)
-		if err != nil {
-			return nil, err
-		}
-		store = st
+	if dryRun {
+		return service.NewArchive(scan, keys, nil, enc, state.logger), noop, nil
 	}
-	return service.NewArchive(scan, keys, store, enc, state.logger), nil
+	store, closeStore, err := newObjectStore(ctx, cfg, state.logger)
+	if err != nil {
+		return nil, nil, err
+	}
+	return service.NewArchive(scan, keys, store, enc, state.logger), closeStore, nil
 }

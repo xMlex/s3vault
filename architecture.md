@@ -1,6 +1,6 @@
 # s3vault architecture
 
-s3vault is a Go CLI and HTTP server that archives local files to S3-compatible object storage, optionally encrypts them client-side, downloads and decrypts them, and serves plaintext from a local cache.
+s3vault is a Go CLI and HTTP server that archives local files to S3-compatible object storage or a local directory, optionally encrypts them client-side, downloads and decrypts them, and serves plaintext from a local cache.
 
 This document is the source of truth for component boundaries, object identity, encryption format, and security constraints. Implementation status is marked per section.
 
@@ -9,7 +9,7 @@ This document is the source of truth for component boundaries, object identity, 
 - Production-small binary: stdlib first, few mature dependencies.
 - Stream large files; do not `ReadAll` object bodies.
 - Idempotent uploads via HEAD metadata, not ETag.
-- Swappable S3, encryption, and cache backends behind small interfaces.
+- Swappable object store, encryption, and cache backends behind small interfaces.
 - Secrets never on the command line or in unstructured logs.
 
 Local files are kept after a successful upload unless `--delete-after-upload` is set.
@@ -35,7 +35,7 @@ CLI (cobra) ──► ArchiveService ──► (optional) RemoteIngest HTTP PUT
          ▼            ▼            ▼
       Scanner     ObjectStore   Encryptor
          │            │            │
-      filesystem      S3        native / command / none
+      filesystem   S3 | local   native / command / none
                                    │
                               PlaintextCache (disk)
 
@@ -46,6 +46,8 @@ S3 API (SigV4) ──► same Fetch/Archive via S3Identity
 Interfaces live in `internal/port` (multiple consumers). Adapters return concrete types. Compile-time checks: `var _ port.Scanner = (*scanner.FS)(nil)`.
 
 `ObjectStore` includes `Head`/`Put`/`Get`/`GetRange`/`Delete`/`List`. Frontend S3 auth uses `port.S3Identity` (`Lookup`, `Allow`).
+
+`backend.type` picks the `ObjectStore` adapter (`s3` or `local`); `cli.newObjectStore` is the only construction site and logs the resolved location once per run (`op=backend`: `dir` + `layout` for local, `bucket`/`endpoint` for S3). Everything above the port — services, HTTP, S3 facade, identity — is backend-agnostic. `internal/storetest.RunConformance` pins the shared contract for both adapters.
 
 ## Layout
 
@@ -59,6 +61,7 @@ Interfaces live in `internal/port` (multiple consumers). Adapters return concret
 | `internal/service` | Archive and Fetch orchestration |
 | `internal/adapter/scanner` | Recursive walk, mtime filter, symlink policy |
 | `internal/adapter/s3` | AWS SDK v2 client (AWS and MinIO) |
+| `internal/adapter/local` | Local filesystem object store (`os.Root`, atomic Put) |
 | `internal/adapter/encrypt` | Passthrough, native S3VLT01, external command |
 | `internal/adapter/remote` | HTTP client for remote ingest (`PUT /files/...`) |
 | `internal/adapter/cache` | Disk plaintext cache (`os.Root`, lockfile, LRU) |
@@ -72,6 +75,7 @@ Interfaces live in `internal/port` (multiple consumers). Adapters return concret
 | `internal/container` | Fixed S3VCTR01 object envelope (identity in body) |
 | `internal/hash` | Streaming SHA-256 of local files |
 | `internal/port/cache.go` | Cache port |
+| `internal/storetest` | Shared `ObjectStore` contract checks (local + S3) |
 
 There is no `pkg/`. `internal/app` is reserved if composition outgrows `internal/cli`.
 
@@ -134,7 +138,25 @@ Search path: `--config`, then `./s3vault.yaml`, then `$XDG_CONFIG_HOME/s3vault/s
 
 Secrets belong in env (`S3VAULT_S3_SECRET_KEY`, AWS SDK chain) or `0600` key files. If `s3.secret_key` or `server.token` appear in the YAML, log a warning unless `s3.allow_secrets_in_config: true`.
 
+Backend: `backend.type` is `s3` (default) or `local`; `local` requires `backend.local.dir`, resolved to an absolute path in `Normalize`. `backend.local.layout` is `container` (default) or `raw`; `raw` requires `encryption.mode=none`.
+
 S3: endpoint, region, bucket, prefix, access/secret/session, TLS, path-style. Empty endpoint uses AWS defaults; non-empty endpoint targets MinIO and other S3-compatible APIs.
+
+The object key prefix stays in `s3.prefix` for both backends (`--prefix`, `S3VAULT_S3_PREFIX` and remote clients already use it); read it through `Config.KeyPrefix()`. `Config.CacheNamespace()` is the per-backend cache namespace: the bucket for S3, `local:<dir>` for the local store.
+
+## Local filesystem backend
+
+`internal/adapter/local` stores each object as one file under `backend.local.dir`.
+
+- **`layout: container` (default):** each file holds exactly the bytes S3 would hold (`S3VCTR01` container plus payload), so identity, dedup, encryption and the S3 facade behave the same.
+- **`layout: raw`:** plaintext is stored as-is (no `S3VCTR01` prefix). Identity lives in an adjacent sidecar `*.s3vault-meta` (exact 128-byte `S3VCTR01` header). Requires `encryption.mode=none` (config rejects otherwise). `Head`/`Get` expose sidecar fields so `identity.ResolveRemote` can skip/dedup without Range magic. Sidecars are never listed; keys ending in `.s3vault-meta` are reserved. `Delete` removes the object first, then the sidecar (so a failed object remove cannot leave plaintext without identity).
+
+- Access goes through `os.Root`; keys must survive `path.Clean` unchanged and be `filepath.IsLocal`, otherwise `domain.ErrInvalidPath`. `.s3vault-tmp/` is reserved and never listed.
+- The directory is created `0700` when missing (an existing directory keeps its mode); object files are `0600`.
+- `Put` streams into a temp file in `.s3vault-tmp/`, then `Sync` + `rename`; interrupted writes are dropped when the store is opened. Parent directories are created `0700`. Raw layout also writes the sidecar via the same temp/rename path after stripping an incoming EncNone container.
+- `Head` reports `Exists=false` for a missing key (and for a path whose parent is a regular file); `Get`/`GetRange` return `domain.ErrNotFound`.
+- `Delete` succeeds on a missing key and prunes directories it leaves empty.
+- Deliberate differences from S3: `ETag` is synthetic (size + mtime, quoted) and only feeds cache revalidation — content identity still comes from the container header or raw sidecar; a range starting past the last byte yields an empty body instead of `416`; a key cannot be both a file and a directory (S3 allows `a` and `a/b`); `List` walks and sorts the whole tree under the prefix, so it is linear in object count.
 
 ## Scanner and symlinks
 
@@ -164,9 +186,9 @@ Before Put:
 
 1. Stream local plaintext SHA-256 (`internal/hash`).
 2. Resolve remote identity (`internal/identity.ResolveRemote`):
-   - `HeadObject` for existence / ETag / LastModified.
+   - `HeadObject` for existence / ETag / LastModified (and any identity already on Head: legacy user-metadata or local raw sidecar).
    - `GetRange` bytes `0-127`, parse S3VCTR01 (CRC-checked).
-   - If not a container: keep any legacy HEAD user-metadata.
+   - If not a container (or peek is corrupt while Head already has SHA-256): keep Head identity.
 3. Compare identity fields:
 
 | Source | Meaning |
@@ -264,7 +286,7 @@ Implemented: `Get` → `DecryptAuto` → file or stdout. HTTP: cache Lookup → 
 
 Store **decrypted** files on disk.
 
-- Cache id = SHA-256(`bucket`, object key, enc fingerprint). Object version (ETag / plaintext SHA-256) is stored in the sidecar, not in the id.
+- Cache id = SHA-256(`Config.CacheNamespace()`, object key, enc fingerprint), so S3 and local entries never collide. Object version (ETag / plaintext SHA-256) is stored in the sidecar, not in the id.
 - Paths: `cache/ab/<hex>` plus sidecar meta (TTL, size, etag, sha256, `validated_at`). Hex-only names; open via `os.Root`.
 - Files `0600`, dirs `0700`.
 - `Populate`: `singleflight` in-process + lockfile across processes; write `*.tmp` → fsync → rename. Identity change for the same id rewrites plaintext.
@@ -280,7 +302,7 @@ Store **decrypted** files on disk.
 
 ## HTTP server
 
-Listen `127.0.0.1:8080` by default. Empty bearer token + non-loopback listen → refuse to start unless S3 frontend credentials are set (multiplexed S3 API).
+Listen `127.0.0.1:8080` by default. Empty bearer token + non-loopback listen → refuse to start unless S3 frontend credentials are set (multiplexed S3 API); `server.s3_listen` without those credentials is refused too. Both checks are backend-independent and name the offending address plus the config keys and env vars that fix them (`ErrTokenRequired`, `ErrS3CredsRequired` in `internal/httpserver/bind.go`).
 
 - `GET`/`HEAD /files/{path...}` — same keying as upload; max path 2048.
 - `PUT /files/{path...}` — ingest plaintext: spool temp (`0600`) while hashing SHA-256 → same Archive identity/encrypt/Put as CLI `upload` (precomputed hash, no second hash pass). Status: `201` uploaded, `200` identical skip, `204` policy omit (`on_change=skip` with different content), `409` on_change=fail conflict. Optional header `X-S3Vault-Mtime` (RFC3339). Requires Archive wired into the server (always on `s3vault server`).
@@ -295,7 +317,7 @@ Graceful `Shutdown` on SIGTERM.
 
 Optional path-style S3 API for standard clients (`aws-cli`, SDKs). Enabled when `server.s3_access_key` and `server.s3_secret_key` are set (prefer env `S3VAULT_SERVER_S3_*`).
 
-- **Semantics:** same as `/files` — Put encrypts into backend; Get/Head decrypt into plaintext cache via `Fetch.Materialize` (soft-TTL / SWR: no backend call on fresh hit).
+- **Semantics:** same as `/files` — Put encrypts into backend; Get/Head decrypt into plaintext cache via `Fetch.Materialize` (soft-TTL / SWR: no backend call on fresh hit). Works over either backend; with `backend.type: local` and no bucket configured the facade advertises `s3vault`.
 - **Auth:** AWS SigV4 via `amwolff/awsig`; credentials resolved through `port.S3Identity` (`Lookup` + `Allow`). v1 adapter is static single principal + one virtual bucket (`server.s3_bucket`, default `s3.bucket`). Optional `server.s3_bucket_as_prefix`: any client bucket is allowed and prepended to the object key under backend `s3.bucket` / `s3.prefix` (`s3://reports/a.log` → `{prefix}/reports/a.log`). Future: multi-key / bucket bindings without changing handlers.
 - **Listen:** `server.s3_listen` empty → multiplex on `server.listen` (reserved first segments `health`, `ready`, `files` stay on HTTP Bearer API). Non-empty → dedicated listener (+ `/health` without auth).
 - **Ops:** GetObject, PutObject, DeleteObject, ListObjectsV2, HeadObject, HeadBucket, ListBuckets. No multipart / CreateBucket / virtual-host in v1.
@@ -346,7 +368,7 @@ Disk cache is custom (samber/hot is in-memory). Retry-go is unused; SDK retries 
 
 ## Tests
 
-Unit (present): period parser, keying, identity, scanner, native/command encrypt, config, archive skip, single-file upload, fetch download, disk cache, HTTP Range/auth, Prometheus collectors.
+Unit (present): period parser, keying, identity, scanner, native/command encrypt, config, archive skip, single-file upload, fetch download, disk cache, HTTP Range/auth, Prometheus collectors, local backend (contract, keys, ranges, list) and a CLI upload/download roundtrip over the local backend.
 
 Integration (planned, `//go:build integration`): MinIO — upload, skip, change, encrypt roundtrip, command encrypt, cache stampede, corrupt object, S3 down, interrupted download, graceful shutdown.
 
@@ -366,4 +388,5 @@ CI (planned): `go test -race`, golangci-lint, gosec, govulncheck.
 | `upload` command | Done |
 | Remote ingest (`PUT /files`, `remote.url`) | Done |
 | S3 API gateway (SigV4, Get/Put/Delete/ListV2 + Head) | Done |
+| Local filesystem backend (`backend.type: local`) | Done |
 | Docker, MinIO tests, CI | Not started |

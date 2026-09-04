@@ -1,6 +1,6 @@
 # s3vault
 
-Утилита на Go: находит локальные файлы старше заданного периода, загружает их в S3-совместимое хранилище, при необходимости шифрует на клиенте и скачивает уже в открытом виде.
+Утилита на Go: находит локальные файлы старше заданного периода, загружает их в S3-совместимое хранилище или в локальную директорию, при необходимости шифрует на клиенте и скачивает уже в открытом виде.
 
 Повторная загрузка того же содержимого пропускается (SHA-256 plaintext в заголовке объекта `S3VCTR01` и, по возможности, в user-metadata; без опоры на ETag). После успешного upload локальный файл **не удаляется**, пока не указан `--delete-after-upload`. Если объект уже есть с тем же содержимым (skip) — `--delete-if-exists`.
 
@@ -8,7 +8,7 @@
 
 ## Что уже есть и чего нет
 
-Работает: `archive` (включая `--dry-run`), `upload`, `download`, `server` (HTTP `/files` + optional S3 SigV4 API), `cache stats|clear`, шифрование `none` / `native` / `command`, Prometheus-метрики (HTTP, S3 API, кэш, upload/download).
+Работает: `archive` (включая `--dry-run`), `upload`, `download`, `server` (HTTP `/files` + optional S3 SigV4 API), `cache stats|clear`, шифрование `none` / `native` / `command`, Prometheus-метрики (HTTP, S3 API, кэш, upload/download). Бэкенд хранения — S3 или локальная директория (`backend.type`).
 
 Docker-образа и systemd-unit в репозитории нет — ниже запуск бинарём.
 
@@ -54,6 +54,9 @@ go test -tags=integration -count=1 ./internal/integration/   # нужен дос
 
 | Переменная | Назначение |
 | --- | --- |
+| `S3VAULT_BACKEND_TYPE` | Бэкенд хранения: `s3` (по умолчанию) или `local` |
+| `S3VAULT_BACKEND_LOCAL_DIR` | Директория объектов при `backend.type=local` |
+| `S3VAULT_BACKEND_LOCAL_LAYOUT` | `container` (по умолчанию) или `raw` (чистые файлы + sidecar; только с `encryption.mode=none`) |
 | `S3VAULT_S3_ENDPOINT` | URL API. Пусто = AWS. Для MinIO: `http://s3.example:9000` |
 | `S3VAULT_S3_REGION` | Регион (для MinIO часто `us-east-1`) |
 | `S3VAULT_S3_BUCKET` | Бакет |
@@ -74,6 +77,39 @@ go test -tags=integration -count=1 ./internal/integration/   # нужен дос
 | `S3VAULT_SERVER_S3_REGION` | Region для SigV4 (default `us-east-1`) |
 
 Файл `.env` использует те же имена `S3VAULT_*`. CLI его сам не читает — сделайте `set -a && source .env && set +a` или экспортируйте переменные иначе. Integration-тесты подхватывают `.env` автоматически.
+
+### Бэкенд хранения: S3 или локальная директория
+
+`backend.type` выбирает, куда пишет `archive` / `upload` и откуда читают `download` и `server`:
+
+```yaml
+backend:
+  type: local
+  local:
+    dir: /srv/s3vault/objects
+    # layout: container  # default — S3VCTR01 || payload (как в S3)
+    # layout: raw        # plaintext as-is + *.s3vault-meta; требует encryption.mode=none
+```
+
+То же самое только через окружение — YAML при этом не нужен вовсе:
+
+```bash
+export S3VAULT_BACKEND_TYPE=local
+export S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
+# export S3VAULT_BACKEND_LOCAL_LAYOUT=raw
+export S3VAULT_S3_PREFIX=backups          # необязательно: общий префикс ключей
+
+s3vault archive /data/app --older-than 7d
+s3vault download backups/app.log /tmp/app.log
+```
+
+Как и для остальных настроек, приоритет прежний: флаги > `S3VAULT_*` > YAML > умолчания, так что `S3VAULT_BACKEND_TYPE=local` переопределяет `backend.type: s3` из файла.
+
+При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. По умолчанию (`layout: container`) формат объекта тот же, что в S3 (контейнер `S3VCTR01` + payload), поэтому шифрование, dedup по SHA-256, `download`, HTTP `/files` и S3 SigV4-фасад работают одинаково на обоих бэкендах. `layout: raw` пишет plaintext без заголовка и держит identity в sidecar `*.s3vault-meta` (только при `encryption.mode=none`). Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
+
+Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime), а идентичность содержимого берётся из `S3VCTR01` или raw-sidecar.
+
+Смена бэкенда меняет namespace дискового кэша, поэтому записи S3 и локального хранилища в кэше не пересекаются.
 
 ### MinIO / S3-compatible
 
@@ -105,7 +141,7 @@ export S3VAULT_S3_SECRET_KEY=...
 ### Команды
 
 ```bash
-# Какие файлы ушли бы в S3 (mtime старше 7 дней)
+# Какие файлы ушли бы в хранилище (mtime старше 7 дней)
 s3vault archive /data/app --older-than 7d --dry-run --prefix backups
 
 # Загрузка
@@ -130,7 +166,14 @@ s3vault download backups/logs/app.log /tmp/app.log
 
 Симлинки по умолчанию пропускаются. Локальный файл после upload остаётся на диске.
 
-Логи — JSON в stderr, итоговая строка archive — в stdout (`--output json` для машинного вида).
+Логи — структурированные в stderr, итоговая строка archive — в stdout (`--output json` для машинного вида).
+
+Первая строка лога любой команды, работающей с хранилищем (`archive`, `upload`, `download`, `server`), показывает выбранный бэкенд и куда именно пишутся объекты:
+
+```text
+level=INFO msg="object store ready" op=backend backend=local dir=/srv/s3vault/objects layout=container prefix=backups
+level=INFO msg="object store ready" op=backend backend=s3 bucket=my-bucket endpoint="" prefix=backups
+```
 
 ## Шифрование
 
@@ -387,6 +430,34 @@ curl -X PUT -H "Authorization: Bearer $S3VAULT_SERVER_TOKEN" \
   --data-binary @./app.log http://127.0.0.1:8080/files/logs/app.log
 ```
 
+### Доступ извне: аутентификация обязательна
+
+По умолчанию сервер слушает loopback и стартует без токена. Как только `server.listen` смотрит наружу (`0.0.0.0:8080`, LAN-адрес и т.п.), процесс откажется стартовать, пока не настроен хотя бы один способ аутентификации:
+
+```text
+unauthenticated server on a non-loopback address: listen "0.0.0.0:8080" accepts remote clients,
+so set one of: server.token (env S3VAULT_SERVER_TOKEN) for the HTTP API,
+or both server.s3_access_key and server.s3_secret_key
+(env S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY) for the S3 API;
+or bind to 127.0.0.1 instead
+```
+
+Проверка касается только адреса прослушивания и не зависит от `backend.type` — на локальном бэкенде она ровно такая же. Любой из трёх вариантов снимает ошибку:
+
+```bash
+# 1) Bearer-токен для HTTP API /files
+export S3VAULT_SERVER_TOKEN='<длинная случайная строка>'
+
+# 2) или ключи S3-фасада (SigV4) — включают S3 API и одновременно закрывают bind
+export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
+export S3VAULT_SERVER_S3_SECRET_KEY=vaultsk
+
+# 3) или оставить сервер на loopback и ходить через reverse proxy / SSH-туннель
+s3vault server --listen 127.0.0.1:8080
+```
+
+Отдельно: если задан `server.s3_listen` (или `--s3-listen`), но ключи `server.s3_access_key` / `server.s3_secret_key` не заданы, сервер тоже не стартует — S3-фасад без ключей включить нельзя (`S3 API listen address without S3 credentials`). Уберите `s3_listen` или задайте пару ключей.
+
 ### S3 API (aws-cli / SDK)
 
 ```bash
@@ -401,7 +472,7 @@ aws --endpoint-url http://127.0.0.1:8080 s3 cp ./file s3://my-bucket/logs/file -
 # клиенту нужен path-style (UsePathStyle / s3ForcePathStyle)
 ```
 
-Ключи `S3VAULT_SERVER_S3_*` — **frontend** (SigV4 к vault), не путать с `S3VAULT_S3_*` к backend storage. Virtual bucket: `server.s3_bucket` (по умолчанию = `s3.bucket`). При `server.s3_bucket_as_prefix` / `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` любое имя bucket в path-style URL допускается и становится префиксом ключа в backend (`s3://reports/a.log` → `{s3.prefix}/reports/a.log` в `s3.bucket`). Multipart upload в v1 нет.
+Ключи `S3VAULT_SERVER_S3_*` — **frontend** (SigV4 к vault), не путать с `S3VAULT_S3_*` к backend storage. Virtual bucket: `server.s3_bucket` (по умолчанию = `s3.bucket`, а при локальном бэкенде без него — `s3vault`). При `server.s3_bucket_as_prefix` / `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` любое имя bucket в path-style URL допускается и становится префиксом ключа в backend (`s3://reports/a.log` → `{s3.prefix}/reports/a.log` в `s3.bucket`). Multipart upload в v1 нет.
 
 На хосте **без** CryptoPro / S3-ключей:
 
@@ -416,10 +487,10 @@ s3vault upload /var/log/app/app.log --key logs/app.log
 - `GET`/`HEAD /files/{path...}` — тот же prefix, что у archive; путь не длиннее 2048.
 - `PUT /files/{path...}` — plaintext → identity/encrypt/Put на сервере; `201` uploaded, `200` identical skip, `204` policy omit (`on_change=skip`), `409` conflict (`on_change=fail`).
 - `GET /health` — процесс жив (без токена).
-- `GET /ready` — дешёвый HEAD в S3.
+- `GET /ready` — дешёвый HEAD в бэкенде хранения.
 - Prometheus: отдельный `server.metrics_listen` (по умолчанию `127.0.0.1:9090`), путь `/metrics`. Без меток с полным path. На `archive`/`upload`/`download` тот же endpoint можно поднять на время команды через `--metrics-listen`.
-- Кэш: каталог `0700`, файлы `0600`, id = SHA-256(bucket, key, enc fingerprint). `s3vault cache stats` / `cache clear`.
-- Пустой `server.token` и bind не на loopback — процесс не стартует (достаточно S3 frontend keys, если включён S3 API).
+- Кэш: каталог `0700`, файлы `0600`, id = SHA-256(namespace бэкенда, key, enc fingerprint). `s3vault cache stats` / `cache clear`.
+- Пустой `server.token` и bind не на loopback — процесс не стартует (достаточно S3 frontend keys, если включён S3 API). См. «Доступ извне: аутентификация обязательна».
 
 SIGTERM/SIGINT — graceful `Shutdown` (HTTP + optional S3 listen + metrics).
 

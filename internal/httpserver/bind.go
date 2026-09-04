@@ -2,17 +2,18 @@ package httpserver
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 )
 
 // ErrTokenRequired is returned when listen is not loopback and neither bearer
 // token nor S3 frontend credentials are configured.
-var ErrTokenRequired = errors.New("server.token or server.s3 credentials are required when listen is not loopback")
+var ErrTokenRequired = errors.New("unauthenticated server on a non-loopback address")
 
-// ErrS3CredsRequired is returned when S3 listen is non-loopback (or requested)
+// ErrS3CredsRequired is returned when a dedicated S3 listen address is set
 // without frontend S3 access/secret keys.
-var ErrS3CredsRequired = errors.New("server.s3_access_key and server.s3_secret_key are required for S3 API on non-loopback listen")
+var ErrS3CredsRequired = errors.New("S3 API listen address without S3 credentials")
 
 // ListenIsLoopback reports whether addr binds only to a loopback address.
 func ListenIsLoopback(addr string) bool {
@@ -38,18 +39,19 @@ func checkBind(listen, token string, s3API bool) error {
 	if token != "" || s3API {
 		return nil
 	}
-	return ErrTokenRequired
+	return fmt.Errorf("%w: listen %q accepts remote clients, so set one of: "+
+		"server.token (env S3VAULT_SERVER_TOKEN) for the HTTP API, "+
+		"or both server.s3_access_key and server.s3_secret_key "+
+		"(env S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY) for the S3 API; "+
+		"or bind to 127.0.0.1 instead", ErrTokenRequired, listen)
 }
 
 func checkS3Listen(s3Listen string, s3API bool) error {
-	if s3Listen == "" {
+	if s3Listen == "" || s3API {
 		return nil
 	}
-	if !s3API {
-		return ErrS3CredsRequired
-	}
-	if !ListenIsLoopback(s3Listen) && !s3API {
-		return ErrS3CredsRequired
-	}
-	return nil
+	return fmt.Errorf("%w: server.s3_listen is %q but the S3 API is off, so set both "+
+		"server.s3_access_key and server.s3_secret_key "+
+		"(env S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY), "+
+		"or clear server.s3_listen", ErrS3CredsRequired, s3Listen)
 }

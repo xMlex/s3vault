@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -21,6 +22,80 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, "none", cfg.Encryption.Mode)
 	assert.NotEmpty(t, cfg.Cache.Dir)
 	assert.False(t, cfg.Server.S3BucketAsPrefix)
+	assert.Equal(t, BackendS3, cfg.Backend.Type)
+}
+
+func TestBackendLocal(t *testing.T) {
+	t.Parallel()
+	v := viper.New()
+	SetDefaults(v)
+	v.Set("backend.type", " LOCAL ")
+	v.Set("backend.local.dir", "objects")
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.Equal(t, BackendLocal, cfg.Backend.Type)
+	assert.Equal(t, LocalLayoutContainer, cfg.Backend.Local.Layout)
+	assert.True(t, filepath.IsAbs(cfg.Backend.Local.Dir), "dir is resolved to an absolute path")
+	assert.Equal(t, "local:"+cfg.Backend.Local.Dir, cfg.CacheNamespace())
+}
+
+func TestBackendLocalRawLayout(t *testing.T) {
+	t.Parallel()
+	v := viper.New()
+	SetDefaults(v)
+	v.Set("backend.type", "local")
+	v.Set("backend.local.dir", "objects")
+	v.Set("backend.local.layout", " RAW ")
+	v.Set("encryption.mode", "none")
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.Equal(t, LocalLayoutRaw, cfg.Backend.Local.Layout)
+}
+
+func TestBackendLocalRawRequiresNoEncryption(t *testing.T) {
+	t.Parallel()
+	v := viper.New()
+	SetDefaults(v)
+	v.Set("backend.type", "local")
+	v.Set("backend.local.dir", "objects")
+	v.Set("backend.local.layout", "raw")
+	v.Set("encryption.mode", "native")
+	_, err := Load(v)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "layout")
+}
+
+func TestBackendInvalid(t *testing.T) {
+	t.Parallel()
+	tests := map[string]map[string]any{
+		"unknown type":         {"backend.type": "gcs"},
+		"local without dir":    {"backend.type": "local"},
+		"unknown local layout": {"backend.type": "local", "backend.local.dir": "objects", "backend.local.layout": "mirror"},
+	}
+	for name, values := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			v := viper.New()
+			SetDefaults(v)
+			for key, val := range values {
+				v.Set(key, val)
+			}
+			_, err := Load(v)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestCacheNamespaceS3(t *testing.T) {
+	t.Parallel()
+	v := viper.New()
+	SetDefaults(v)
+	v.Set("s3.bucket", "my-bucket")
+	v.Set("s3.prefix", "backups")
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.Equal(t, "my-bucket", cfg.CacheNamespace())
+	assert.Equal(t, "backups", cfg.KeyPrefix())
 }
 
 func TestLoadInvalidOlderThan(t *testing.T) {
@@ -84,6 +159,8 @@ func TestEnvWithoutYAMLDefault(t *testing.T) {
 	t.Setenv("S3VAULT_S3_SECRET_KEY", "env-secret")
 	t.Setenv("S3VAULT_REMOTE_URL", "https://remote.example:8080/")
 	t.Setenv("S3VAULT_SERVER_S3_BUCKET_AS_PREFIX", "true")
+	t.Setenv("S3VAULT_BACKEND_TYPE", "local")
+	t.Setenv("S3VAULT_BACKEND_LOCAL_DIR", "/srv/s3vault/objects")
 
 	v := viper.New()
 	SetDefaults(v)
@@ -99,6 +176,8 @@ func TestEnvWithoutYAMLDefault(t *testing.T) {
 	assert.Equal(t, "env-secret", cfg.S3.SecretKey)
 	assert.Equal(t, "https://remote.example:8080", cfg.Remote.URL)
 	assert.True(t, cfg.Server.S3BucketAsPrefix)
+	assert.Equal(t, BackendLocal, cfg.Backend.Type)
+	assert.Equal(t, "/srv/s3vault/objects", cfg.Backend.Local.Dir)
 }
 
 func TestEnvIgnoredWithoutBindEnv(t *testing.T) {
