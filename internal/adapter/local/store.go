@@ -8,6 +8,8 @@ package localstore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -26,6 +29,10 @@ import (
 const (
 	fileMode fs.FileMode = 0o600
 	dirMode  fs.FileMode = 0o700
+
+	// shaCacheMax bounds the raw-layout SHA-256 memo per process. One arbitrary
+	// entry is dropped on overflow; entries are cheap and re-derivable.
+	shaCacheMax = 4096
 )
 
 // tmpSeq makes concurrent Put temp names distinct within a process.
@@ -36,6 +43,17 @@ type Store struct {
 	root   *os.Root
 	dir    string
 	layout string
+	// shaCache memoizes raw-layout plaintext SHA-256 per path. Only touched for
+	// layout=raw, where there is no container header to read the digest from.
+	shaMu    sync.Mutex
+	shaCache map[string]shaEntry
+}
+
+// shaEntry is a cached digest validated by size and mtime.
+type shaEntry struct {
+	size  int64
+	mtime int64
+	sum   string
 }
 
 var _ port.ObjectStore = (*Store)(nil)
@@ -66,7 +84,7 @@ func New(cfg config.LocalConfig) (*Store, error) {
 		_ = root.Close()
 		return nil, fmt.Errorf("clean local store temp: %w", err)
 	}
-	return &Store{root: root, dir: cfg.Dir, layout: layout}, nil
+	return &Store{root: root, dir: cfg.Dir, layout: layout, shaCache: make(map[string]shaEntry)}, nil
 }
 
 // Close releases the directory file descriptor.
@@ -106,7 +124,15 @@ func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error)
 	if !fi.Mode().IsRegular() {
 		return domain.ObjectMeta{Key: key, Exists: false}, nil
 	}
-	return objectMeta(key, fi), nil
+	meta := objectMeta(key, fi)
+	if s.layout == config.LocalLayoutRaw {
+		sum, err := s.sha256For(ctx, key, rel, fi)
+		if err != nil {
+			return domain.ObjectMeta{}, err
+		}
+		meta.SHA256 = sum
+	}
+	return meta, nil
 }
 
 func (s *Store) Put(ctx context.Context, key string, r io.Reader, _ domain.PutMeta) error {
@@ -161,7 +187,73 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, domain.Obje
 	if err != nil {
 		return nil, domain.ObjectMeta{}, err
 	}
-	return f, objectMeta(key, fi), nil
+	meta := objectMeta(key, fi)
+	if s.layout == config.LocalLayoutRaw {
+		rel, err := relPath(key)
+		if err != nil {
+			_ = f.Close()
+			return nil, domain.ObjectMeta{}, err
+		}
+		sum, err := s.sha256ForFile(ctx, key, rel, fi, f)
+		if err != nil {
+			_ = f.Close()
+			return nil, domain.ObjectMeta{}, err
+		}
+		meta.SHA256 = sum
+	}
+	return f, meta, nil
+}
+
+// sha256For returns a raw-layout object's plaintext SHA-256, reading the file
+// on a cache miss. layout=raw has no container header, so this is the only way
+// to expose identity; the digest is memoized by (path, size, mtime).
+func (s *Store) sha256For(ctx context.Context, key, rel string, fi fs.FileInfo) (string, error) {
+	if sum, ok := s.cachedSHA(rel, fi); ok {
+		return sum, nil
+	}
+	f, err := s.root.Open(rel)
+	if err != nil {
+		return "", fmt.Errorf("hash %s: %w", key, err)
+	}
+	defer func() { _ = f.Close() }()
+	return s.sha256ForFile(ctx, key, rel, fi, f)
+}
+
+// sha256ForFile digests f and rewinds it, so the caller can still stream the
+// file. A cache hit skips the read entirely.
+func (s *Store) sha256ForFile(ctx context.Context, key, rel string, fi fs.FileInfo, f *os.File) (string, error) {
+	if sum, ok := s.cachedSHA(rel, fi); ok {
+		return sum, nil
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, ctxReader{ctx: ctx, r: f}); err != nil {
+		return "", fmt.Errorf("hash %s: %w", key, err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("rewind %s: %w", key, err)
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	s.rememberSHA(rel, fi, sum)
+	return sum, nil
+}
+
+func (s *Store) cachedSHA(rel string, fi fs.FileInfo) (string, bool) {
+	s.shaMu.Lock()
+	defer s.shaMu.Unlock()
+	e, ok := s.shaCache[rel]
+	return e.sum, ok && e.size == fi.Size() && e.mtime == fi.ModTime().UnixNano()
+}
+
+func (s *Store) rememberSHA(rel string, fi fs.FileInfo, sum string) {
+	s.shaMu.Lock()
+	defer s.shaMu.Unlock()
+	if len(s.shaCache) >= shaCacheMax {
+		for k := range s.shaCache {
+			delete(s.shaCache, k)
+			break
+		}
+	}
+	s.shaCache[rel] = shaEntry{size: fi.Size(), mtime: fi.ModTime().UnixNano(), sum: sum}
 }
 
 // GetRange returns bytes [start, end] inclusive. An end past the last byte is

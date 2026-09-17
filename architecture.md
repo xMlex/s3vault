@@ -74,8 +74,9 @@ Interfaces live in `internal/port` (multiple consumers). Adapters return concret
 | `internal/identity` | Skip / overwrite / fail from HEAD metadata or S3VCTR01 Range |
 | `internal/container` | Fixed S3VCTR01 object envelope (identity in body) |
 | `internal/hash` | Streaming SHA-256 of local files |
-| `internal/port/cache.go` | Cache port |
 | `internal/storetest` | Shared `ObjectStore` contract checks (local + S3) |
+| `internal/s3test` | S3 config from repo `.env`/process env for integration tests |
+| `internal/integration` | `//go:build integration` end-to-end tests against live S3/MinIO |
 
 There is no `pkg/`. `internal/app` is reserved if composition outgrows `internal/cli`.
 
@@ -149,7 +150,7 @@ The object key prefix stays in `s3.prefix` for both backends (`--prefix`, `S3VAU
 `internal/adapter/local` stores each object as one file under `backend.local.dir`.
 
 - **`layout: container` (default):** each file holds exactly the bytes S3 would hold (`S3VCTR01` container plus payload), so identity, dedup, encryption and the S3 facade behave the same.
-- **`layout: raw`:** plaintext is stored as-is (no `S3VCTR01` prefix). Requires `encryption.mode=none` (config rejects otherwise). Without a container header there is no remote content hash, so archive skip/dedup by SHA-256 is unavailable; an existing object is always treated as changed, so `on_change=overwrite` re-uploads, `skip` omits, and `fail` fails. `Archive` detects this via `Store.StoresPlaintext()`, skips hashing the local file and the `GetRange` peek, and uploads bare payload without a container header.
+- **`layout: raw`:** plaintext is stored as-is (no `S3VCTR01` prefix). Requires `encryption.mode=none` (config rejects otherwise). There is no stored content hash, so the store derives the plaintext SHA-256 from the file and memoizes it in memory per `(path, size, mtime)`; a cache miss reads the object once (first `Head`/`Get` per process). `Head`/`Get` therefore expose identity, and the S3 facade / HTTP answers carry `ETag` and `x-amz-checksum-sha256`. `Archive` keeps its `Store.StoresPlaintext()` fast path — it does not hash the local file and passes no digest to `Decide` — so a blank `layout=raw` archive never content-skips: `on_change=overwrite` re-uploads, `skip` omits, `fail` fails.
 
 - Access goes through `os.Root`; keys must survive `path.Clean` unchanged and be `filepath.IsLocal`, otherwise `domain.ErrInvalidPath`. `.s3vault-tmp/` is reserved and never listed.
 - The directory is created `0700` when missing (an existing directory keeps its mode); object files are `0600`.
@@ -189,7 +190,7 @@ Before Put:
    - `HeadObject` for existence / ETag / LastModified (and any identity already on Head: legacy user-metadata).
    - `GetRange` bytes `0-127`, parse S3VCTR01 (CRC-checked).
    - If not a container (or peek is corrupt while Head already has SHA-256): keep Head identity.
-   - For a plaintext store (`layout=raw`, `Store.StoresPlaintext()`) steps 1–2 collapse to a single `Head` / `HeadObject`: there is no container header to hash or peek, and the payload is uploaded without one.
+   - For a plaintext store (`layout=raw`, `Store.StoresPlaintext()`) `Head` returns the plaintext SHA-256 the store derives from the file (memoized in memory; the first call reads the object once). `Archive` does not hash the local file for such a store, so its `Decide` gets an empty local digest and never skips; HTTP/S3 GET/HEAD still get full identity without a container.
 3. Compare identity fields:
 
 | Source | Meaning |
@@ -311,7 +312,7 @@ Listen `127.0.0.1:8080` by default. Empty bearer token + non-loopback listen →
 - `PUT /files/{path...}` — ingest plaintext: spool temp (`0600`) while hashing SHA-256 → same Archive identity/encrypt/Put as CLI `upload` (precomputed hash, no second hash pass). Status: `201` uploaded, `200` identical skip, `204` policy omit (`on_change=skip` with different content), `409` on_change=fail conflict. Optional header `X-S3Vault-Mtime` (RFC3339). Requires Archive wired into the server (always on `s3vault server`).
 - `GET /health`, `GET /ready` (cheap S3 check).
 - Metrics on a **separate** `metrics_listen` (`/metrics`).
-- Serve via `http.ServeContent` after `Materialize` → Range, `Content-Length`, `Last-Modified`, `ETag`.
+- Serve via `http.ServeContent` after `Materialize` → Range, `Content-Length`, `Last-Modified`, `ETag`. `ETag` is always emitted as a single valid quoted value: plaintext SHA-256 when known, otherwise the backend ETag with any incoming quotes stripped (local synthetic and S3 ETags both arrive pre-quoted).
 - With `cache.enabled`: first miss fully decrypts into the disk cache; soft-TTL / SWR as above. With cache disabled: ephemeral temp per request (still seekable for Range). Seekable ciphertext decrypt without spooling is a follow-up (chunk index already supports it).
 
 Graceful `Shutdown` on SIGTERM.
@@ -324,7 +325,7 @@ Optional path-style S3 API for standard clients (`aws-cli`, SDKs). Enabled when 
 - **Auth:** AWS SigV4 via `amwolff/awsig`; credentials resolved through `port.S3Identity` (`Lookup` + `Allow`). v1 adapter is static single principal + one virtual bucket (`server.s3_bucket`, default `s3.bucket`). Optional `server.s3_bucket_as_prefix`: any client bucket is allowed and prepended to the object key under backend `s3.bucket` / `s3.prefix` (`s3://reports/a.log` → `{prefix}/reports/a.log`). Future: multi-key / bucket bindings without changing handlers.
 - **Listen:** `server.s3_listen` empty → multiplex on `server.listen` (reserved first segments `health`, `ready`, `files` stay on HTTP Bearer API). Non-empty → dedicated listener (+ `/health` without auth).
 - **Ops:** GetObject, PutObject, DeleteObject, ListObjectsV2, HeadObject, HeadBucket, ListBuckets. No multipart / CreateBucket / virtual-host in v1.
-- **Checksum:** Get/Head/Put responses include `x-amz-checksum-sha256` (base64 of plaintext SHA-256) and `x-amz-checksum-type: FULL_OBJECT` when identity is known. Client request checksum headers are ignored in v1.
+- **Checksum:** Get/Head/Put responses include `x-amz-checksum-sha256` (base64 of plaintext SHA-256) and `x-amz-checksum-type: FULL_OBJECT` when identity is known (for `layout=raw` the local store derives it from the file — see Local filesystem backend). Client request checksum headers are ignored in v1.
 - **Metrics:** existing HTTP instrumentation plus `s3vault_s3_requests_total{op,result}` (low cardinality).
 - Frontend S3 keys are **not** backend `s3.access_key`.
 
@@ -368,15 +369,17 @@ Prometheus (low cardinality — no full path labels) on `metrics_listen` (server
 | stdlib crypto | AES-GCM, RSA-OAEP | age (poor Range story) |
 | testify | Tests | — |
 
-Disk cache is custom (samber/hot is in-memory). Retry-go is unused; SDK retries S3.
+Disk cache is custom (samber/hot is in-memory). No retry library: the AWS SDK retries S3 calls.
 
 ## Tests
 
-Unit (present): period parser, keying, identity, scanner, native/command encrypt, config, archive skip, single-file upload, fetch download, disk cache, HTTP Range/auth, Prometheus collectors, local backend (contract, keys, ranges, list) and a CLI upload/download roundtrip over the local backend.
+Unit (`go test ./...`, no S3 and no `.env`): period parser, keying, identity, scanner, native/command encrypt, config, archive skip, single-file upload, fetch download, disk cache, HTTP Range/auth, Prometheus collectors, container, local backend (contract, keys, ranges, list, raw layout) and a CLI upload/download roundtrip over the local backend. Run with `-race`. `internal/storetest.RunConformance` is the shared `ObjectStore` contract, exercised by both `internal/adapter/local` and the S3 integration test.
 
-Integration (planned, `//go:build integration`): MinIO — upload, skip, change, encrypt roundtrip, command encrypt, cache stampede, corrupt object, S3 down, interrupted download, graceful shutdown.
+Integration (`//go:build integration`, `internal/integration`, live S3/MinIO): Put/Head/Get/skip, archive then skip, encrypted roundtrip, and the store conformance suite. `internal/s3test.ConfigFromEnv` reads the repo `.env` (process env wins) and `t.Skip`s when endpoint/bucket/access/secret are unset.
 
-CI (planned): `go test -race`, golangci-lint, gosec, govulncheck.
+Not yet covered: command-mode encryption against a real provider, cache stampede, corrupt object, S3 down, interrupted download, graceful shutdown.
+
+CI: `.github/workflows/go.yml` runs `go build -v ./...` and `go test -v ./...` on push/PR to `main` (Go 1.26). Not yet in CI: `-race`, golangci-lint, gosec, govulncheck, an integration job.
 
 ## Status
 
@@ -392,5 +395,7 @@ CI (planned): `go test -race`, golangci-lint, gosec, govulncheck.
 | `upload` command | Done |
 | Remote ingest (`PUT /files`, `remote.url`) | Done |
 | S3 API gateway (SigV4, Get/Put/Delete/ListV2 + Head) | Done |
-| Local filesystem backend (`backend.type: local`) | Done |
-| Docker, MinIO tests, CI | Not started |
+| Local filesystem backend (`backend.type: local`, container + raw) | Done |
+| MinIO integration tests (happy paths + store conformance) | Partial |
+| GitHub Actions (build + `go test`; no race/lint/integration) | Partial |
+| Docker / compose, CI hardening (`-race`, lint, gosec, vulncheck), GoReleaser | Not started |

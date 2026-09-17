@@ -338,6 +338,12 @@ func newTestAPI(t *testing.T, bucket string) (*s3api.API, func()) {
 
 func newTestAPIWith(t *testing.T, bucket string, bucketAsPrefix bool) (*s3api.API, func()) {
 	t.Helper()
+	api, _, cleanup := newTestAPIStore(t, bucket, bucketAsPrefix)
+	return api, cleanup
+}
+
+func newTestAPIStore(t *testing.T, bucket string, bucketAsPrefix bool) (*s3api.API, *memStore, func()) {
+	t.Helper()
 	store := newMemStore()
 	disk, err := cache.New(cache.Options{Dir: t.TempDir(), TTL: time.Hour, MaxBytes: 1 << 20})
 	require.NoError(t, err)
@@ -374,5 +380,55 @@ func newTestAPIWith(t *testing.T, bucket string, bucketAsPrefix bool) (*s3api.AP
 		EncFP:          "fp",
 	})
 	require.NoError(t, err)
-	return api, func() { _ = disk.Close() }
+	return api, store, func() { _ = disk.Close() }
+}
+
+// A raw/legacy object has no container SHA-256 and carries a pre-quoted ETag;
+// the facade must still emit a single, valid ETag and no checksum header.
+func TestSDKHeadValidETagWithoutContainer(t *testing.T) {
+	t.Parallel()
+	api, store, cleanup := newTestAPIStore(t, "vault", false)
+	t.Cleanup(cleanup)
+
+	srv := httptest.NewServer(api.Handler())
+	t.Cleanup(srv.Close)
+
+	const quoted = `"c-18d60b88a89c5eea"`
+	store.mu.Lock()
+	store.body["backups/docs/raw.txt"] = []byte("raw-plaintext")
+	store.meta["backups/docs/raw.txt"] = domain.ObjectMeta{
+		Key:          "backups/docs/raw.txt",
+		Exists:       true,
+		Size:         int64(len("raw-plaintext")),
+		ETag:         quoted,
+		LastModified: time.Unix(1_700_000_000, 0).UTC(),
+	}
+	store.mu.Unlock()
+
+	client := s3.New(s3.Options{
+		BaseEndpoint: aws.String(srv.URL),
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("AKIATEST", "secretsecretsecretsecret", ""),
+		UsePathStyle: true,
+	})
+
+	head, err := client.HeadObject(context.Background(), &s3.HeadObjectInput{
+		Bucket: aws.String("vault"),
+		Key:    aws.String("docs/raw.txt"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, quoted, aws.ToString(head.ETag))
+	assert.Empty(t, aws.ToString(head.ChecksumSHA256))
+
+	got, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String("vault"),
+		Key:    aws.String("docs/raw.txt"),
+	})
+	require.NoError(t, err)
+	defer func() { _ = got.Body.Close() }()
+	assert.Equal(t, quoted, aws.ToString(got.ETag))
+	assert.Empty(t, aws.ToString(got.ChecksumSHA256))
+	body, err := io.ReadAll(got.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "raw-plaintext", string(body))
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,7 +63,7 @@ func TestRawLayoutStripsContainerToCleanFile(t *testing.T) {
 	meta, err := st.Head(ctx, "logs/app.log")
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(payload)), meta.Size)
-	assert.Empty(t, meta.SHA256)
+	assert.Equal(t, hex.EncodeToString(sha256Sum(payload)), meta.SHA256)
 
 	rc, getMeta, err := st.Get(ctx, "logs/app.log")
 	require.NoError(t, err)
@@ -70,7 +71,7 @@ func TestRawLayoutStripsContainerToCleanFile(t *testing.T) {
 	require.NoError(t, rc.Close())
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
-	assert.Empty(t, getMeta.SHA256)
+	assert.Equal(t, hex.EncodeToString(sha256Sum(payload)), getMeta.SHA256)
 
 	page, err := st.List(ctx, domain.ListOptions{})
 	require.NoError(t, err)
@@ -78,7 +79,65 @@ func TestRawLayoutStripsContainerToCleanFile(t *testing.T) {
 	assert.Equal(t, "logs/app.log", page.Contents[0].Key)
 }
 
-func TestRawLayoutNoContentHashSkip(t *testing.T) {
+// raw layout has no container header; the store derives plaintext SHA-256 from
+// the file itself (memoized in memory) so GET/HEAD can expose identity.
+func TestRawLayoutHeadReportsSHA256(t *testing.T) {
+	t.Parallel()
+	st, _ := newRawStore(t)
+	ctx := context.Background()
+	payload := []byte("dedup me")
+	body := contained(t, payload, time.Now().UTC())
+	require.NoError(t, st.Put(ctx, "k.bin", bytes.NewReader(body), domain.PutMeta{}))
+
+	want := hex.EncodeToString(sha256Sum(payload))
+	remote, err := identity.ResolveRemote(ctx, st, "k.bin")
+	require.NoError(t, err)
+	assert.Equal(t, want, remote.SHA256)
+}
+
+// The memo is keyed by size+mtime, so rewriting an object re-derives the digest.
+func TestRawLayoutSHACacheInvalidatesOnRewrite(t *testing.T) {
+	t.Parallel()
+	st, _ := newRawStore(t)
+	ctx := context.Background()
+	require.NoError(t, st.Put(ctx, "k.bin", strings.NewReader("first"), domain.PutMeta{}))
+	first, err := st.Head(ctx, "k.bin")
+	require.NoError(t, err)
+	require.NotEmpty(t, first.SHA256)
+
+	require.NoError(t, st.Put(ctx, "k.bin", strings.NewReader("second-longer"), domain.PutMeta{}))
+	second, err := st.Head(ctx, "k.bin")
+	require.NoError(t, err)
+	assert.NotEqual(t, first.SHA256, second.SHA256)
+	assert.Equal(t, hex.EncodeToString(sha256Sum([]byte("second-longer"))), second.SHA256)
+}
+
+// The memo is consulted before reading: rewrite the bytes in place but restore
+// size and mtime, and the cached digest is served instead of a re-read.
+func TestRawLayoutSHACacheHitAvoidsReread(t *testing.T) {
+	t.Parallel()
+	st, dir := newRawStore(t)
+	ctx := context.Background()
+	payload := []byte("first")
+	require.NoError(t, st.Put(ctx, "k.bin", bytes.NewReader(payload), domain.PutMeta{}))
+	fi, err := os.Stat(filepath.Join(dir, "k.bin"))
+	require.NoError(t, err)
+
+	first, err := st.Head(ctx, "k.bin")
+	require.NoError(t, err)
+	require.Equal(t, hex.EncodeToString(sha256Sum(payload)), first.SHA256)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "k.bin"), []byte("other"), 0o600))
+	require.NoError(t, os.Chtimes(filepath.Join(dir, "k.bin"), fi.ModTime(), fi.ModTime()))
+
+	second, err := st.Head(ctx, "k.bin")
+	require.NoError(t, err)
+	assert.Equal(t, first.SHA256, second.SHA256)
+}
+
+// Archive keeps the raw fast path: it never hashes the local file, so Decide
+// sees an empty local digest and re-uploads even though the store reports one.
+func TestRawLayoutArchivePassesNoLocalDigest(t *testing.T) {
 	t.Parallel()
 	st, _ := newRawStore(t)
 	ctx := context.Background()
@@ -88,9 +147,9 @@ func TestRawLayoutNoContentHashSkip(t *testing.T) {
 
 	remote, err := identity.ResolveRemote(ctx, st, "k.bin")
 	require.NoError(t, err)
-	sum := hex.EncodeToString(sha256Sum(payload))
-	assert.Equal(t, identity.ActionUpload, identity.Decide(sum, int64(len(payload)), remote, identity.OnChangeOverwrite),
-		"raw layout has no remote SHA-256 for skip")
+	assert.Equal(t,
+		identity.ActionUpload,
+		identity.Decide("", int64(len(payload)), remote, identity.OnChangeOverwrite))
 }
 
 func TestRawLayoutPassthroughWithoutContainer(t *testing.T) {
@@ -106,7 +165,7 @@ func TestRawLayoutPassthroughWithoutContainer(t *testing.T) {
 
 	meta, err := st.Head(ctx, "plain.txt")
 	require.NoError(t, err)
-	assert.Empty(t, meta.SHA256)
+	assert.Equal(t, hex.EncodeToString(sha256Sum(payload)), meta.SHA256)
 }
 
 func TestRawLayoutRejectsEncryptedContainer(t *testing.T) {

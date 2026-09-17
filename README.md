@@ -2,7 +2,7 @@
 
 Утилита на Go: находит локальные файлы старше заданного периода, загружает их в S3-совместимое хранилище или в локальную директорию, при необходимости шифрует на клиенте и скачивает уже в открытом виде.
 
-Повторная загрузка того же содержимого пропускается (SHA-256 plaintext в заголовке объекта `S3VCTR01` и, по возможности, в user-metadata; без опоры на ETag). После успешного upload локальный файл **не удаляется**, пока не указан `--delete-after-upload`. Если объект уже есть с тем же содержимым (skip) — `--delete-if-exists`.
+Повторная загрузка того же содержимого пропускается по идентичности из заголовка объекта `S3VCTR01` (SHA-256 plaintext); ETag как хеш содержимого не используется. Legacy-объекты со старым `s3vault-*` user-metadata читаются как fallback, но новые Put его не пишут. После успешного upload локальный файл **не удаляется**, пока не указан `--delete-after-upload`. Если объект уже есть с тем же содержимым (skip) — `--delete-if-exists`.
 
 Архитектура: [architecture.md](architecture.md).
 
@@ -14,7 +14,7 @@ Docker-образа и systemd-unit в репозитории нет — ниж�
 
 ## Сборка
 
-Нужен Go 1.24+ (в `go.mod` зафиксирована версия toolchain).
+Нужен Go 1.26+ (в `go.mod` зафиксирована версия toolchain).
 
 ```bash
 git clone <repo>
@@ -27,8 +27,11 @@ make build
 Проверки:
 
 ```bash
-go test ./...
-go test -tags=integration -count=1 ./internal/integration/   # нужен доступ к S3, см. ниже
+make test                                                    # go test -race -count=1 ./...
+go vet ./...
+gofmt -l .
+golangci-lint run --new-from-rev=HEAD ./...                  # дерево не lint-clean: смотрите только свою дельту
+go test -tags=integration -count=1 ./internal/integration/   # нужен доступ к S3, иначе skip; см. ниже
 ```
 
 ## Развёртывание
@@ -400,7 +403,7 @@ Legacy-объекты без `S3VCTR01` / без metadata расшифровыв
 
 ## Тесты против живого S3
 
-Integration-тесты читают корневой `.env` (те же `S3VAULT_*`, что и приложение):
+Integration-тесты читают корневой `.env` (те же `S3VAULT_*`, что и приложение; переменные процесса имеют приоритет). Если `S3VAULT_S3_ENDPOINT`, `S3VAULT_S3_BUCKET`, `S3VAULT_S3_ACCESS_KEY` и `S3VAULT_S3_SECRET_KEY` не заданы, тесты пропускаются (`t.Skip`), а не падают.
 
 ```bash
 # .env — не коммитить; см. .env.example
@@ -497,4 +500,6 @@ SIGTERM/SIGINT — graceful `Shutdown` (HTTP + optional S3 listen + metrics).
 
 ## Дальше
 
-Docker-образа и GitHub Actions ещё нет.
+GitHub Actions (`.github/workflows/go.yml`) уже есть: `go build -v ./...` + `go test -v ./...` на push/PR в `main`.
+
+Ещё нет: Docker-образа / compose и CI-джобы с MinIO; в CI не запускаются `-race`, golangci-lint, gosec, govulncheck; GoReleaser. Unit-тесты (включая `-race`) и integration против живого S3/MinIO гоняйте локально — см. «Тесты против живого S3».

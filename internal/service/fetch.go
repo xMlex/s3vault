@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -371,12 +372,15 @@ func cacheStillValid(cached port.EntryMeta, remote domain.ObjectMeta) bool {
 	return false
 }
 
+// etagForHTTP returns an unquoted ETag value; callers add the RFC 7232 quotes
+// via strconv.Quote. Prefer plaintext SHA-256, then the backend ETag (which may
+// arrive pre-quoted from S3 or from the local synthetic validator), then the id.
 func etagForHTTP(meta port.EntryMeta, id port.CacheID) string {
 	if meta.SHA256 != "" {
 		return meta.SHA256
 	}
-	if meta.ETag != "" {
-		return meta.ETag
+	if e := strings.Trim(meta.ETag, `"`); e != "" {
+		return e
 	}
 	return string(id)
 }
