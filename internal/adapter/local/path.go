@@ -30,9 +30,6 @@ func relPath(key string) (string, error) {
 	if key == tmpDir || strings.HasPrefix(key, tmpDir+"/") {
 		return "", fmt.Errorf("%w: object key %q is reserved", domain.ErrInvalidPath, key)
 	}
-	if strings.HasSuffix(key, metaSuffix) {
-		return "", fmt.Errorf("%w: object key %q is reserved", domain.ErrInvalidPath, key)
-	}
 	rel := filepath.FromSlash(key)
 	if !filepath.IsLocal(rel) {
 		return "", fmt.Errorf("%w: object key %q", domain.ErrInvalidPath, key)

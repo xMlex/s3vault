@@ -13,6 +13,7 @@ import (
 
 	localstore "github.com/xMlex/s3vault/internal/adapter/local"
 	"github.com/xMlex/s3vault/internal/config"
+	"github.com/xMlex/s3vault/internal/container"
 	"github.com/xMlex/s3vault/internal/domain"
 )
 
@@ -204,7 +205,6 @@ func TestInvalidKeysRejected(t *testing.T) {
 		`a\b.txt`,
 		"a\x00b.txt",
 		".s3vault-tmp/put-1",
-		"a.log.s3vault-meta",
 	}
 	for _, key := range keys {
 		t.Run(key, func(t *testing.T) {
@@ -340,6 +340,114 @@ func TestNewRequiresDirAndCleansTemp(t *testing.T) {
 
 	_, err = os.Stat(stale)
 	assert.True(t, os.IsNotExist(err), "interrupted Put temp files are dropped at open")
+}
+
+func TestStoreCapabilities(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	st, err := localstore.New(config.LocalConfig{Dir: dir})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	assert.Equal(t, config.LocalLayoutContainer, st.Layout())
+	assert.False(t, st.StoresPlaintext())
+	assert.Equal(t, dir, st.Dir())
+
+	rawDir := t.TempDir()
+	raw, err := localstore.New(config.LocalConfig{Dir: rawDir, Layout: config.LocalLayoutRaw})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	assert.Equal(t, config.LocalLayoutRaw, raw.Layout())
+	assert.True(t, raw.StoresPlaintext())
+	assert.Equal(t, rawDir, raw.Dir())
+}
+
+func TestNewRejectsUnsupportedLayout(t *testing.T) {
+	t.Parallel()
+	_, err := localstore.New(config.LocalConfig{Dir: t.TempDir(), Layout: "bogus"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not supported")
+}
+
+// A key that names a directory is not an object: reads report it as missing.
+func TestHeadOnDirectoryKey(t *testing.T) {
+	t.Parallel()
+	st, _ := newStore(t)
+	ctx := context.Background()
+	put(t, st, "dir/obj", "x")
+
+	meta, err := st.Head(ctx, "dir")
+	require.NoError(t, err)
+	assert.False(t, meta.Exists)
+
+	_, _, err = st.Get(ctx, "dir")
+	require.ErrorIs(t, err, domain.ErrNotFound)
+
+	_, _, err = st.GetRange(ctx, "dir", 0, 127)
+	require.ErrorIs(t, err, domain.ErrNotFound)
+}
+
+func TestContextCancellation(t *testing.T) {
+	t.Parallel()
+	st, _ := newStore(t)
+	put(t, st, "a/b.txt", "data")
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := st.Head(canceled, "a/b.txt")
+	require.ErrorIs(t, err, context.Canceled)
+
+	err = st.Put(canceled, "c.txt", strings.NewReader("x"), domain.PutMeta{})
+	require.ErrorIs(t, err, context.Canceled)
+
+	_, _, err = st.Get(canceled, "a/b.txt")
+	require.ErrorIs(t, err, context.Canceled)
+
+	_, _, err = st.GetRange(canceled, "a/b.txt", 0, 1)
+	require.ErrorIs(t, err, context.Canceled)
+
+	err = st.Delete(canceled, "a/b.txt")
+	require.ErrorIs(t, err, context.Canceled)
+
+	_, err = st.List(canceled, domain.ListOptions{})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+// cancelAfterReader emits single bytes and cancels its context once it has
+// been read `after` times, so the store observes cancellation mid-copy.
+type cancelAfterReader struct {
+	cancel context.CancelFunc
+	after  int
+	reads  int
+}
+
+func (r *cancelAfterReader) Read(p []byte) (int, error) {
+	r.reads++
+	p[0] = 'x'
+	if r.reads >= r.after {
+		r.cancel()
+	}
+	return 1, nil
+}
+
+func TestPutAbortsOnContextCancel(t *testing.T) {
+	t.Parallel()
+	for _, layout := range []string{config.LocalLayoutContainer, config.LocalLayoutRaw} {
+		t.Run(layout, func(t *testing.T) {
+			t.Parallel()
+			st, err := localstore.New(config.LocalConfig{Dir: t.TempDir(), Layout: layout})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = st.Close() })
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			err = st.Put(ctx, "k.bin",
+				&cancelAfterReader{cancel: cancel, after: container.HeaderSize},
+				domain.PutMeta{})
+			require.ErrorIs(t, err, context.Canceled)
+		})
+	}
 }
 
 func keysOf(page domain.ListPage) []string {

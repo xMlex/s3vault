@@ -8,6 +8,30 @@ import (
 	"github.com/xMlex/s3vault/internal/domain"
 )
 
+func TestParseOnChange(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   string
+		want OnChange
+		ok   bool
+	}{
+		{name: "overwrite", in: "overwrite", want: OnChangeOverwrite, ok: true},
+		{name: "skip", in: "skip", want: OnChangeSkip, ok: true},
+		{name: "fail", in: "fail", want: OnChangeFail, ok: true},
+		{name: "empty", in: "", want: OnChangeUnknown},
+		{name: "unknown", in: "bogus", want: OnChangeUnknown},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := ParseOnChange(tt.in)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.ok, ok)
+		})
+	}
+}
+
 func TestDecide(t *testing.T) {
 	t.Parallel()
 

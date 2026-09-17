@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -58,18 +59,10 @@ func TestRawLayoutStripsContainerToCleanFile(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, payload, raw, "object file must be plaintext only")
 
-	metaBytes, err := os.ReadFile(filepath.Join(dir, "logs", "app.log.s3vault-meta"))
-	require.NoError(t, err)
-	require.Len(t, metaBytes, container.HeaderSize)
-	assert.True(t, container.IsMagic(metaBytes))
-
 	meta, err := st.Head(ctx, "logs/app.log")
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(payload)), meta.Size)
-	assert.Equal(t, hex.EncodeToString(sha256Sum(payload)), meta.SHA256)
-	assert.Equal(t, int64(len(payload)), meta.ContentSize)
-	assert.Equal(t, "none", meta.Encrypted)
-	assert.Equal(t, container.FormatVersion, meta.FormatVersion)
+	assert.Empty(t, meta.SHA256)
 
 	rc, getMeta, err := st.Get(ctx, "logs/app.log")
 	require.NoError(t, err)
@@ -77,7 +70,7 @@ func TestRawLayoutStripsContainerToCleanFile(t *testing.T) {
 	require.NoError(t, rc.Close())
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
-	assert.Equal(t, meta.SHA256, getMeta.SHA256)
+	assert.Empty(t, getMeta.SHA256)
 
 	page, err := st.List(ctx, domain.ListOptions{})
 	require.NoError(t, err)
@@ -85,7 +78,7 @@ func TestRawLayoutStripsContainerToCleanFile(t *testing.T) {
 	assert.Equal(t, "logs/app.log", page.Contents[0].Key)
 }
 
-func TestRawLayoutIdentitySkipViaSidecar(t *testing.T) {
+func TestRawLayoutNoContentHashSkip(t *testing.T) {
 	t.Parallel()
 	st, _ := newRawStore(t)
 	ctx := context.Background()
@@ -96,7 +89,8 @@ func TestRawLayoutIdentitySkipViaSidecar(t *testing.T) {
 	remote, err := identity.ResolveRemote(ctx, st, "k.bin")
 	require.NoError(t, err)
 	sum := hex.EncodeToString(sha256Sum(payload))
-	assert.Equal(t, identity.ActionSkip, identity.Decide(sum, int64(len(payload)), remote, identity.OnChangeOverwrite))
+	assert.Equal(t, identity.ActionUpload, identity.Decide(sum, int64(len(payload)), remote, identity.OnChangeOverwrite),
+		"raw layout has no remote SHA-256 for skip")
 }
 
 func TestRawLayoutPassthroughWithoutContainer(t *testing.T) {
@@ -109,8 +103,6 @@ func TestRawLayoutPassthroughWithoutContainer(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(dir, "plain.txt"))
 	require.NoError(t, err)
 	assert.Equal(t, payload, raw)
-	_, err = os.Stat(filepath.Join(dir, "plain.txt.s3vault-meta"))
-	assert.True(t, os.IsNotExist(err), "no sidecar without container header")
 
 	meta, err := st.Head(ctx, "plain.txt")
 	require.NoError(t, err)
@@ -135,63 +127,40 @@ func TestRawLayoutRejectsEncryptedContainer(t *testing.T) {
 	assert.Contains(t, err.Error(), "layout=raw")
 }
 
-func TestRawLayoutDeleteRemovesSidecar(t *testing.T) {
+// Magic matches but the header is corrupt → raw Put must fail, not store it.
+func TestRawLayoutRejectsCorruptHeader(t *testing.T) {
+	t.Parallel()
+	st, _ := newRawStore(t)
+	bad := make([]byte, container.HeaderSize)
+	copy(bad, container.Magic)
+	bad = append(bad, 'x')
+
+	err := st.Put(context.Background(), "bad.bin", bytes.NewReader(bad), domain.PutMeta{})
+	require.ErrorIs(t, err, container.ErrCorruptHeader)
+}
+
+var errBoom = errors.New("boom")
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) { return 0, errBoom }
+
+func TestRawLayoutPutReadError(t *testing.T) {
+	t.Parallel()
+	st, _ := newRawStore(t)
+	err := st.Put(context.Background(), "boom.bin", failingReader{}, domain.PutMeta{})
+	require.ErrorIs(t, err, errBoom)
+}
+
+func TestRawLayoutDelete(t *testing.T) {
 	t.Parallel()
 	st, dir := newRawStore(t)
 	ctx := context.Background()
-	body := contained(t, []byte("x"), time.Now().UTC())
-	require.NoError(t, st.Put(ctx, "a/b.log", bytes.NewReader(body), domain.PutMeta{}))
+	require.NoError(t, st.Put(ctx, "a/b.log", bytes.NewReader([]byte("x")), domain.PutMeta{}))
 	require.NoError(t, st.Delete(ctx, "a/b.log"))
 
 	_, err := os.Stat(filepath.Join(dir, "a", "b.log"))
 	assert.True(t, os.IsNotExist(err))
-	_, err = os.Stat(filepath.Join(dir, "a", "b.log.s3vault-meta"))
-	assert.True(t, os.IsNotExist(err))
-}
-
-// Failed object Remove must not drop the sidecar first — otherwise plaintext
-// remains without identity and ResolveRemote can no longer dedup.
-func TestRawLayoutDeleteKeepsSidecarWhenObjectRemoveFails(t *testing.T) {
-	t.Parallel()
-	st, dir := newRawStore(t)
-	ctx := context.Background()
-	body := contained(t, []byte("keep-meta"), time.Now().UTC())
-	require.NoError(t, st.Put(ctx, "stuck.log", bytes.NewReader(body), domain.PutMeta{}))
-
-	obj := filepath.Join(dir, "stuck.log")
-	meta := obj + ".s3vault-meta"
-	require.NoError(t, os.Remove(obj))
-	require.NoError(t, os.Mkdir(obj, 0o700))
-	require.NoError(t, os.WriteFile(filepath.Join(obj, "blocker"), []byte("x"), 0o600))
-
-	err := st.Delete(ctx, "stuck.log")
-	require.Error(t, err)
-
-	_, err = os.Stat(meta)
-	require.NoError(t, err, "sidecar must survive a failed object delete")
-}
-
-func TestRawLayoutDeleteCleansOrphanSidecar(t *testing.T) {
-	t.Parallel()
-	st, dir := newRawStore(t)
-	ctx := context.Background()
-	body := contained(t, []byte("orphan"), time.Now().UTC())
-	require.NoError(t, st.Put(ctx, "gone.log", bytes.NewReader(body), domain.PutMeta{}))
-
-	obj := filepath.Join(dir, "gone.log")
-	meta := obj + ".s3vault-meta"
-	require.NoError(t, os.Remove(obj))
-
-	require.NoError(t, st.Delete(ctx, "gone.log"))
-	_, err := os.Stat(meta)
-	assert.True(t, os.IsNotExist(err))
-}
-
-func TestRawLayoutMetaKeyReserved(t *testing.T) {
-	t.Parallel()
-	st, _ := newRawStore(t)
-	_, err := st.Head(context.Background(), "a.log.s3vault-meta")
-	require.ErrorIs(t, err, domain.ErrInvalidPath)
 }
 
 func sha256Sum(b []byte) []byte {

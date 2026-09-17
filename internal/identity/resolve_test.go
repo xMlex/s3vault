@@ -3,9 +3,11 @@ package identity_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"testing"
+	"testing/iotest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,6 +64,100 @@ func (s *rangeStore) GetRange(_ context.Context, key string, start, end int64) (
 	return io.NopCloser(bytes.NewReader(b[start:to])), s.meta[key], nil
 }
 
+// stubStore drives ResolveRemote's Head/GetRange error paths.
+type stubStore struct {
+	head     func(context.Context, string) (domain.ObjectMeta, error)
+	getRange func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error)
+}
+
+func (s stubStore) Head(ctx context.Context, key string) (domain.ObjectMeta, error) {
+	return s.head(ctx, key)
+}
+
+func (s stubStore) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error) {
+	return s.getRange(ctx, key, start, end)
+}
+
+var (
+	errHead  = errors.New("head failed")
+	errRange = errors.New("range failed")
+	errRead  = errors.New("read failed")
+)
+
+func TestResolveRemoteHeadError(t *testing.T) {
+	t.Parallel()
+	store := stubStore{
+		head: func(context.Context, string) (domain.ObjectMeta, error) {
+			return domain.ObjectMeta{}, errHead
+		},
+		getRange: func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error) {
+			t.Fatal("GetRange must not run when Head fails")
+			return nil, domain.ObjectMeta{}, nil
+		},
+	}
+	_, err := identity.ResolveRemote(context.Background(), store, "k")
+	require.ErrorIs(t, err, errHead)
+}
+
+func TestResolveRemoteRangeNotFoundKeepsHead(t *testing.T) {
+	t.Parallel()
+	store := stubStore{
+		head: func(context.Context, string) (domain.ObjectMeta, error) {
+			return domain.ObjectMeta{Key: "k", Exists: true, SHA256: "aa"}, nil
+		},
+		getRange: func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error) {
+			return nil, domain.ObjectMeta{}, domain.ErrNotFound
+		},
+	}
+	got, err := identity.ResolveRemote(context.Background(), store, "k")
+	require.NoError(t, err)
+	assert.Equal(t, "aa", got.SHA256)
+}
+
+func TestResolveRemoteRangeError(t *testing.T) {
+	t.Parallel()
+	store := stubStore{
+		head: func(context.Context, string) (domain.ObjectMeta, error) {
+			return domain.ObjectMeta{Key: "k", Exists: true}, nil
+		},
+		getRange: func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error) {
+			return nil, domain.ObjectMeta{}, errRange
+		},
+	}
+	_, err := identity.ResolveRemote(context.Background(), store, "k")
+	require.ErrorIs(t, err, errRange)
+}
+
+func TestResolveRemoteRangeReadError(t *testing.T) {
+	t.Parallel()
+	store := stubStore{
+		head: func(context.Context, string) (domain.ObjectMeta, error) {
+			return domain.ObjectMeta{Key: "k", Exists: true}, nil
+		},
+		getRange: func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error) {
+			return io.NopCloser(iotest.ErrReader(errRead)), domain.ObjectMeta{}, nil
+		},
+	}
+	_, err := identity.ResolveRemote(context.Background(), store, "k")
+	require.ErrorIs(t, err, errRead)
+}
+
+func TestResolveRemoteCorruptHeaderWithoutHeadIdentity(t *testing.T) {
+	t.Parallel()
+	bad := make([]byte, container.HeaderSize)
+	copy(bad, container.Magic)
+	store := stubStore{
+		head: func(context.Context, string) (domain.ObjectMeta, error) {
+			return domain.ObjectMeta{Key: "k", Exists: true}, nil // no SHA256
+		},
+		getRange: func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error) {
+			return io.NopCloser(bytes.NewReader(bad)), domain.ObjectMeta{}, nil
+		},
+	}
+	_, err := identity.ResolveRemote(context.Background(), store, "k")
+	require.ErrorIs(t, err, container.ErrCorruptHeader)
+}
+
 func TestResolveRemotePrefersContainerOverHEAD(t *testing.T) {
 	t.Parallel()
 	sum, err := container.SHA256FromHex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
@@ -107,18 +203,18 @@ func TestResolveRemoteLegacyHEADMeta(t *testing.T) {
 func TestResolveRemoteFallsBackWhenPeekCorruptButHeadHasIdentity(t *testing.T) {
 	t.Parallel()
 	// Magic matches but CRC is wrong — e.g. raw plaintext that starts like
-	// S3VCTR01. Head identity (sidecar / legacy metadata) must still win.
+	// S3VCTR01. Head identity (legacy metadata) must still win.
 	bad := make([]byte, container.HeaderSize)
 	copy(bad, container.Magic)
 	store := &rangeStore{
 		meta: map[string]domain.ObjectMeta{
-			"k": {Key: "k", Exists: true, SHA256: "from-sidecar", ContentSize: 3, Encrypted: "none"},
+			"k": {Key: "k", Exists: true, SHA256: "from-metadata", ContentSize: 3, Encrypted: "none"},
 		},
 		body: map[string][]byte{"k": bad},
 	}
 	got, err := identity.ResolveRemote(context.Background(), store, "k")
 	require.NoError(t, err)
-	assert.Equal(t, "from-sidecar", got.SHA256)
+	assert.Equal(t, "from-metadata", got.SHA256)
 	assert.Equal(t, int64(3), got.ContentSize)
 }
 

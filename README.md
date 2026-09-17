@@ -56,7 +56,7 @@ go test -tags=integration -count=1 ./internal/integration/   # нужен дос
 | --- | --- |
 | `S3VAULT_BACKEND_TYPE` | Бэкенд хранения: `s3` (по умолчанию) или `local` |
 | `S3VAULT_BACKEND_LOCAL_DIR` | Директория объектов при `backend.type=local` |
-| `S3VAULT_BACKEND_LOCAL_LAYOUT` | `container` (по умолчанию) или `raw` (чистые файлы + sidecar; только с `encryption.mode=none`) |
+| `S3VAULT_BACKEND_LOCAL_LAYOUT` | `container` (по умолчанию) или `raw` (чистые файлы; только с `encryption.mode=none`) |
 | `S3VAULT_S3_ENDPOINT` | URL API. Пусто = AWS. Для MinIO: `http://s3.example:9000` |
 | `S3VAULT_S3_REGION` | Регион (для MinIO часто `us-east-1`) |
 | `S3VAULT_S3_BUCKET` | Бакет |
@@ -89,7 +89,7 @@ backend:
   local:
     dir: /srv/s3vault/objects
     # layout: container  # default — S3VCTR01 || payload (как в S3)
-    # layout: raw        # plaintext as-is + *.s3vault-meta; требует encryption.mode=none
+    # layout: raw        # plaintext as-is; требует encryption.mode=none
 ```
 
 То же самое только через окружение — YAML при этом не нужен вовсе:
@@ -106,9 +106,9 @@ s3vault download backups/app.log /tmp/app.log
 
 Как и для остальных настроек, приоритет прежний: флаги > `S3VAULT_*` > YAML > умолчания, так что `S3VAULT_BACKEND_TYPE=local` переопределяет `backend.type: s3` из файла.
 
-При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. По умолчанию (`layout: container`) формат объекта тот же, что в S3 (контейнер `S3VCTR01` + payload), поэтому шифрование, dedup по SHA-256, `download`, HTTP `/files` и S3 SigV4-фасад работают одинаково на обоих бэкендах. `layout: raw` пишет plaintext без заголовка и держит identity в sidecar `*.s3vault-meta` (только при `encryption.mode=none`). Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
+При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. По умолчанию (`layout: container`) формат объекта тот же, что в S3 (контейнер `S3VCTR01` + payload), поэтому шифрование, dedup по SHA-256, `download`, HTTP `/files` и S3 SigV4-фасад работают одинаково на обоих бэкендах. `layout: raw` пишет только plaintext без заголовка (только при `encryption.mode=none`); skip/dedup по SHA-256 в этом режиме недоступен. Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
 
-Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime), а идентичность содержимого берётся из `S3VCTR01` или raw-sidecar.
+Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime), а идентичность содержимого берётся из `S3VCTR01` (в `layout: container`).
 
 Смена бэкенда меняет namespace дискового кэша, поэтому записи S3 и локального хранилища в кэше не пересекаются.
 

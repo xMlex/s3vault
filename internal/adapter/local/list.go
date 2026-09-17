@@ -116,9 +116,6 @@ func (s *Store) walk(ctx context.Context, prefix string) ([]domain.ListObject, e
 		if !d.Type().IsRegular() || !strings.HasPrefix(p, prefix) {
 			return nil
 		}
-		if strings.HasSuffix(p, metaSuffix) {
-			return nil // layout=raw identity sidecar
-		}
 		fi, err := d.Info()
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {

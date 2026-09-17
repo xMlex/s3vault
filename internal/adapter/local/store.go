@@ -1,8 +1,9 @@
 // Package localstore keeps objects as files under a single local directory.
 //
 // Default layout (container) stores the same bytes as the S3 backend
-// (S3VCTR01 container plus payload). layout=raw stores plaintext as-is and
-// keeps identity in an adjacent .s3vault-meta sidecar (requires encryption.mode=none).
+// (S3VCTR01 container plus payload). layout=raw stores plaintext as-is
+// (requires encryption.mode=none). Without a container header, content-hash
+// skip/dedup is unavailable.
 package localstore
 
 import (
@@ -82,6 +83,11 @@ func (s *Store) Dir() string { return s.dir }
 // Layout returns the on-disk layout (container or raw).
 func (s *Store) Layout() string { return s.layout }
 
+// StoresPlaintext reports whether objects are stored as bare payload without
+// the S3VCTR01 container (layout=raw). Such a store has no remote content hash,
+// so callers must not hash files for skip decisions or build a container header.
+func (s *Store) StoresPlaintext() bool { return s.layout == config.LocalLayoutRaw }
+
 func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error) {
 	rel, err := relPath(key)
 	if err != nil {
@@ -100,12 +106,7 @@ func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error)
 	if !fi.Mode().IsRegular() {
 		return domain.ObjectMeta{Key: key, Exists: false}, nil
 	}
-	meta := objectMeta(key, fi)
-	meta, err = s.withSidecar(rel, meta)
-	if err != nil {
-		return domain.ObjectMeta{}, fmt.Errorf("head %s: %w", key, err)
-	}
-	return meta, nil
+	return objectMeta(key, fi), nil
 }
 
 func (s *Store) Put(ctx context.Context, key string, r io.Reader, _ domain.PutMeta) error {
@@ -121,7 +122,7 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, _ domain.PutMe
 			return fmt.Errorf("put %s: %w", key, err)
 		}
 	}
-	if s.layout == layoutRaw {
+	if s.layout == config.LocalLayoutRaw {
 		return s.putRaw(ctx, key, rel, r)
 	}
 	return s.putContainer(ctx, key, rel, r)
@@ -156,17 +157,11 @@ func (s *Store) putContainer(ctx context.Context, key, rel string, r io.Reader) 
 }
 
 func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, domain.ObjectMeta, error) {
-	f, fi, rel, err := s.open(ctx, key)
+	f, fi, err := s.open(ctx, key)
 	if err != nil {
 		return nil, domain.ObjectMeta{}, err
 	}
-	meta := objectMeta(key, fi)
-	meta, err = s.withSidecar(rel, meta)
-	if err != nil {
-		_ = f.Close()
-		return nil, domain.ObjectMeta{}, fmt.Errorf("get %s: %w", key, err)
-	}
-	return f, meta, nil
+	return f, objectMeta(key, fi), nil
 }
 
 // GetRange returns bytes [start, end] inclusive. An end past the last byte is
@@ -174,13 +169,12 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, domain.Obje
 // than the 416 an S3 backend would raise.
 //
 // layout=raw ranges over the plaintext file (not a reconstructed container).
-// Identity comes from the sidecar via Head; ResolveRemote falls back to it
-// when the body is not S3VCTR01.
+// ResolveRemote finds no S3VCTR01 magic, so content-hash skip is unavailable.
 func (s *Store) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error) {
 	if start < 0 || end < start {
 		return nil, domain.ObjectMeta{}, fmt.Errorf("get range %s: invalid range %d-%d", key, start, end)
 	}
-	f, fi, rel, err := s.open(ctx, key)
+	f, fi, err := s.open(ctx, key)
 	if err != nil {
 		return nil, domain.ObjectMeta{}, err
 	}
@@ -192,41 +186,35 @@ func (s *Store) GetRange(ctx context.Context, key string, start, end int64) (io.
 		}
 		length = end - start + 1
 	}
-	meta := objectMeta(key, fi)
-	meta, err = s.withSidecar(rel, meta)
-	if err != nil {
-		_ = f.Close()
-		return nil, domain.ObjectMeta{}, fmt.Errorf("get range %s: %w", key, err)
-	}
 	body := readCloser{Reader: io.NewSectionReader(f, start, length), Closer: f}
-	return body, meta, nil
+	return body, objectMeta(key, fi), nil
 }
 
-func (s *Store) open(ctx context.Context, key string) (*os.File, fs.FileInfo, string, error) {
+func (s *Store) open(ctx context.Context, key string) (*os.File, fs.FileInfo, error) {
 	rel, err := relPath(key)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, "", err
+		return nil, nil, err
 	}
 	f, err := s.root.Open(rel)
 	if err != nil {
 		if isNotFound(err) {
-			return nil, nil, "", domain.ErrNotFound
+			return nil, nil, domain.ErrNotFound
 		}
-		return nil, nil, "", fmt.Errorf("get %s: %w", key, err)
+		return nil, nil, fmt.Errorf("get %s: %w", key, err)
 	}
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
-		return nil, nil, "", fmt.Errorf("get %s: %w", key, err)
+		return nil, nil, fmt.Errorf("get %s: %w", key, err)
 	}
 	if !fi.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, nil, "", domain.ErrNotFound
+		return nil, nil, domain.ErrNotFound
 	}
-	return f, fi, rel, nil
+	return f, fi, nil
 }
 
 func (s *Store) createTemp() (string, *os.File, error) {
@@ -258,8 +246,7 @@ func objectMeta(key string, fi fs.FileInfo) domain.ObjectMeta {
 
 // etag is a synthetic validator: size and mtime both change when an object is
 // rewritten. Quoted like an S3 ETag so http.ServeContent accepts it. Content
-// identity still comes from the S3VCTR01 header (or raw sidecar), never from
-// this value.
+// identity still comes from the S3VCTR01 header, never from this value.
 func etag(fi fs.FileInfo) string {
 	return `"` + strconv.FormatInt(fi.Size(), 16) + "-" + strconv.FormatInt(fi.ModTime().UnixNano(), 16) + `"`
 }

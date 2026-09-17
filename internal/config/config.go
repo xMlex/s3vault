@@ -45,7 +45,7 @@ type BackendConfig struct {
 // Local filesystem object layouts for LocalConfig.Layout.
 const (
 	LocalLayoutContainer = "container" // S3VCTR01 || payload (S3-parity default)
-	LocalLayoutRaw       = "raw"       // plaintext file + .s3vault-meta sidecar
+	LocalLayoutRaw       = "raw"       // plaintext file as-is (no S3VCTR01)
 )
 
 // LocalConfig configures the local filesystem object store.

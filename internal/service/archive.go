@@ -259,15 +259,8 @@ func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.F
 		return a.handleRemote(ctx, opts, info, key, op)
 	}
 
-	sum := opts.PlaintextSHA256
-	if sum == "" {
-		var err error
-		sum, err = hash.FileSHA256(info.AbsPath)
-		if err != nil {
-			return 0, identity.ActionUnknown, fmt.Errorf("checksum: %w", err)
-		}
-	}
-	remote, err := identity.ResolveRemote(ctx, a.store, key)
+	plaintext := a.storesPlaintext()
+	sum, remote, err := a.resolveRemote(ctx, opts, info, key, plaintext)
 	if err != nil {
 		return 0, identity.ActionUnknown, err
 	}
@@ -283,7 +276,7 @@ func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.F
 		return 0, action, fmt.Errorf("object exists with different checksum: %s", key)
 	}
 
-	if err := a.upload(ctx, key, info, sum); err != nil {
+	if err := a.upload(ctx, key, info, sum, plaintext); err != nil {
 		return 0, identity.ActionUpload, err
 	}
 	if err := a.maybeDeleteLocal(opts, info, identity.ActionUpload); err != nil {
@@ -351,15 +344,55 @@ func actionName(a identity.Action) string {
 	}
 }
 
-func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, sum string) error {
-	started := time.Now()
-	encName := encryptName(a.enc)
-	wrapName := encryptWrap(a.enc)
-	provider := encryptProvider(a.enc)
-	tp := cryptoProThumbprint(a.enc)
-	hdrBytes, err := buildContainerHeader(sum, info.Size, info.ModTime, encName, wrapName, provider, tp)
+// plaintextStore is an ObjectStore that persists bare payload without the
+// S3VCTR01 container (local layout=raw).
+type plaintextStore interface {
+	StoresPlaintext() bool
+}
+
+// storesPlaintext reports whether the backend drops the container header, so
+// the pipeline can skip hashing and the range peek.
+func (a *Archive) storesPlaintext() bool {
+	ps, ok := a.store.(plaintextStore)
+	return ok && ps.StoresPlaintext()
+}
+
+// resolveRemote returns the local plaintext SHA-256 and the remote identity.
+// For a plaintext store there is no remote content hash, so hashing and the
+// range peek are wasted I/O and Head alone drives on_change.
+func (a *Archive) resolveRemote(ctx context.Context, opts ArchiveOptions, info domain.FileInfo, key string, plaintext bool) (string, domain.ObjectMeta, error) {
+	if plaintext {
+		meta, err := a.store.Head(ctx, key)
+		if err != nil {
+			return "", domain.ObjectMeta{}, err
+		}
+		return "", meta, nil
+	}
+	sum := opts.PlaintextSHA256
+	if sum == "" {
+		var err error
+		sum, err = hash.FileSHA256(info.AbsPath)
+		if err != nil {
+			return "", domain.ObjectMeta{}, fmt.Errorf("checksum: %w", err)
+		}
+	}
+	meta, err := identity.ResolveRemote(ctx, a.store, key)
 	if err != nil {
-		return err
+		return "", domain.ObjectMeta{}, err
+	}
+	return sum, meta, nil
+}
+
+func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, sum string, plaintext bool) error {
+	started := time.Now()
+	var hdrBytes []byte
+	if !plaintext {
+		var err error
+		hdrBytes, err = buildContainerHeader(sum, info.Size, info.ModTime,
+			encryptName(a.enc), encryptWrap(a.enc), encryptProvider(a.enc), cryptoProThumbprint(a.enc))
+		if err != nil {
+			return err
+		}
 	}
 
 	pr, pw := io.Pipe()
@@ -377,16 +410,19 @@ func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, 
 	})
 	g.Go(func() error {
 		defer pr.Close()
-		body := io.MultiReader(bytes.NewReader(hdrBytes), pr)
+		var body io.Reader = pr
+		if !plaintext {
+			body = io.MultiReader(bytes.NewReader(hdrBytes), pr)
+		}
 		return a.store.Put(ctx, key, body, domain.PutMeta{
 			ContentType: mime.TypeByExtension(filepath.Ext(info.AbsPath)),
 		})
 	})
-	err = g.Wait()
-	if err == nil {
-		a.metrics.ObserveUpload(time.Since(started), info.Size)
+	if err := g.Wait(); err != nil {
+		return err
 	}
-	return err
+	a.metrics.ObserveUpload(time.Since(started), info.Size)
+	return nil
 }
 
 func buildContainerHeader(shaHex string, size int64, mtime time.Time, encName, wrapName, provider, thumbHex string) ([]byte, error) {

@@ -5,7 +5,7 @@ backend:
   # local:
   #   dir: /srv/s3vault/objects  # object tree on this host; s3.* is then unused
   #   layout: container          # default: S3VCTR01 || payload (S3 parity)
-  #   # layout: raw              # plaintext as-is + *.s3vault-meta (encryption.mode=none only)
+  #   # layout: raw              # plaintext as-is (encryption.mode=none only)
   # Env equivalents (override this file, no YAML needed at all):
   #   S3VAULT_BACKEND_TYPE=local
   #   S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects

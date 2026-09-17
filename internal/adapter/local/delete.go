@@ -7,10 +7,6 @@ import (
 )
 
 // Delete removes an object. Deleting a missing key succeeds, as in S3.
-//
-// The object file is removed before the layout=raw sidecar so a failed
-// Remove cannot leave plaintext without identity metadata. An orphan
-// sidecar (object already gone) is still cleaned up.
 func (s *Store) Delete(ctx context.Context, key string) error {
 	rel, err := relPath(key)
 	if err != nil {
@@ -24,7 +20,6 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 			return fmt.Errorf("delete %s: %w", key, err)
 		}
 	}
-	s.removeSidecar(rel)
 	s.pruneDirs(filepath.Dir(rel))
 	return nil
 }

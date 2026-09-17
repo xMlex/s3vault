@@ -113,14 +113,10 @@ cache:
 	require.NoError(t, err)
 	assert.Equal(t, payload, raw, "layout=raw stores plaintext without S3VCTR01")
 
-	metaPath := stored + ".s3vault-meta"
-	meta, err := os.ReadFile(metaPath)
-	require.NoError(t, err)
-	assert.Equal(t, "S3VCTR01", string(meta[:8]))
-
+	// No remote SHA-256 without a container → re-upload, not content-hash skip.
 	out, err = run(t, "upload", src, "--config", cfg, "--output", "json")
 	require.NoError(t, err)
-	assert.Contains(t, out, `"skipped":1`)
+	assert.Contains(t, out, `"uploaded":1`)
 
 	dest := filepath.Join(base, "restored.log")
 	_, err = run(t, "download", "backups/app.log", dest, "--config", cfg)

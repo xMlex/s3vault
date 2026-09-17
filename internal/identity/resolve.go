@@ -46,11 +46,12 @@ func ResolveRemote(ctx context.Context, store ObjectIdentity, key string) (domai
 	if n < container.HeaderSize || !container.IsMagic(buf) {
 		return mergeRangeMeta(meta, rangeMeta), nil
 	}
+	// IsMagic already matched, so Parse can only fail with ErrCorruptHeader.
 	hdr, err := container.Parse(buf)
 	if err != nil {
-		// Non-container body, or a corrupt peek while Head already carries
-		// identity (legacy user-metadata / local raw sidecar).
-		if errors.Is(err, container.ErrNotContainer) || meta.SHA256 != "" {
+		// Corrupt peek while Head already carries identity (legacy metadata):
+		// keep Head identity instead of failing the resolve.
+		if meta.SHA256 != "" {
 			return mergeRangeMeta(meta, rangeMeta), nil
 		}
 		return domain.ObjectMeta{}, fmt.Errorf("identity parse %s: %w", key, err)

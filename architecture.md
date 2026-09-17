@@ -149,14 +149,14 @@ The object key prefix stays in `s3.prefix` for both backends (`--prefix`, `S3VAU
 `internal/adapter/local` stores each object as one file under `backend.local.dir`.
 
 - **`layout: container` (default):** each file holds exactly the bytes S3 would hold (`S3VCTR01` container plus payload), so identity, dedup, encryption and the S3 facade behave the same.
-- **`layout: raw`:** plaintext is stored as-is (no `S3VCTR01` prefix). Identity lives in an adjacent sidecar `*.s3vault-meta` (exact 128-byte `S3VCTR01` header). Requires `encryption.mode=none` (config rejects otherwise). `Head`/`Get` expose sidecar fields so `identity.ResolveRemote` can skip/dedup without Range magic. Sidecars are never listed; keys ending in `.s3vault-meta` are reserved. `Delete` removes the object first, then the sidecar (so a failed object remove cannot leave plaintext without identity).
+- **`layout: raw`:** plaintext is stored as-is (no `S3VCTR01` prefix). Requires `encryption.mode=none` (config rejects otherwise). Without a container header there is no remote content hash, so archive skip/dedup by SHA-256 is unavailable; an existing object is always treated as changed, so `on_change=overwrite` re-uploads, `skip` omits, and `fail` fails. `Archive` detects this via `Store.StoresPlaintext()`, skips hashing the local file and the `GetRange` peek, and uploads bare payload without a container header.
 
 - Access goes through `os.Root`; keys must survive `path.Clean` unchanged and be `filepath.IsLocal`, otherwise `domain.ErrInvalidPath`. `.s3vault-tmp/` is reserved and never listed.
 - The directory is created `0700` when missing (an existing directory keeps its mode); object files are `0600`.
-- `Put` streams into a temp file in `.s3vault-tmp/`, then `Sync` + `rename`; interrupted writes are dropped when the store is opened. Parent directories are created `0700`. Raw layout also writes the sidecar via the same temp/rename path after stripping an incoming EncNone container.
+- `Put` streams into a temp file in `.s3vault-tmp/`, then `Sync` + `rename`; interrupted writes are dropped when the store is opened. Parent directories are created `0700`. Raw layout strips an incoming EncNone container and stores plaintext only.
 - `Head` reports `Exists=false` for a missing key (and for a path whose parent is a regular file); `Get`/`GetRange` return `domain.ErrNotFound`.
 - `Delete` succeeds on a missing key and prunes directories it leaves empty.
-- Deliberate differences from S3: `ETag` is synthetic (size + mtime, quoted) and only feeds cache revalidation — content identity still comes from the container header or raw sidecar; a range starting past the last byte yields an empty body instead of `416`; a key cannot be both a file and a directory (S3 allows `a` and `a/b`); `List` walks and sorts the whole tree under the prefix, so it is linear in object count.
+- Deliberate differences from S3: `ETag` is synthetic (size + mtime, quoted) and only feeds cache revalidation — content identity still comes from the container header (`layout: container`); a range starting past the last byte yields an empty body instead of `416`; a key cannot be both a file and a directory (S3 allows `a` and `a/b`); `List` walks and sorts the whole tree under the prefix, so it is linear in object count.
 
 ## Scanner and symlinks
 
@@ -186,9 +186,10 @@ Before Put:
 
 1. Stream local plaintext SHA-256 (`internal/hash`).
 2. Resolve remote identity (`internal/identity.ResolveRemote`):
-   - `HeadObject` for existence / ETag / LastModified (and any identity already on Head: legacy user-metadata or local raw sidecar).
+   - `HeadObject` for existence / ETag / LastModified (and any identity already on Head: legacy user-metadata).
    - `GetRange` bytes `0-127`, parse S3VCTR01 (CRC-checked).
    - If not a container (or peek is corrupt while Head already has SHA-256): keep Head identity.
+   - For a plaintext store (`layout=raw`, `Store.StoresPlaintext()`) steps 1–2 collapse to a single `Head` / `HeadObject`: there is no container header to hash or peek, and the payload is uploaded without one.
 3. Compare identity fields:
 
 | Source | Meaning |
