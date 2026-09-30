@@ -55,7 +55,34 @@ type S3Config struct {
 	SessionTok         string `mapstructure:"session_token"`
 	PathStyle          bool   `mapstructure:"path_style"`
 	AllowSecretsInFile bool   `mapstructure:"allow_secrets_in_config"`
+	// MultipartPartSize is the size of one multipart part this client writes.
+	// It is a writer-side choice, not a negotiated one: it is the size this
+	// process sends, and any S3-compatible store — the gateway facade included —
+	// accepts whatever legal size it is given. A body of at most one part goes as
+	// a single PutObject and never opens a session at all.
+	//
+	// Zero means "not specified" and becomes DefaultMultipartPartSize; anything
+	// else must be legal. The same rule holds in s3store.New, so a fragment built
+	// by hand behaves like one that came through Load.
+	MultipartPartSize int64 `mapstructure:"multipart_part_size"`
 }
+
+// Multipart part size bounds. 5 MiB is the S3 minimum for every part except the
+// last, 5 GiB is the S3 maximum for one part.
+//
+// The default is the minimum, which is what the AWS SDK used before this key
+// existed: leaving it there keeps every existing deployment byte-for-byte
+// unchanged, and it is also the cheapest profile, since the SDK holds
+// Concurrency+1 buffers of exactly this size (~30 MiB at concurrency 5). Raising
+// it trades memory for fewer round trips — that is what the key is for, and it is
+// a per-deployment decision, not something to bake in. Whichever value is set,
+// the SDK raises the part size itself if it would need more than MaxUploadParts
+// parts, so a large value is never a hard ceiling.
+const (
+	MinMultipartPartSize     int64 = 5 << 20
+	MaxMultipartPartSize     int64 = 5 << 30
+	DefaultMultipartPartSize int64 = MinMultipartPartSize
+)
 
 type EncryptionConfig struct {
 	Mode    string     `mapstructure:"mode"`
@@ -106,6 +133,13 @@ type ServerConfig struct {
 	S3Region         string `mapstructure:"s3_region"`
 	S3Bucket         string `mapstructure:"s3_bucket"`           // virtual bucket; default = s3.bucket
 	S3BucketAsPrefix bool   `mapstructure:"s3_bucket_as_prefix"` // client bucket → key prefix under s3.bucket
+	// Multipart spool of the S3 facade. Not cache.dir: the cache is off by
+	// default and carries its own invariants, while multipart must work always.
+	MultipartDir           string        `mapstructure:"multipart_dir"`
+	MultipartTTL           time.Duration `mapstructure:"multipart_ttl"`
+	MultipartSweepInterval time.Duration `mapstructure:"multipart_sweep_interval"`
+	MultipartMaxSessions   int           `mapstructure:"multipart_max_sessions"`
+	MultipartMaxBytes      int64         `mapstructure:"multipart_max_bytes"`
 }
 
 type ArchiveConfig struct {
@@ -122,6 +156,7 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("log.level", "info")
 	v.SetDefault("backend.type", BackendS3)
 	v.SetDefault("s3.region", "us-east-1")
+	v.SetDefault("s3.multipart_part_size", DefaultMultipartPartSize)
 	v.SetDefault("encryption.mode", "none")
 	v.SetDefault("encryption.native.wrap", "rsa-oaep")
 	v.SetDefault("encryption.native.chunk_size", 65536)
@@ -136,6 +171,10 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("server.metrics_listen", "127.0.0.1:9090")
 	v.SetDefault("server.s3_region", "us-east-1")
 	v.SetDefault("server.s3_bucket_as_prefix", false)
+	v.SetDefault("server.multipart_ttl", "24h")
+	v.SetDefault("server.multipart_sweep_interval", "15m")
+	v.SetDefault("server.multipart_max_sessions", 64)
+	v.SetDefault("server.multipart_max_bytes", int64(0))
 	v.SetDefault("archive.older_than", "7d")
 	v.SetDefault("archive.workers", 4)
 }
@@ -157,6 +196,7 @@ var envKeys = []string{
 	"s3.session_token",
 	"s3.path_style",
 	"s3.allow_secrets_in_config",
+	"s3.multipart_part_size",
 	"encryption.mode",
 	"encryption.native.wrap",
 	"encryption.native.public_key_path",
@@ -182,6 +222,11 @@ var envKeys = []string{
 	"server.s3_region",
 	"server.s3_bucket",
 	"server.s3_bucket_as_prefix",
+	"server.multipart_dir",
+	"server.multipart_ttl",
+	"server.multipart_sweep_interval",
+	"server.multipart_max_sessions",
+	"server.multipart_max_bytes",
 	"archive.older_than",
 	"archive.workers",
 	"archive.follow_symlinks",
@@ -256,8 +301,32 @@ func (c *Config) Normalize() error {
 		}
 		c.Cache.Dir = filepath.Join(dir, "s3vault")
 	}
+	// The multipart spool lives beside the cache directory, not inside it: both
+	// hold plaintext on disk, but they are swept by different rules and the
+	// cache may be disabled while multipart must keep working.
+	if strings.TrimSpace(c.Server.MultipartDir) == "" {
+		c.Server.MultipartDir = filepath.Join(c.Cache.Dir, "multipart")
+	}
 	if _, err := period.Parse(c.Archive.OlderThan); err != nil {
 		return fmt.Errorf("archive.older_than: %w", err)
+	}
+	// Checked here rather than left to the SDK: the SDK's own floor is the same
+	// 5 MiB but it reports a bare "part size must be at least N bytes" with no
+	// key name, and only at the first upload. Zero is the one value that means
+	// "not specified" — it becomes the default rather than an error, exactly as
+	// archive.workers below, so that a fragment assembled by hand behaves like one
+	// that came through Load.
+	if c.S3.MultipartPartSize == 0 {
+		c.S3.MultipartPartSize = DefaultMultipartPartSize
+	}
+
+	switch {
+	case c.S3.MultipartPartSize < MinMultipartPartSize:
+		return fmt.Errorf("s3.multipart_part_size: must be %d (default) or at least %d bytes (5 MiB, the S3 minimum for every part but the last), got %d",
+			DefaultMultipartPartSize, MinMultipartPartSize, c.S3.MultipartPartSize)
+	case c.S3.MultipartPartSize > MaxMultipartPartSize:
+		return fmt.Errorf("s3.multipart_part_size: must be at most %d bytes (5 GiB, the S3 maximum for one part), got %d",
+			MaxMultipartPartSize, c.S3.MultipartPartSize)
 	}
 	switch c.Encryption.Mode {
 	case "none", "native", "command":

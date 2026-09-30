@@ -21,6 +21,14 @@ const (
 	S3OpList
 	S3OpHeadBucket
 	S3OpListBuckets
+	// S3OpCreateMultipartUpload and the four after it are the multipart set.
+	// The gateway assembles parts itself, so these are first-class operations of
+	// the facade rather than a client-side fallback (docs/multipart.md).
+	S3OpCreateMultipartUpload
+	S3OpUploadPart
+	S3OpCompleteMultipartUpload
+	S3OpAbortMultipartUpload
+	S3OpListParts
 )
 
 // Principal is an authenticated S3 API caller (frontend credentials).

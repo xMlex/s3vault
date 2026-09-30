@@ -235,7 +235,8 @@ func (c *Collector) CacheMiss() {
 }
 
 // S3 increments s3vault_s3_requests_total.
-// op: get|put|delete|list|head|head_bucket|list_buckets; result: ok|denied|not_found|error|…
+//
+// op: get|put|delete|list|head|head_bucket|list_buckets|create_multipart|upload_part|complete_multipart|abort_multipart|list_parts; result: ok|denied|not_found|error|…
 func (c *Collector) S3(op, result string) {
 	if c == nil {
 		return

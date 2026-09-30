@@ -73,6 +73,7 @@ func newFacade(t *testing.T, softTTL time.Duration) *facade {
 		Cache:         disk,
 		BucketBackend: "vault",
 		EncFP:         "fp",
+		Multipart:     s3api.MultipartConfig{Dir: t.TempDir()},
 	})
 	require.NoError(t, err)
 

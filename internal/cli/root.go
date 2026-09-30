@@ -513,12 +513,23 @@ func newServerCmd(state *runState) *cobra.Command {
 					BucketBackend:  cfg.CacheNamespace(),
 					BucketAsPrefix: cfg.Server.S3BucketAsPrefix,
 					EncFP:          encFP,
-					Logger:         state.logger,
-					Metrics:        met,
+					Multipart: s3api.MultipartConfig{
+						Dir:           cfg.Server.MultipartDir,
+						TTL:           cfg.Server.MultipartTTL,
+						SweepInterval: cfg.Server.MultipartSweepInterval,
+						MaxSessions:   cfg.Server.MultipartMaxSessions,
+						MaxBytes:      cfg.Server.MultipartMaxBytes,
+					},
+					Logger:  state.logger,
+					Metrics: met,
 				})
 				if err != nil {
 					return err
 				}
+				// Multipart parts are spooled to disk and only reclaimed by this
+				// loop; without it an interrupted upload would stay there for
+				// good, since no other timer in the process owns that directory.
+				api.StartSweeper(ctx, cfg.Server.MultipartSweepInterval)
 				s3Handler = api.Handler()
 			}
 

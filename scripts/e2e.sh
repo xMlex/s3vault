@@ -42,6 +42,9 @@ METRICS_URL="http://127.0.0.1:${METRICS_PORT}"
 
 FACADE_AK="e2eaccess"
 FACADE_SK="e2esecretkey0123456789abcdef"
+# Спул multipart фасада. Явный путь, а не дефолт рядом с ~/.cache: фаза проверяет,
+# что после Complete там пусто, и смотреть на чужой каталог нельзя.
+MP_SPOOL="${WORK}/mp-spool"
 # Префикс уникален на прогон: иначе повторный запуск видит объекты прошлого и
 # получает skip вместо upload, ломая счётчики и окно для --metrics-listen.
 RUN_ID="${S3VAULT_E2E_RUN_ID:-$$-$(date +%s)}"
@@ -686,9 +689,11 @@ sigv4() { # sigv4 <ak> <sk> [curl args...]
 }
 
 phase_facade() {
-	log "SigV4 S3-фасад: bucket/object/list/range/checksum/ACL"
+	log "SigV4 S3-фасад: bucket/object/list/range/checksum/ACL, multipart"
 	wait_minio
-	start_vault || return
+	# Спул multipart задаём явно: иначе проверка утечки смотрела бы на дефолт в $HOME.
+	rm -rf "$MP_SPOOL"
+	start_vault "S3VAULT_SERVER_MULTIPART_DIR=$MP_SPOOL" || return
 
 	assert_contains "ListBuckets отдаёт виртуальный бакет" \
 		"$(sigv4 "$FACADE_AK" "$FACADE_SK" "$S3API_URL/")" "<Name>${S3_BUCKET}</Name>"
@@ -757,7 +762,207 @@ phase_facade() {
 		--key facade/aws.txt "$WORK/facade-aws.out" >/dev/null
 	assert_same_bytes "aws s3api roundtrip через фасад" "$obj" "$WORK/facade-aws.out"
 
+	phase_facade_multipart
+
 	stop_vault || true
+}
+
+# Multipart через фасад — тот самый случай, ради которого всё затевалось.
+#
+# Граница 5 МиБ выбрана не нами: manager.DefaultUploadPartSize == MinUploadPartSize,
+# и uploader выбирает multipart, только прочитав первые 5 МиБ. Всё, что меньше,
+# раньше проходило, а дальше фасад отвечал 405 MethodNotAllowed — ещё до SigV4 и
+# до хранилища, потому что POST в classify не имел случая вовсе.
+#
+# Загружает настоящий s3vault-клиент (не curl и не aws cli): ровно он держит
+# s3.endpoint на фасаде и отправляет container в S3VCTR01, поэтому проверка
+# заодно держит инвариант слоёв на живом стенде.
+# Сколько UploadPart уже прошло через фасад. Метрика накопительная, поэтому
+# части всегда сравниваем по разнице снимков до и после конкретной загрузки.
+facade_upload_parts() {
+	curl -fsS "$METRICS_URL/metrics" 2>/dev/null |
+		awk '/^s3vault_s3_requests_total\{.*op="upload_part".*result="ok".*\}/ {print $NF; found=1}
+		     END {if (!found) print 0}'
+}
+
+phase_facade_multipart() {
+	log "Multipart через фасад: клиент >5 МиБ собирается шлюзом, roundtrip и один слой"
+
+	local src="$WORK/src-mp"
+	rm -rf "$src"
+	mkdir -p "$src"
+	# 12 МиБ + хвост, режется на три части по 5 МиБ, последняя меньше.
+	# Содержимое непериодическое, иначе ошибка сборки неотличима от успеха.
+	head -c 12582919 /dev/urandom >"$src/big.bin"
+
+	# Клиент: свой S3-эндпоинт — фасад, свои креды — server.s3_* шлюза,
+	# свой префикс. Ключ целиком строит клиент; `facade-mp/` в нём — это его
+	# s3.prefix, а `PREFIX/` из S3_ENV подставляет уже шлюз.
+	#
+	# Размер части задан явно (5242880 = 5 МиБ), чтобы число частей ниже было
+	# утверждением о сборке шлюза, а не о текущем дефолте: он тоже 5 МиБ, но
+	# когда-нибудь может им не быть, и тогда молча сдвинулся бы и этот тест.
+	# Проверка самого дефолта живёт ниже отдельным блоком.
+	local client_env=(
+		"S3VAULT_S3_ENDPOINT=$S3API_URL"
+		"S3VAULT_S3_ACCESS_KEY=$FACADE_AK"
+		"S3VAULT_S3_SECRET_KEY=$FACADE_SK"
+		"S3VAULT_S3_PATH_STYLE=true"
+		"S3VAULT_S3_PREFIX=facade-mp"
+		"S3VAULT_ENCRYPTION_MODE=none"
+		"S3VAULT_S3_MULTIPART_PART_SIZE=5242880"
+	)
+	local key="facade-mp/big.bin"
+	local parts_before
+	parts_before=$(facade_upload_parts)
+	local rc=0
+	vault "${client_env[@]}" upload "$src/big.bin" \
+		>/dev/null 2>"$WORK/mp-upload.err" || rc=$?
+	if [[ $rc -ne 0 ]]; then
+		fail "upload >5 МиБ через фасад" "rc=$rc: $(tail -3 "$WORK/mp-upload.err" | tr '\n' ' ')"
+		return 0
+	fi
+	pass "upload >5 МиБ через фасад (multipart, не 405)"
+
+	# Число частей — это и есть проверка s3.multipart_part_size: 12 МиБ+7 при
+	# части в 5 МиБ обязаны дать ровно три части. Считаем по метрике фасада,
+	# потому что клиент о своей разбивке не отчитывается.
+	assert_eq "части ровно по s3.multipart_part_size (5 МиБ → 3 части)" \
+		"$(( $(facade_upload_parts) - parts_before ))" "3"
+
+	# Объект дошёл до MinIO одним ключом: сборка частей шла в шлюзе, а не
+	# многообъектной нарезкой. Проверяем напрямую в MinIO, поэтому в ключе
+	# нужен и серверный префикс шлюза ($PREFIX), а не только клиентский.
+	assert_ok "multipart сошёлся в один объект в S3" s3_head_raw "$PREFIX/$key"
+
+	# Слои: клиент на encryption.mode=none пишет голый payload, шлюз — свой
+	# контейнер S3VCTR01. На download каждый процесс снимает ровно свой, поэтому
+	# побайтовое сравнение и есть проверка инварианта.
+	rc=0
+	vault "${client_env[@]}" download "$key" "$WORK/mp-back.bin" \
+		>/dev/null 2>>"$WORK/mp-upload.err" || rc=$?
+	assert_eq "download >5 МиБ через фасад" "$rc" "0"
+	assert_same_bytes "multipart roundtrip: те же байты, что клиент отдал" "$src/big.bin" "$WORK/mp-back.bin"
+
+	# ETag собранного объекта — sha256(plaintext), как у Get и Put.
+	local got_sum
+	got_sum=$(sigv4 "$FACADE_AK" "$FACADE_SK" -I "$S3API_URL/$S3_BUCKET/$key" |
+		tr -d '\r' | awk -F': ' 'tolower($1)=="x-amz-checksum-sha256"{print $2}')
+	local want_b64
+	want_b64=$(openssl dgst -sha256 -binary "$src/big.bin" | openssl base64 -A)
+	assert_eq "multipart: чек-сумма собранного объекта = sha256(plaintext)" "$got_sum" "$want_b64"
+
+	# Часть, которую aws s3 cp запрашивает при скачивании: 206. Здесь нельзя
+	# отдавать x-amz-checksum-sha256 всего объекта — тело это диапазон, и клиент,
+	# который проверяет чек-сумму, отвергнет весь ответ (именно так и было:
+	# `s3 cp` падал с "Expected checksum ... did not match" на 12 МиБ).
+	local ranged_sum
+	ranged_sum=$(sigv4 "$FACADE_AK" "$FACADE_SK" -H 'Range: bytes=0-8388607' \
+		-D - -o /dev/null "$S3API_URL/$S3_BUCKET/$key" |
+		tr -d '\r' | awk -F': ' 'tolower($1)=="x-amz-checksum-sha256"{print $2}')
+	assert_eq "206 не объявляет чек-сумму всего объекта" "$ranged_sum" ""
+
+	# Тот же объект через настоящий aws s3 cp: загрузка идёт multipart, а
+	# скачивание — диапазонами, и это единственная проверка, которая ловит
+	# неверную чек-сумму в ranged-ответе.
+	local aws_env=(AWS_ACCESS_KEY_ID="$FACADE_AK" AWS_SECRET_ACCESS_KEY="$FACADE_SK"
+		AWS_DEFAULT_REGION="$REGION")
+	env "${aws_env[@]}" aws --endpoint-url "$S3API_URL" s3 cp \
+		"$src/big.bin" "s3://$S3_BUCKET/facade-mp/cp.bin" >/dev/null 2>&1
+	env "${aws_env[@]}" aws --endpoint-url "$S3API_URL" s3 cp \
+		"s3://$S3_BUCKET/facade-mp/cp.bin" "$WORK/facade-mp-cp.back" >/dev/null 2>&1
+	assert_same_bytes "aws s3 cp 12 МиБ через фасад (ranges) roundtrip" \
+		"$src/big.bin" "$WORK/facade-mp-cp.back"
+
+	# Один и тот же байт-в-байт контент через оба пути обязан дать один digest.
+	# Это и есть утверждение «multipart не меняет содержимое»: границу в 5 МиБ
+	# проводит uploader, а шлюз обязан собрать ровно то, что прислали.
+	local pair
+	pair="$WORK/mp-pairs"; rm -rf "$pair"; mkdir -p "$pair"
+	head -c 5242879 /dev/urandom >"$pair/under.bin"  # 5 МиБ - 1: ещё single PutObject
+	cp "$src/big.bin" "$pair/over.bin"                # 12 МиБ: multipart
+	local k
+	for k in under over; do
+		# client_env уже несёт S3VAULT_S3_PREFIX=facade-mp, поэтому --key берём
+		# без префикса, а download ждёт полный ключ (он его не применяет).
+		vault "${client_env[@]}" upload "$pair/$k.bin" --key "$k.bin" >/dev/null 2>&1
+		vault "${client_env[@]}" download "facade-mp/$k.bin" "$pair/$k.back" >/dev/null 2>&1
+	done
+	assert_eq "sha256 single-PUT (5 МиБ-1) = исходник" \
+		"$(sha256_hex "$pair/under.back")" "$(sha256_hex "$pair/under.bin")"
+	assert_eq "sha256 multipart (12 МиБ) = исходник" \
+		"$(sha256_hex "$pair/over.back")" "$(sha256_hex "$pair/over.bin")"
+	assert_eq "тот же байт через MinIO напрямую даёт тот же digest" \
+		"$(env "${S3_ENV[@]}" "$VAULT_BIN" upload "$pair/over.bin" --key "facade-mp-direct/over.bin" >/dev/null 2>&1; \
+			env "${S3_ENV[@]}" "$VAULT_BIN" download "$PREFIX/facade-mp-direct/over.bin" - 2>/dev/null |
+			sha256sum | cut -d' ' -f1)" \
+		"$(sha256_hex "$pair/over.back")"
+
+	# Метрика фасада: части видны отдельной операцией, а не ровно одним put.
+	assert_contains "s3vault_s3_requests_total учитывает multipart" \
+		"$(curl -fsS "$METRICS_URL/metrics" 2>/dev/null || true)" \
+		's3vault_s3_requests_total{op="upload_part"'
+
+	# --- дефолт s3.multipart_part_size -------------------------------------------
+	# Всё выше размер части задавал явно, поэтому дефолт виден только здесь. Он
+	# равен 5242880 — минимуму S3, то есть тому, что SDK делал до появления
+	# ключа, — и оба числа ниже завязаны ровно на это. Плюс контраст: тело
+	# меньше одной части уходит одиночным PutObject и сессию не открывает, то
+	# есть размер части же является порогом начала multipart.
+	local dflt
+	dflt="$WORK/mp-default"; rm -rf "$dflt"; mkdir -p "$dflt"
+	head -c 33554439 /dev/urandom >"$dflt/def.bin" # 32 МиБ + 7
+	head -c 4194303 /dev/urandom >"$dflt/under.bin" # 4 МиБ - 1: меньше одной части
+	local dflt_env=(
+		"S3VAULT_S3_ENDPOINT=$S3API_URL"
+		"S3VAULT_S3_ACCESS_KEY=$FACADE_AK"
+		"S3VAULT_S3_SECRET_KEY=$FACADE_SK"
+		"S3VAULT_S3_PATH_STYLE=true"
+		"S3VAULT_S3_PREFIX=facade-def"
+		"S3VAULT_ENCRYPTION_MODE=none"
+	)
+
+	parts_before=$(facade_upload_parts)
+	vault "${dflt_env[@]}" upload "$dflt/under.bin" >/dev/null 2>&1
+	assert_eq "дефолт: 4 МиБ-1 меньше одной части → ни одной UploadPart" \
+		"$(( $(facade_upload_parts) - parts_before ))" "0"
+
+	parts_before=$(facade_upload_parts)
+	vault "${dflt_env[@]}" upload "$src/big.bin" >/dev/null 2>&1
+	assert_eq "дефолт: 12 МиБ режется на 3 части, то есть дефолт = 5 МиБ" \
+		"$(( $(facade_upload_parts) - parts_before ))" "3"
+
+	parts_before=$(facade_upload_parts)
+	vault "${dflt_env[@]}" upload "$dflt/def.bin" >/dev/null 2>&1
+	assert_eq "дефолт: 32 МиБ режется на 7 частей" \
+		"$(( $(facade_upload_parts) - parts_before ))" "7"
+	vault "${dflt_env[@]}" download "facade-def/def.bin" "$dflt/def.back" >/dev/null 2>&1
+	assert_same_bytes "дефолт: roundtrip 32 МиБ" "$dflt/def.bin" "$dflt/def.back"
+
+	# Значение вне диапазона S3 должно быть отвергнуто на старте, а не на
+	# первой же загрузке — и с именем ключа в сообщении.
+	local bad_rc=0
+	env "${dflt_env[@]/facade-def/}" S3VAULT_S3_MULTIPART_PART_SIZE=1024 \
+		"$VAULT_BIN" upload "$dflt/def.bin" --key bad.bin >/dev/null 2>&1 || bad_rc=$?
+	assert_ne "часть меньше 5 МиБ отвергается на старте" "$bad_rc" "0"
+	assert_contains "в тексте ошибки назван ключ" \
+		"$(env "${dflt_env[@]/facade-def/}" S3VAULT_S3_MULTIPART_PART_SIZE=1024 \
+			"$VAULT_BIN" upload "$dflt/def.bin" --key bad.bin 2>&1 >/dev/null || true)" \
+		"s3.multipart_part_size"
+
+	# Спул не протекает: ни частей, ни склеенного файла после Complete не остаётся.
+	# Каталог задан явно (start_vault выше), иначе проверялся бы дефолт в $HOME.
+	if [[ -d "$MP_SPOOL" ]]; then
+		local left
+		left=$(find "$MP_SPOOL" -mindepth 1 | wc -l)
+		if [[ "$left" -eq 0 ]]; then
+			pass "спул multipart пуст после Complete"
+		else
+			fail "спул multipart пуст после Complete" "в $MP_SPOOL осталось $left записей"
+		fi
+	else
+		fail "спул multipart пуст после Complete" "каталога $MP_SPOOL нет — шлюз его не создал"
+	fi
 }
 
 # ---------------------------------------------------------------- local ---

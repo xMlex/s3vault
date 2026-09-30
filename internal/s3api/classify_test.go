@@ -15,11 +15,15 @@ import (
 const (
 	testClassifyBucket = "vault"
 	testClassifyKey    = "a.txt"
+	// testClassifyUpload is a syntactically valid uploadId; classify never
+	// looks inside it, only at its presence.
+	testClassifyUpload = "uploadId=X"
 )
 
-// classify must keep the existing operation set and only add a rejection for
-// ListObjects v1: list-type=2 wins over a stray marker, and the other
-// operations are untouched.
+// classify must keep the existing operation set, add the five multipart
+// operations on their query parameters, and only add a rejection for the two
+// request shapes the facade recognises but does not serve: ListObjects v1 and
+// the browser form POST. list-type=2 wins over a stray marker.
 func TestClassify(t *testing.T) {
 	t.Parallel()
 
@@ -47,7 +51,20 @@ func TestClassify(t *testing.T) {
 		{name: "put bucket only", method: http.MethodPut, bucket: testClassifyBucket, wantOp: port.S3OpUnknown, wantOK: false},
 		{name: "delete object", method: http.MethodDelete, bucket: testClassifyBucket, key: testClassifyKey, wantOp: port.S3OpDelete, wantOK: true},
 		{name: "delete bucket only", method: http.MethodDelete, bucket: testClassifyBucket, wantOp: port.S3OpUnknown, wantOK: false},
-		{name: "method not allowed", method: http.MethodPost, bucket: testClassifyBucket, key: testClassifyKey, wantOp: port.S3OpUnknown, wantOK: false},
+
+		// Multipart: dispatched on the query, sharing verbs with the single-shot
+		// operations. This table is the regression net for the 405 that a
+		// >5 MiB upload used to hit, because POST had no case at all.
+		{name: "create multipart", method: http.MethodPost, bucket: testClassifyBucket, key: testClassifyKey, rawQuery: "uploads", wantOp: port.S3OpCreateMultipartUpload, wantOK: true},
+		{name: "complete multipart", method: http.MethodPost, bucket: testClassifyBucket, key: testClassifyKey, rawQuery: testClassifyUpload, wantOp: port.S3OpCompleteMultipartUpload, wantOK: true},
+		{name: "post without multipart params is recognised", method: http.MethodPost, bucket: testClassifyBucket, key: testClassifyKey, wantOp: port.S3OpUnknown, wantReject: s3err.NotImplemented, wantOK: true},
+		{name: "post bucket only", method: http.MethodPost, bucket: testClassifyBucket, wantOp: port.S3OpUnknown, wantOK: false},
+		{name: "upload part", method: http.MethodPut, bucket: testClassifyBucket, key: testClassifyKey, rawQuery: "partNumber=1&uploadId=X", wantOp: port.S3OpUploadPart, wantOK: true},
+		{name: "put with uploadId but no partNumber is a put", method: http.MethodPut, bucket: testClassifyBucket, key: testClassifyKey, rawQuery: testClassifyUpload, wantOp: port.S3OpPut, wantOK: true},
+		{name: "put with partNumber but no uploadId is a put", method: http.MethodPut, bucket: testClassifyBucket, key: testClassifyKey, rawQuery: "partNumber=1", wantOp: port.S3OpPut, wantOK: true},
+		{name: "list parts", method: http.MethodGet, bucket: testClassifyBucket, key: testClassifyKey, rawQuery: testClassifyUpload, wantOp: port.S3OpListParts, wantOK: true},
+		{name: "abort multipart", method: http.MethodDelete, bucket: testClassifyBucket, key: testClassifyKey, rawQuery: testClassifyUpload, wantOp: port.S3OpAbortMultipartUpload, wantOK: true},
+		{name: "method not allowed", method: http.MethodPatch, bucket: testClassifyBucket, key: testClassifyKey, wantOp: port.S3OpUnknown, wantOK: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -383,9 +383,79 @@ func newTestAPIStore(t *testing.T, bucket string, bucketAsPrefix bool) (*s3api.A
 		BucketBackend:  bucket,
 		BucketAsPrefix: bucketAsPrefix,
 		EncFP:          "fp",
+		Multipart:      s3api.MultipartConfig{Dir: t.TempDir()},
 	})
 	require.NoError(t, err)
 	return api, store, func() { _ = disk.Close() }
+}
+
+// A ranged response must not carry the whole object's checksum.
+//
+// x-amz-checksum-sha256 describes the bytes in the body, and a 206 body is a
+// range. Advertising the whole object's digest there is a false claim, and
+// clients that verify checksums act on it: `aws s3 cp` downloads large objects
+// in ranges and fails the whole transfer with "Expected checksum ... did not
+// match". This was reachable only for objects over 5 MiB, because below that the
+// gateway could not accept an upload at all — multipart is what exposed it.
+func TestRangedGetOmitsWholeObjectChecksum(t *testing.T) {
+	t.Parallel()
+	api, cleanup := newTestAPI(t, "vault")
+	t.Cleanup(cleanup)
+
+	srv := httptest.NewServer(api.Handler())
+	t.Cleanup(srv.Close)
+	client := s3.New(s3.Options{
+		BaseEndpoint: aws.String(srv.URL),
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("AKIATEST", "secretsecretsecretsecret", ""),
+		UsePathStyle: true,
+	})
+
+	payload := []byte(strings.Repeat("0123456789abcdef", 64)) // 1 KiB
+	_, err := client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String("vault"),
+		Key:    aws.String("range.bin"),
+		Body:   bytes.NewReader(payload),
+	})
+	require.NoError(t, err)
+
+	sum := sha256.Sum256(payload)
+	wantWhole := base64.StdEncoding.EncodeToString(sum[:])
+
+	t.Run("whole object advertises its digest", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String("vault"),
+			Key:    aws.String("range.bin"),
+		})
+		require.NoError(t, err)
+
+		defer func() { _ = got.Body.Close() }()
+
+		assert.Equal(t, wantWhole, aws.ToString(got.ChecksumSHA256))
+		assert.Equal(t, types.ChecksumTypeFullObject, got.ChecksumType)
+	})
+
+	t.Run("range advertises nothing", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := client.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String("vault"),
+			Key:    aws.String("range.bin"),
+			Range:  aws.String("bytes=0-15"),
+		})
+		require.NoError(t, err)
+
+		defer func() { _ = got.Body.Close() }()
+
+		body, err := io.ReadAll(got.Body)
+		require.NoError(t, err)
+		assert.Equal(t, payload[:16], body)
+		assert.Empty(t, aws.ToString(got.ChecksumSHA256),
+			"a 206 must not claim the whole object's digest")
+		assert.Empty(t, got.ChecksumType)
+	})
 }
 
 // A raw/legacy object has no container SHA-256 and carries a pre-quoted ETag;

@@ -3,6 +3,7 @@ package s3api
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"hash"
 	"io"
 	"log/slog"
 	"net/http"
@@ -106,7 +107,8 @@ func spoolReader(r io.Reader) (path string, size int64, shaHex string, modTime t
 		return path, 0, "", modTime, err
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), r)
+
+	n, err := spoolTo(f, r, h)
 	if err != nil {
 		return path, 0, "", modTime, err
 	}
@@ -117,4 +119,23 @@ func spoolReader(r io.Reader) (path string, size int64, shaHex string, modTime t
 		return path, 0, "", modTime, err
 	}
 	return path, n, hex.EncodeToString(h.Sum(nil)), modTime, nil
+}
+
+// spoolTo streams r into dst, teeing every byte through h, and returns the
+// number of bytes written. It exists so the request body has exactly one
+// copy-and-hash path: handlePut hashes plaintext (SHA-256, the object identity)
+// while an UploadPart hashes the part (MD5, the part ETag) — the file handling
+// around it is the same, so it is not written twice.
+// spoolTo copies r to dst, teeing every byte into each of hashes. Several hashes
+// at once is how assembleParts gets the whole stream's SHA-256 and one part's MD5
+// out of a single pass over the data.
+func spoolTo(dst io.Writer, r io.Reader, hashes ...hash.Hash) (int64, error) {
+	writers := make([]io.Writer, 0, len(hashes)+1)
+
+	writers = append(writers, dst)
+	for _, h := range hashes {
+		writers = append(writers, h)
+	}
+
+	return io.Copy(io.MultiWriter(writers...), r)
 }

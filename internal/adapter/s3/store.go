@@ -34,6 +34,20 @@ func New(ctx context.Context, cfg config.S3Config) (*Store, error) {
 	if cfg.Bucket == "" {
 		return nil, fmt.Errorf("s3 bucket is required")
 	}
+	// Re-checked at the point of use. The SDK would only complain about a too-small
+	// part size at the first upload, naming neither the config key nor the S3
+	// minimum. Zero means "not specified" here too, so a fragment assembled by
+	// hand — as s3test.ConfigFromEnv does for the integration suite — gets the
+	// documented default instead of failing.
+	partSize := cfg.MultipartPartSize
+	if partSize == 0 {
+		partSize = config.DefaultMultipartPartSize
+	}
+
+	if partSize < config.MinMultipartPartSize {
+		return nil, fmt.Errorf("s3.multipart_part_size: must be %d (default) or at least %d bytes (5 MiB), got %d",
+			config.DefaultMultipartPartSize, config.MinMultipartPartSize, partSize)
+	}
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 	}
@@ -59,7 +73,16 @@ func New(ctx context.Context, cfg config.S3Config) (*Store, error) {
 	return &Store{
 		client: client,
 		bucket: cfg.Bucket,
-		put:    manager.NewUploader(client),
+		put: manager.NewUploader(client, func(u *manager.Uploader) { //nolint:staticcheck // the uploader s3vault itself uses, on purpose
+			// The part size is this client's choice and travels with the request;
+			// it is not negotiated with the store and not probed for. Raising it
+			// cuts the number of parts (and of HTTP round trips) for a big file.
+			// The cost is memory: the SDK keeps Concurrency+1 buffers of exactly
+			// PartSize, so the 5 MiB default at concurrency 5 is ~30 MiB, and
+			// every MiB added to the key adds ~5 MiB there. That is a deliberate
+			// trade, not an oversight — see architecture.md.
+			u.PartSize = partSize
+		}),
 	}, nil
 }
 

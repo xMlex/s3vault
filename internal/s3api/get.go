@@ -53,7 +53,17 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request, bucket, clientKe
 	w.Header().Set("x-amz-request-id", s3err.RequestID(r))
 	w.Header().Set("ETag", strconv.Quote(cached.ETag))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	setChecksumSHA256(w, cached.SHA256)
+	// Only on a whole-object response. A 206 carries a range, and
+	// x-amz-checksum-sha256 describes the bytes in the body: advertising the
+	// whole object's digest there is a false claim, and clients that verify
+	// checksums (aws s3 cp downloads large objects in ranges) reject the
+	// response instead of the file. S3 answers a ranged GET with the digest *of
+	// the range*; computing that per range would mean reading it on every ranged
+	// read, so the header is simply omitted — same as a store that has no
+	// checksum to give.
+	if r.Header.Get("Range") == "" {
+		setChecksumSHA256(w, cached.SHA256)
+	}
 	if headOnly {
 		st, err := f.Stat()
 		if err != nil {

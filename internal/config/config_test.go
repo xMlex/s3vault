@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
@@ -24,6 +25,129 @@ func TestLoadDefaults(t *testing.T) {
 	assert.False(t, cfg.Cache.Enabled)
 	assert.False(t, cfg.Server.S3BucketAsPrefix)
 	assert.Equal(t, BackendS3, cfg.Backend.Type)
+	assert.Equal(t, 24*time.Hour, cfg.Server.MultipartTTL)
+	assert.Equal(t, 15*time.Minute, cfg.Server.MultipartSweepInterval)
+	assert.Equal(t, 64, cfg.Server.MultipartMaxSessions)
+	assert.Zero(t, cfg.Server.MultipartMaxBytes, "no per-session spool budget unless asked for")
+	assert.Equal(t, DefaultMultipartPartSize, cfg.S3.MultipartPartSize)
+}
+
+// The part size is bounded by S3 on both sides. The bounds are checked in
+// Normalize rather than left to the SDK, which would only complain about a
+// too-small value at the first upload, naming neither the key nor the reason.
+// Zero is the single exception: it means "not specified" and takes the default,
+// the same way archive.workers below 1 is clamped rather than refused.
+func TestMultipartPartSizeBounds(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		partSize int64
+		want     int64
+		wantErr  string
+	}{
+		{name: "zero means unset", partSize: 0, want: DefaultMultipartPartSize},
+		{name: "negative", partSize: -1, wantErr: "s3.multipart_part_size"},
+		{name: "one byte", partSize: 1, wantErr: "s3.multipart_part_size"},
+		{name: "just under the S3 minimum", partSize: MinMultipartPartSize - 1, wantErr: "at least 5242880"},
+		{name: "exactly the S3 minimum", partSize: MinMultipartPartSize, want: MinMultipartPartSize},
+		{name: "exactly the S3 maximum", partSize: MaxMultipartPartSize, want: MaxMultipartPartSize},
+		{name: "just over the S3 maximum", partSize: MaxMultipartPartSize + 1, wantErr: "at most 5368709120"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			v := viper.New()
+			SetDefaults(v)
+			v.Set("s3.multipart_part_size", tc.partSize)
+			cfg, err := Load(v)
+
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				assert.Equal(t, tc.want, cfg.S3.MultipartPartSize)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// The key is advertised in .env.example, so it must bind — the same failure
+// TestEnvKeysMatchConfigFields exists for.
+func TestMultipartPartSizeFromEnv(t *testing.T) {
+	t.Setenv("S3VAULT_S3_MULTIPART_PART_SIZE", "52428800")
+
+	v := viper.New()
+	SetDefaults(v)
+	v.SetEnvPrefix("S3VAULT")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+	v.AutomaticEnv()
+	require.NoError(t, BindEnv(v))
+
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.Equal(t, int64(52428800), cfg.S3.MultipartPartSize)
+}
+
+// The multipart spool defaults beside the cache directory but is not inside it:
+// the cache carries its own invariants (TTL, sweeper, lockfile) and can be
+// switched off, while multipart has to work in every configuration. Reusing
+// cache.dir would have coupled a must-always-work feature to a default-false one.
+func TestMultipartDirDefault(t *testing.T) {
+	t.Parallel()
+
+	t.Run("derived from cache.dir", func(t *testing.T) {
+		t.Parallel()
+
+		v := viper.New()
+		SetDefaults(v)
+		v.Set("cache.dir", "/srv/s3vault/cache")
+		cfg, err := Load(v)
+		require.NoError(t, err)
+		assert.Equal(t, filepath.Join("/srv/s3vault/cache", "multipart"), cfg.Server.MultipartDir)
+	})
+
+	t.Run("overridable", func(t *testing.T) {
+		t.Parallel()
+
+		v := viper.New()
+		SetDefaults(v)
+		v.Set("cache.dir", "/srv/s3vault/cache")
+		v.Set("server.multipart_dir", "/srv/s3vault/mp")
+		cfg, err := Load(v)
+		require.NoError(t, err)
+		assert.Equal(t, "/srv/s3vault/mp", cfg.Server.MultipartDir)
+	})
+}
+
+// The spool keys are advertised in .env.example, so they must actually bind —
+// this is the same failure TestEnvKeysMatchConfigFields was written for (a key
+// that looks wired while nothing reads it).
+func TestMultipartKeysFromEnv(t *testing.T) {
+	t.Setenv("S3VAULT_SERVER_MULTIPART_DIR", "/tmp/mp")
+	t.Setenv("S3VAULT_SERVER_MULTIPART_TTL", "90m")
+	t.Setenv("S3VAULT_SERVER_MULTIPART_SWEEP_INTERVAL", "5m")
+	t.Setenv("S3VAULT_SERVER_MULTIPART_MAX_SESSIONS", "7")
+	t.Setenv("S3VAULT_SERVER_MULTIPART_MAX_BYTES", "1048576")
+
+	v := viper.New()
+	SetDefaults(v)
+	v.SetEnvPrefix("S3VAULT")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+	v.AutomaticEnv()
+	require.NoError(t, BindEnv(v))
+
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.Equal(t, "/tmp/mp", cfg.Server.MultipartDir)
+	assert.Equal(t, 90*time.Minute, cfg.Server.MultipartTTL)
+	assert.Equal(t, 5*time.Minute, cfg.Server.MultipartSweepInterval)
+	assert.Equal(t, 7, cfg.Server.MultipartMaxSessions)
+	assert.Equal(t, int64(1048576), cfg.Server.MultipartMaxBytes)
 }
 
 func TestBackendLocal(t *testing.T) {
