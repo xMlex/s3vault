@@ -1,0 +1,34 @@
+# Build context hygiene: nothing here belongs in the image, and some of it must
+# never be baked in at all.
+
+# Secrets and local config. `.env` and `*.pem` carry key material — the CLI
+# reads them from the environment/mounts at runtime, never from the image.
+.env
+.env.*.local
+*.pem
+kek.bin
+s3vault.yaml
+s3vault-local.yaml
+
+# Build output and scratch space.
+dist/
+bin/
+coverage.out
+coverage.html
+/s3vault
+tmp/
+
+# VCS and CI metadata: the build uses --buildvcs=false, so git history is
+# dead weight (and large).
+.git
+.github/
+.gitignore
+.gitattributes
+
+# Docs and stand: the image ships the binary only.
+README.md
+AGENTS.md
+architecture.md
+docs/
+compose.e2e.yaml
+scripts/

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/amwolff/awsig"
@@ -47,17 +46,12 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 	}
 	_, action, err := a.archive.UploadFile(r.Context(), info, service.ArchiveOptions{
 		Root:            filepath.Dir(tmp),
-		OnChange:        a.onChange,
 		ExplicitKey:     a.clientPath(bucket, clientKey),
 		Op:              "upload",
 		PlaintextSHA256: sum,
 	})
 	if err != nil {
 		a.metric("put", "error")
-		if strings.Contains(err.Error(), "object exists with different checksum") {
-			s3err.WriteError(w, r, s3err.AccessDenied, "object exists with different checksum")
-			return
-		}
 		a.log.ErrorContext(r.Context(), "s3 put upload",
 			slog.String("op", "s3.put"),
 			slog.String("err", err.Error()),
@@ -67,12 +61,22 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 	}
 	switch action {
 	case identity.ActionUpload, identity.ActionSkip:
-		w.Header().Set("ETag", strconv.Quote(sum))
-		w.Header().Set("x-amz-request-id", s3err.RequestID(r))
-		setChecksumSHA256(w, sum)
-		w.WriteHeader(http.StatusOK)
-		a.metric("put", "ok")
-	case identity.ActionOmit:
+		if action == identity.ActionUpload {
+			// The gateway just wrote a new version, so the plaintext cache entry
+			// (if any) describes the previous one. Drop it: with soft_ttl > 0 a
+			// fresh hit is served without revalidation, which would hand the
+			// client the old content right after a successful PUT.
+			// backendKey cannot fail here — UploadFile already mapped the same key.
+			backendKey, keyErr := a.backendKey(bucket, clientKey)
+			if keyErr != nil {
+				a.log.WarnContext(r.Context(), "s3 put cache invalidate",
+					slog.String("op", "s3.put"),
+					slog.String("err", keyErr.Error()),
+				)
+			} else {
+				a.invalidateCache(r.Context(), backendKey, "s3.put")
+			}
+		}
 		w.Header().Set("ETag", strconv.Quote(sum))
 		w.Header().Set("x-amz-request-id", s3err.RequestID(r))
 		setChecksumSHA256(w, sum)

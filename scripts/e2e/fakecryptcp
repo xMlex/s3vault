@@ -1,0 +1,86 @@
+#!/bin/sh
+# Заглушка cryptcp для e2e-стенда: повторяет контракт настоящего
+# /opt/cprocsp/bin/amd64/cryptcp, но ключевой материал выводит из SHA-1
+# thumbprint получателя, а не из контейнера CryptoPro.
+#
+# Вызывается штатными scripts/cryptcp-encrypt / cryptcp-decrypt:
+#   encr: cryptcp -encr -der -thumbprint <TP> <in> <out>
+#   decr: cryptcp -decr -nochain -thumbprint <TP> [-pin <PIN>] <in> <out>
+#
+# Ключ = SHA-256(thumbprint || содержимое $E2E_FAKE_KEK).
+# Перед шифрованием к plaintext добавляется 8-байтовый маркер: при неверном
+# thumbprint (смена ключа, битый заголовок S3VCTR01) расшифровка падает
+# громко, а не молча выдаёт мусор.
+#
+# Это НЕ криптография и не ГОСТ. Задача — проверить конвейер s3vault:
+# argv без shell, CRYPTOPRO_THUMBPRINT из env, roundtrip, ротация ключа.
+set -eu
+
+MAGIC="E2EFAKE1"
+E2E_FAKE_KEK="${E2E_FAKE_KEK:-/dev/null}"
+
+mode=""
+thumb=""
+in=""
+out=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-encr) mode="encr" ;;
+	-decr) mode="decr" ;;
+	-der | -nochain | -noeff | -pin)
+		[ "$1" = "-pin" ] && shift
+		;;
+	-thumbprint)
+		shift
+		thumb="${1:-}"
+		;;
+	-*) ;;
+	*)
+		if [ -z "$in" ]; then in="$1"; else out="$1"; fi
+		;;
+	esac
+	shift
+done
+
+# s3vault прокидывает thumbprint через env (adapter/encrypt/command.go);
+# штатные wrapper-скрипты превращают его в argv. Поддерживаем оба пути.
+[ -n "$thumb" ] || thumb="${CRYPTOPRO_THUMBPRINT:-}"
+thumb=$(printf '%s' "$thumb" | tr -d ' :')
+
+if [ -z "$mode" ] || [ -z "$in" ] || [ -z "$out" ]; then
+	echo "fake cryptcp: usage: -encr|-decr -thumbprint <sha1> <in> <out>" >&2
+	exit 2
+fi
+if [ "${#thumb}" -ne 40 ] || printf '%s' "$thumb" | tr -d '0-9a-f' | grep -q .; then
+	echo "fake cryptcp: thumbprint must be 40 hex chars, got '$thumb'" >&2
+	exit 2
+fi
+
+umask 077
+kf=$(mktemp)
+tmp_in=$(mktemp)
+tmp_out=$(mktemp)
+trap 'rm -f "$kf" "$tmp_in" "$tmp_out"' EXIT
+
+{ printf '%s' "$thumb"; cat "$E2E_FAKE_KEK"; } |
+	openssl dgst -sha256 -hex | awk '{print $NF}' >"$kf"
+
+if [ "$mode" = "encr" ]; then
+	{ printf '%s' "$MAGIC"; cat "$in"; } >"$tmp_in"
+	openssl enc -aes-256-ctr -salt -pbkdf2 -iter 100000 -md sha256 \
+		-pass "file:$kf" -in "$tmp_in" -out "$out" 2>/dev/null
+	exit 0
+fi
+
+if ! openssl enc -d -aes-256-ctr -salt -pbkdf2 -iter 100000 -md sha256 \
+	-pass "file:$kf" -in "$in" -out "$tmp_out" 2>/dev/null; then
+	echo "fake cryptcp: decrypt failed for thumbprint $thumb" >&2
+	exit 1
+fi
+if [ "$(dd if="$tmp_out" bs=1 count=8 2>/dev/null)" != "$MAGIC" ]; then
+	echo "fake cryptcp: key mismatch for thumbprint $thumb (ciphertext is not ours)" >&2
+	exit 1
+fi
+# Настоящий cryptcp пишет результат в файл-аргумент, и scripts/cryptcp-decrypt
+# читает именно его (cat "$out"). Пишем туда же, иначе roundtrip отдаёт пустой файл.
+dd if="$tmp_out" of="$out" bs=1 skip=8 2>/dev/null

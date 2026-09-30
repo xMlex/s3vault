@@ -3,7 +3,9 @@ package service_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,6 +19,131 @@ import (
 	"github.com/xMlex/s3vault/internal/domain"
 	"github.com/xMlex/s3vault/internal/service"
 )
+
+// containedPayload builds S3VCTR01 || payload with the requested enc byte.
+func containedPayload(t *testing.T, enc uint8, payload []byte) []byte {
+	t.Helper()
+
+	sum := sha256.Sum256(payload)
+	hdr, err := container.Marshal(container.Header{
+		Version:       container.VersionV1,
+		PlaintextSize: int64(len(payload)),
+		SHA256:        sum[:],
+		Enc:           enc,
+	})
+	require.NoError(t, err)
+
+	return append(hdr, payload...)
+}
+
+// recordingCommand returns a *Command whose decrypt program copies stdin to
+// stdout and touches marker, so tests can prove Decrypt was (not) invoked.
+func recordingCommand(t *testing.T, marker string) *encrypt.Command {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "fake-cryptcp")
+	body := "#!/bin/sh\nset -eu\nprintf invoked > \"" + marker + "\"\ncat\n"
+	require.NoError(t, os.WriteFile(script, []byte(body), 0o700)) //nolint:gosec // test fixture must be executable
+	enc, err := encrypt.NewCommand(config.CommandEnc{
+		Encrypt: []string{script},
+		Decrypt: []string{script},
+	})
+	require.NoError(t, err)
+
+	return enc
+}
+
+// TestFetchDownloadRefusesEncMismatch is the P1 read path: a command-encrypted
+// object read with mode=none must fail loudly, not write ciphertext.
+func TestFetchDownloadRefusesEncMismatch(t *testing.T) {
+	t.Parallel()
+
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k",
+		bytes.NewReader(containedPayload(t, container.EncCommand, []byte("Salted__ciphertext"))), domain.PutMeta{}))
+
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	err := service.NewFetch(store, encrypt.Passthrough{}).Download(context.Background(), "k", dest, io.Discard)
+
+	require.ErrorContains(t, err, "requires encryption.mode=command")
+
+	_, statErr := os.Stat(dest)
+	assert.True(t, os.IsNotExist(statErr), "no output must be left on a mode mismatch")
+}
+
+// TestFetchDownloadRefusesEncNoneWithCommandReader is H5: enc=0 means there is
+// no layer to strip, so the decrypt program must not run.
+func TestFetchDownloadRefusesEncNoneWithCommandReader(t *testing.T) {
+	t.Parallel()
+
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k",
+		bytes.NewReader(containedPayload(t, container.EncNone, []byte("plaintext"))), domain.PutMeta{}))
+
+	marker := filepath.Join(t.TempDir(), "invoked")
+	enc := recordingCommand(t, marker)
+	dest := filepath.Join(t.TempDir(), "out.bin")
+
+	err := service.NewFetch(store, enc).Download(context.Background(), "k", dest, io.Discard)
+
+	require.ErrorContains(t, err, "requires encryption.mode=none")
+	assert.NoFileExists(t, marker, "decrypt program must not run for enc=0")
+}
+
+// TestFetchDownloadEncryptedRoundTrip keeps the symmetric contract: enc=command
+// with a command reader still decrypts.
+func TestFetchDownloadEncryptedRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("hello container")
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k",
+		bytes.NewReader(containedPayload(t, container.EncCommand, payload)), domain.PutMeta{}))
+
+	marker := filepath.Join(t.TempDir(), "invoked")
+	enc := recordingCommand(t, marker)
+	dest := filepath.Join(t.TempDir(), "out")
+
+	require.NoError(t, service.NewFetch(store, enc).Download(context.Background(), "k", dest, io.Discard))
+	b, err := os.ReadFile(dest) //nolint:gosec // dest is a test temp file
+	require.NoError(t, err)
+	assert.Equal(t, string(payload), string(b))
+	assert.FileExists(t, marker)
+}
+
+// TestFetchDownloadLegacyWarns covers objects without an S3VCTR01 container:
+// legacy detection still decrypts/copies, and the read is flagged in the log.
+func TestFetchDownloadLegacyWarns(t *testing.T) {
+	t.Parallel()
+
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k", bytes.NewReader([]byte("bare plaintext")), domain.PutMeta{}))
+
+	var logs bytes.Buffer
+
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	dest := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, service.NewFetch(store, encrypt.Passthrough{}).WithLogger(logger).
+		Download(context.Background(), "k", dest, io.Discard))
+
+	b, err := os.ReadFile(dest) //nolint:gosec // dest is a test temp file
+	require.NoError(t, err)
+	assert.Equal(t, "bare plaintext", string(b))
+	assert.Contains(t, logs.String(), "legacy detection")
+}
+
+// TestFetchMaterializeRefusesEncMismatch checks the HTTP/S3 ephemeral path uses
+// the same header-driven check.
+func TestFetchMaterializeRefusesEncMismatch(t *testing.T) {
+	t.Parallel()
+
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k",
+		bytes.NewReader(containedPayload(t, container.EncCommand, []byte("Salted__ciphertext"))), domain.PutMeta{}))
+
+	_, err := service.NewFetch(store, encrypt.Passthrough{}).Materialize(context.Background(), "k")
+	require.ErrorContains(t, err, "requires encryption.mode=command")
+}
 
 func TestFetchDownloadPlain(t *testing.T) {
 	t.Parallel()

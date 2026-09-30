@@ -13,6 +13,7 @@ import (
 
 func benchStore(b *testing.B, layout string, objects int) *localstore.Store {
 	b.Helper()
+
 	st, err := localstore.New(config.LocalConfig{Dir: b.TempDir(), Layout: layout})
 	if err != nil {
 		b.Fatal(err)
@@ -36,6 +37,7 @@ func BenchmarkPut(b *testing.B) {
 			payload := bytes.Repeat([]byte("x"), 4096)
 			b.SetBytes(int64(len(payload)))
 			b.ReportAllocs()
+
 			for b.Loop() {
 				if err := st.Put(ctx, "k.bin", bytes.NewReader(payload), domain.PutMeta{}); err != nil {
 					b.Fatal(err)

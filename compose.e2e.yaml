@@ -1,0 +1,61 @@
+name: s3vault-e2e
+
+# E2E-стенд: только S3-совместимое хранилище. Остальное (HTTP-сервер,
+# S3-фасад, метрики, кэш, ключи) — это порты и каталоги самого s3vault,
+# их поднимает scripts/e2e.sh.
+#
+#   docker compose -f compose.e2e.yaml up -d
+#   docker compose -f compose.e2e.yaml down -v
+#
+# Именованный том (не tmpfs) — сценарий resilience останавливает MinIO
+# и поднимает заново; на tmpfs данные бы потерялись.
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3VAULT_E2E_S3_ACCESS_KEY:-s3vault}
+      MINIO_ROOT_PASSWORD: ${S3VAULT_E2E_S3_SECRET_KEY:-s3vaulttest}
+    ports:
+      - "${S3VAULT_E2E_MINIO_API:-9000}:9000"
+      - "${S3VAULT_E2E_MINIO_CONSOLE:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      # В образе есть mc; curl — запасной вариант на случай смены базового образа.
+      test:
+        - CMD-SHELL
+        - >-
+          mc ready local ||
+          curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null ||
+          exit 1
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+
+  # Создаёт бакет и выходит. s3store.New только проверяет, что имя бакета
+  # непустое, и ни разу не вызывает CreateBucket — бакет обязан существовать.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${S3VAULT_E2E_S3_ACCESS_KEY:-s3vault}
+      MINIO_ROOT_PASSWORD: ${S3VAULT_E2E_S3_SECRET_KEY:-s3vaulttest}
+      S3VAULT_E2E_S3_BUCKET: ${S3VAULT_E2E_S3_BUCKET:-s3vault}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        mc alias set vault http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null
+        mc mb --ignore-existing "vault/$$S3VAULT_E2E_S3_BUCKET" >/dev/null
+        mc anonymous set none "vault/$$S3VAULT_E2E_S3_BUCKET" >/dev/null 2>&1 || true
+        echo "bucket $$S3VAULT_E2E_S3_BUCKET ready"
+    restart: "no"
+
+volumes:
+  minio-data:

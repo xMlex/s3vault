@@ -1,0 +1,45 @@
+name: Lint
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  golangci-lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # only-new-issues считает диф по базе ветки — нужен полный git.
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.26'
+        check-latest: true
+
+    # only-new-issues: true — не «спрятать» дерево, а честно откалибровать
+    # гейт. На момент включения в .golangci.yml включено ~19 линтеров, из них
+    # один только wsl_v5 даёт ~420 находок, и по ним в рабочем дереве есть
+    # пред-существующий долг (см. AGENTS.md). Массово переписывать чужой
+    # форматирующий долг в этом PR было бы опаснее, чем оставить джоб зелёным
+    # на новом коде: любое новое нарушение всё равно ломает сборку.
+    # Когда долг закрыт — снять only-new-issues и сделать джоб сплошным.
+    # gosec входит в .golangci.yml, поэтому отдельного джоба на SAST здесь нет:
+    # новые находки gosec приезжают сюда же.
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v9
+      with:
+        version: latest
+        only-new-issues: true

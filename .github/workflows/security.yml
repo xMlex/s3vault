@@ -1,0 +1,62 @@
+name: Security
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  govulncheck:
+    # govulncheck отличается от generic-CVE-сканеров: он отвечает на вопрос
+    # «вызывается ли уязвимый код именно этим проектом», а не «есть ли такой
+    # CVE в графе зависимостей». Для S3/крипто-утилиты это и есть нужный гейт.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.26'
+        check-latest: true
+
+    - name: Install govulncheck
+      run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+
+    - name: Run govulncheck
+      run: govulncheck ./...
+
+  gosec:
+    # Отдельный джоб на всё дерево сейчас красный: gosec уже включён в
+    # .golangci.yml и находит ~41 замечание (14 в production, 27 в _test.go),
+    # почти все — G304 «file inclusion via variable», которая для этого CLI
+    # (сканирование каталогов, чтение ключей/конфигов) является прямым
+    # назначением, а не дефектом. Подавить их молча = повесить трубку на
+    # будущие настоящие находки, поэтому новые ловит lint.yml (gosec включён),
+    # а этот джоб поднят с continue-on-error и служит видимым счётчиком долга.
+    # Когда находки разобраны — снять continue-on-error.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.26'
+        check-latest: true
+
+    - name: Install gosec
+      run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+    - name: Run gosec
+      run: gosec -quiet -fmt=golangci-lint ./...

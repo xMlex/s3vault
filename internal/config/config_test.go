@@ -2,6 +2,7 @@ package config
 
 import (
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -18,7 +19,6 @@ func TestLoadDefaults(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "info", cfg.Log.Level)
 	assert.Equal(t, 4, cfg.Archive.Workers)
-	assert.Equal(t, "overwrite", cfg.Archive.OnChange)
 	assert.Equal(t, "none", cfg.Encryption.Mode)
 	assert.NotEmpty(t, cfg.Cache.Dir)
 	assert.False(t, cfg.Cache.Enabled)
@@ -47,27 +47,36 @@ func TestBackendLocalRawLayout(t *testing.T) {
 	v.Set("backend.type", "local")
 	v.Set("backend.local.dir", "objects")
 	v.Set("backend.local.layout", " RAW ")
-	v.Set("encryption.mode", "none")
 	cfg, err := Load(v)
 	require.NoError(t, err)
 	assert.Equal(t, LocalLayoutRaw, cfg.Backend.Local.Layout)
 }
 
-func TestBackendLocalRawRequiresNoEncryption(t *testing.T) {
+// layout=raw drops the S3VCTR01 header, so it cannot carry the enc marker and
+// must not be combined with encryption: refuse at load (problems.md P1-legacy).
+func TestBackendLocalRawRejectsEncryption(t *testing.T) {
 	t.Parallel()
-	v := viper.New()
-	SetDefaults(v)
-	v.Set("backend.type", "local")
-	v.Set("backend.local.dir", "objects")
-	v.Set("backend.local.layout", "raw")
-	v.Set("encryption.mode", "native")
-	_, err := Load(v)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "layout")
+
+	for _, mode := range []string{"native", "command"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+
+			v := viper.New()
+			SetDefaults(v)
+			v.Set("backend.type", "local")
+			v.Set("backend.local.dir", "objects")
+			v.Set("backend.local.layout", "raw")
+			v.Set("encryption.mode", mode)
+
+			_, err := Load(v)
+			require.ErrorContains(t, err, "cannot be combined with encryption.mode")
+		})
+	}
 }
 
 func TestBackendInvalid(t *testing.T) {
 	t.Parallel()
+
 	tests := map[string]map[string]any{
 		"unknown type":         {"backend.type": "gcs"},
 		"local without dir":    {"backend.type": "local"},
@@ -76,13 +85,43 @@ func TestBackendInvalid(t *testing.T) {
 	for name, values := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
+
 			v := viper.New()
 			SetDefaults(v)
+
 			for key, val := range values {
 				v.Set(key, val)
 			}
+
 			_, err := Load(v)
 			require.Error(t, err)
+		})
+	}
+}
+
+func TestRemovedKeysRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]map[string]any{
+		"remote.url":        {"remote.url": "https://s3vault.example:8080"},
+		"remote.rate_limit": {"remote.rate_limit_bps": int64(1024)},
+		"server.token":      {"server.token": "secret"},
+		"archive.on_change": {"archive.on_change": "skip"},
+	}
+	for name, values := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			v := viper.New()
+			SetDefaults(v)
+
+			for key, val := range values {
+				v.Set(key, val)
+			}
+
+			_, err := Load(v)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "was removed")
 		})
 	}
 }
@@ -140,35 +179,11 @@ func TestCommandThumbprintFromArgv(t *testing.T) {
 	assert.Equal(t, "afa43c43975fbfc700f051fd62016e1571e7e025", cfg.Encryption.Command.Thumbprint)
 }
 
-func TestRemoteURLTrim(t *testing.T) {
-	t.Parallel()
-	v := viper.New()
-	SetDefaults(v)
-	v.Set("remote.url", "https://s3vault.example:8080/")
-	v.Set("remote.rate_limit_bps", int64(1024))
-	cfg, err := Load(v)
-	require.NoError(t, err)
-	assert.Equal(t, "https://s3vault.example:8080", cfg.Remote.URL)
-	assert.Equal(t, int64(1024), cfg.Remote.RateLimitBPS)
-}
-
-func TestRemoteRateLimitNegative(t *testing.T) {
-	t.Parallel()
-	v := viper.New()
-	SetDefaults(v)
-	v.Set("remote.rate_limit_bps", int64(-1))
-	_, err := Load(v)
-	require.Error(t, err)
-}
-
 func TestEnvWithoutYAMLDefault(t *testing.T) {
-	// Keys with no SetDefault (e.g. server.token) are invisible to Unmarshal
-	// unless BindEnv registered them — the failure mode that rejected
-	// S3VAULT_SERVER_TOKEN on non-loopback listen.
-	t.Setenv("S3VAULT_SERVER_TOKEN", "env-token")
+	// Keys with no SetDefault (e.g. s3.secret_key, backend.local.dir) are
+	// invisible to Unmarshal unless BindEnv registered them.
 	t.Setenv("S3VAULT_S3_BUCKET", "env-bucket")
 	t.Setenv("S3VAULT_S3_SECRET_KEY", "env-secret")
-	t.Setenv("S3VAULT_REMOTE_URL", "https://remote.example:8080/")
 	t.Setenv("S3VAULT_SERVER_S3_BUCKET_AS_PREFIX", "true")
 	t.Setenv("S3VAULT_BACKEND_TYPE", "local")
 	t.Setenv("S3VAULT_BACKEND_LOCAL_DIR", "/srv/s3vault/objects")
@@ -182,17 +197,15 @@ func TestEnvWithoutYAMLDefault(t *testing.T) {
 
 	cfg, err := Load(v)
 	require.NoError(t, err)
-	assert.Equal(t, "env-token", cfg.Server.Token)
 	assert.Equal(t, "env-bucket", cfg.S3.Bucket)
 	assert.Equal(t, "env-secret", cfg.S3.SecretKey)
-	assert.Equal(t, "https://remote.example:8080", cfg.Remote.URL)
 	assert.True(t, cfg.Server.S3BucketAsPrefix)
 	assert.Equal(t, BackendLocal, cfg.Backend.Type)
 	assert.Equal(t, "/srv/s3vault/objects", cfg.Backend.Local.Dir)
 }
 
 func TestEnvIgnoredWithoutBindEnv(t *testing.T) {
-	t.Setenv("S3VAULT_SERVER_TOKEN", "env-token")
+	t.Setenv("S3VAULT_S3_BUCKET", "env-bucket")
 
 	v := viper.New()
 	SetDefaults(v)
@@ -202,5 +215,82 @@ func TestEnvIgnoredWithoutBindEnv(t *testing.T) {
 
 	cfg, err := Load(v)
 	require.NoError(t, err)
-	assert.Empty(t, cfg.Server.Token, "AutomaticEnv alone must not populate Unmarshal for unbound keys")
+	assert.Empty(t, cfg.S3.Bucket, "AutomaticEnv alone must not populate Unmarshal for unbound keys")
+}
+
+// configFieldKeys walks Config and returns every "a.b" mapstructure path.
+func configFieldKeys(t *testing.T) map[string]struct{} {
+	t.Helper()
+
+	keys := map[string]struct{}{}
+
+	var walk func(prefix string, typ reflect.Type)
+
+	walk = func(prefix string, typ reflect.Type) {
+		for f := range typ.Fields() {
+			tag := f.Tag.Get("mapstructure")
+			if tag == "" || tag == "-" {
+				continue
+			}
+
+			path := tag
+			if prefix != "" {
+				path = prefix + "." + tag
+			}
+
+			if f.Type.Kind() == reflect.Struct && f.Type.PkgPath() != "" {
+				walk(path, f.Type)
+
+				continue
+			}
+
+			keys[path] = struct{}{}
+		}
+	}
+
+	walk("", reflect.TypeFor[Config]())
+
+	return keys
+}
+
+// TestEnvKeysMatchConfigFields keeps envKeys honest in both directions.
+// A key listed in envKeys but absent from Config used to look wired while
+// nothing read it: that is exactly how the dead `s3.tls` boolean survived.
+func TestEnvKeysMatchConfigFields(t *testing.T) {
+	t.Parallel()
+
+	fields := configFieldKeys(t)
+	bound := make(map[string]struct{}, len(envKeys))
+
+	for _, k := range envKeys {
+		_, dup := bound[k]
+		require.False(t, dup, "duplicate key in envKeys: %s", k)
+
+		bound[k] = struct{}{}
+
+		assert.Contains(t, fields, k, "envKeys lists a key with no Config field")
+	}
+
+	for k := range fields {
+		assert.Contains(t, bound, k, "Config field is not bound for S3VAULT_* environment lookup")
+	}
+}
+
+// TestCommandArgvFromEnv pins the env override for the command-mode argv
+// slices: .env.example advertises these keys, so they must actually bind.
+func TestCommandArgvFromEnv(t *testing.T) {
+	t.Setenv("S3VAULT_ENCRYPTION_COMMAND_ENCRYPT", "cryptcp,-encrypt,--thumbprint,AA")
+	t.Setenv("S3VAULT_ENCRYPTION_COMMAND_DECRYPT", "cryptcp,-decrypt,--thumbprint,AA")
+
+	v := viper.New()
+	SetDefaults(v)
+	v.SetEnvPrefix("S3VAULT")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+	v.AutomaticEnv()
+	require.NoError(t, BindEnv(v))
+
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"cryptcp", "-encrypt", "--thumbprint", "AA"}, cfg.Encryption.Command.Encrypt)
+	assert.Equal(t, []string{"cryptcp", "-decrypt", "--thumbprint", "AA"}, cfg.Encryption.Command.Decrypt)
 }

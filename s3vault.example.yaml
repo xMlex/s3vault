@@ -5,7 +5,8 @@ backend:
   # local:
   #   dir: /srv/s3vault/objects  # object tree on this host; s3.* is then unused
   #   layout: container          # default: S3VCTR01 || payload (S3 parity)
-  #   # layout: raw              # plaintext as-is (encryption.mode=none only)
+  #   # layout: raw              # bare plaintext payload without the container;
+  #   #                          # only with encryption.mode=none
   # Env equivalents (override this file, no YAML needed at all):
   #   S3VAULT_BACKEND_TYPE=local
   #   S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
@@ -15,9 +16,21 @@ s3:
   bucket: my-bucket
   prefix: backups
   path_style: false
-  tls: true
+  # session_token: ""  # only for STS-style temporary credentials
+  # allow_secrets_in_config: false  # set true to silence the secret-in-YAML warning
+  # Схема endpoint определяет TLS сама: https:// — с проверкой сертификата
+  # по системному хранилищу, http:// — без TLS. Отдельного ключа s3.tls нет:
+  # два источника истины для одного факта молча расходятся.
 encryption:
   mode: none
+  # native: S3VLT01 inside S3VCTR01. RSA is envelope-only — it never touches file bytes.
+  # mode: native
+  # native:
+  #   wrap: rsa-oaep          # rsa-oaep | keyfile
+  #   public_key_path: /etc/s3vault/public.pem
+  #   private_key_path: /etc/s3vault/private.pem   # wrap: rsa-oaep
+  #   key_file: /etc/s3vault/kek.bin              # wrap: keyfile; 32 raw bytes or SHA-256 of the file
+  #   chunk_size: 65536
   # CryptoPro CSP (ГОСТ): provider + SHA-1 thumbprint → S3VCTR01 header;
   # download uses header (CRYPTOPRO_THUMBPRINT) so old objects stay decryptable after key rotation.
   # PIN — only CRYPTOPRO_PIN in the process environment, not in this file.
@@ -38,25 +51,23 @@ cache:
 server:
   listen: "127.0.0.1:8080"
   metrics_listen: "127.0.0.1:9090"
-  # token: set via S3VAULT_SERVER_TOKEN, not in this file.
-  # Required once listen is not loopback (e.g. 0.0.0.0:8080), unless the S3 API
-  # keys below are set; otherwise the server refuses to start.
-  # S3 API (SigV4 plaintext facade). Both keys required to enable.
-  # s3_listen: ""  # empty = multiplex on listen (reserved: /health /ready /files)
+  # The gateway serves clients only over the S3 API; server.token / HTTP /files
+  # were removed. A non-loopback or loopback server both require the S3 keys.
+  # S3 API (SigV4 plaintext facade). Both keys required (the only data frontend).
+  # s3_listen: ""  # empty = multiplex on listen (reserved: /health /ready)
   # s3_listen: "127.0.0.1:8333"  # or separate port; needs the key pair below
   # s3_access_key / s3_secret_key: prefer S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY
   # s3_region: us-east-1
   # s3_bucket: my-bucket  # virtual bucket name; default = s3.bucket
   # s3_bucket_as_prefix: false  # true = client bucket name becomes key prefix under s3.bucket
-# Client without CryptoPro/S3: send plaintext to a configured s3vault server.
-# remote:
-#   url: "https://s3vault.example:8080"
-#   rate_limit_bps: 10485760  # 10 MiB/s aggregate; 0 = unlimited
-# Auth: same S3VAULT_SERVER_TOKEN as the server.
+# Клиент без CryptoPro/S3: указывает s3.endpoint на S3-фасад шлюза и использует
+# его server.s3_access_key/server.s3_secret_key как S3-креды, path_style: true.
+# Тогда archive/upload/download ходят только через шлюз. Ключи remote.url и
+# S3VAULT_SERVER_TOKEN удалены.
 archive:
   older_than: 7d
   workers: 4
-  on_change: overwrite
   follow_symlinks: false
+  # fail_fast: false      # one file error aborts the whole run
   # delete_after_upload: false
   # delete_if_exists: false

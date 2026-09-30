@@ -1,0 +1,114 @@
+name: E2E
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  e2e:
+    runs-on: ubuntu-latest
+    # Фаза resilience рвёт TCP-прокси и ждёт восстановления — на 10 минут
+    # GitHub сам процесс не убьёт, но подстраховаться дешевле, чем red-стабильный
+    # джоб из-за потолка.
+    timeout-minutes: 30
+    services:
+      minio:
+        image: minio/minio:RELEASE.2025-10-15T17-29-55Z
+        # Креды те же, что ждёт scripts/e2e.sh (S3VAULT_E2E_S3_ACCESS_KEY).
+        env:
+          MINIO_ROOT_USER: s3vault
+          MINIO_ROOT_PASSWORD: s3vaulttest
+        ports:
+          - '9000:9000'
+        options: >-
+          --health-cmd "curl -fsS http://127.0.0.1:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.26'
+        check-latest: true
+
+    - name: Install socat
+      # Фаза resilience имитирует отказ S3 управляемым socat-прокси, а не
+      # docker compose stop — в CI compose вообще не поднимается.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends socat
+        socat -V | head -1
+
+    - name: Ensure aws cli
+      # scripts/e2e.sh ходит в MinIO напрямую через awscli (s3api get-object и
+      # т.д.), мимо s3vault — без него фазы не пройдут.
+      run: |
+        if ! command -v aws >/dev/null 2>&1; then
+          sudo pipx install awscli
+        fi
+        aws --version
+
+    - name: Create bucket
+      # e2e.sh бакет не создаёт: в compose это делает minio-init, здесь —
+      # внешний инструмент, тот же приём.
+      run: |
+        aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket \
+          --bucket s3vault || true
+        aws --endpoint-url http://127.0.0.1:9000 s3api head-bucket \
+          --bucket s3vault
+      env:
+        AWS_ACCESS_KEY_ID: s3vault
+        AWS_SECRET_ACCESS_KEY: s3vaulttest
+        AWS_DEFAULT_REGION: us-east-1
+
+    - name: Run e2e
+      # S3VAULT_E2E_NO_COMPOSE=1 — MinIO уже поднят сервис-контейнером выше.
+      run: ./scripts/e2e.sh all
+      env:
+        S3VAULT_E2E_NO_COMPOSE: '1'
+
+    - name: Run decrypt-detection verify
+      # Стенды детектора шифрования (docs/decrypt-detection.md): ветвление
+      # DecryptAuto по hdr.Enc, владение слоями, дрейф encryption.mode.
+      # Живут отдельно от e2e.sh, потому что проверяют не сценарии CLI, а
+      # инварианты чтения, и каждый стенд сам собирает бинарь из исходников.
+      run: make verify
+      env:
+        AWS_ACCESS_KEY_ID: s3vault
+        AWS_SECRET_ACCESS_KEY: s3vaulttest
+        AWS_DEFAULT_REGION: us-east-1
+
+    - name: Upload vault log on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-logs
+        path: /tmp/s3vault-e2e-$(id -u)/
+        if-no-files-found: ignore
+
+    - name: Upload verify logs on failure
+      # Причина отказа фасада пишется в srv-<сценарий>-<mode>.log: клиенту
+      # уходит пустой InternalError, поэтому без этого артефакта диагностика
+      # в CI невозможна. Пути — дефолтные VERIFY_WORKDIR стендов.
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: verify-logs
+        path: |
+          /tmp/verify/
+          /tmp/verify-layers/
+          /tmp/verify-drift/
+        if-no-files-found: ignore

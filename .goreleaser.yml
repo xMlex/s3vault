@@ -1,0 +1,60 @@
+# GoReleaser для s3vault: один статический CLI-бинарь, без cgo, без Dockerfile.
+version: 2
+
+project_name: s3vault
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: s3vault
+    main: ./cmd/s3vault
+    binary: s3vault
+    env:
+      - CGO_ENABLED=0
+    # Тот же ldflag, что и в Makefile: версия приходит из тега, а не из
+    # VCS-стампинга (он ломает сборку там, где git недоступен).
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: s3vault
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE*
+      - s3vault.example.yaml
+      - .env.example
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+sboms:
+  - artifacts: sbom
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  prerelease: auto

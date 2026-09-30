@@ -21,6 +21,7 @@ const (
 	SignatureDoesNotMatch Code = "SignatureDoesNotMatch"
 	InvalidAccessKeyId    Code = "InvalidAccessKeyId"
 	MethodNotAllowed      Code = "MethodNotAllowed"
+	NotImplemented        Code = "NotImplemented"
 )
 
 // Error is the S3 XML error document.
@@ -41,6 +42,7 @@ var messages = map[Code]string{
 	SignatureDoesNotMatch: "The request signature we calculated does not match the signature you provided.",
 	InvalidAccessKeyId:    "The AWS Access Key Id you provided does not exist in our records.",
 	MethodNotAllowed:      "The specified method is not allowed against this resource.",
+	NotImplemented:        "The requested operation is not implemented.",
 }
 
 var status = map[Code]int{
@@ -52,6 +54,7 @@ var status = map[Code]int{
 	SignatureDoesNotMatch: http.StatusForbidden,
 	InvalidAccessKeyId:    http.StatusForbidden,
 	MethodNotAllowed:      http.StatusMethodNotAllowed,
+	NotImplemented:        http.StatusNotImplemented,
 }
 
 // WriteError writes an S3 XML error response.

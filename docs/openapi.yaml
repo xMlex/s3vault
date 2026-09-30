@@ -1,54 +1,40 @@
 openapi: 3.0.3
 info:
   title: s3vault HTTP API
-  version: "1.0"
+  version: "2.0"
   description: |
-    HTTP surface of `s3vault server`.
+    Operational HTTP surface of `s3vault server` (the gateway).
 
-    Serves **plaintext** via `Fetch.Materialize` + `http.ServeContent` (including
-    HTTP Range) after decrypting objects from storage. Persistent disk cache is
-    optional (`cache.enabled`, default false); when off, each request uses an
-    ephemeral temp file. Accepts **PUT** plaintext for remote archive clients;
-    encryption and backend Put run on the server.
+    The gateway serves object data **only** over its S3 API facade (SigV4,
+    path-style) — see `architecture.md`. The former bearer-token `HTTP /files`
+    frontend (`GET`/`HEAD`/`PUT`) and the `remote.url` ingest mode were removed:
+    a client without CryptoPro/S3 points `s3.endpoint` at the gateway facade
+    and uses the gateway's `server.s3_access_key`/`server.s3_secret_key`.
 
-    Default listen: `127.0.0.1:8080`. Empty bearer token with a non-loopback
-    bind refuses to start. Prometheus metrics are on a **separate** listen
-    address (`server.metrics_listen`, default `127.0.0.1:9090`) and are not
-    protected by the application bearer token.
-
-    Object path keying matches CLI upload: request path is relative to
-    `s3.prefix` / `--prefix` on the server (often empty when each client
-    embeds its own prefix in the path).
+    This document covers the remaining plain HTTP endpoints only: liveness and
+    readiness. Prometheus metrics are on a separate listen
+    (`server.metrics_listen`, default `127.0.0.1:9090`).
   contact:
     name: xMlex/s3vault
     url: https://github.com/xMlex/s3vault
 
 servers:
   - url: http://127.0.0.1:8080
-    description: Application server (default)
+    description: Gateway operational endpoints (default)
   - url: http://127.0.0.1:9090
-    description: Metrics server only (`/metrics`)
-  - url: http://crypto-s3.service.prod.lab.internal
     description: Metrics server only (`/metrics`)
 
 tags:
   - name: health
     description: Liveness and readiness (no body schema)
-  - name: files
-    description: Plaintext download and ingest
-  - name: metrics
-    description: Prometheus scrape endpoint (separate listen)
 
 paths:
   /health:
     get:
       tags: [health]
-      summary: Liveness
-      description: |
-        Process is up. Always public: bearer auth is skipped even when
-        `server.token` is set.
+      summary: Liveness probe
+      description: Process is alive. Never touches the object store.
       operationId: getHealth
-      security: []
       responses:
         "200":
           description: Alive
@@ -56,343 +42,20 @@ paths:
             text/plain:
               schema:
                 type: string
-                example: |
-                  ok
-
+                example: ok
   /ready:
     get:
       tags: [health]
-      summary: Readiness
-      description: |
-        Cheap S3 HEAD of sentinel key `.s3vault-ready`. Requires bearer token
-        when `server.token` is configured.
+      summary: Readiness probe
+      description: Cheap HEAD against the object store.
       operationId: getReady
-      security:
-        - BearerAuth: []
       responses:
         "200":
-          description: S3 reachable
+          description: Store reachable
           content:
             text/plain:
               schema:
                 type: string
-                example: |
-                  ok
-        "401":
-          $ref: "#/components/responses/Unauthorized"
+                example: ok
         "503":
-          description: S3 HEAD failed
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: not ready
-
-  /files/{path}:
-    parameters:
-      - $ref: "#/components/parameters/FilePath"
-    get:
-      tags: [files]
-      summary: Download plaintext file
-      description: |
-        Materializes the object (disk cache when enabled, else ephemeral temp),
-        then serves via `http.ServeContent` (supports `Range`, sets
-        `Content-Length`, `Last-Modified`, `ETag`).
-
-        Path length after `/files/` must be ≤ 2048. Traversal and empty paths
-        are rejected.
-      operationId: getFile
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/Range"
-        - $ref: "#/components/parameters/IfNoneMatch"
-        - $ref: "#/components/parameters/IfModifiedSince"
-      responses:
-        "200":
-          description: Full plaintext body
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-            X-Content-Type-Options:
-              $ref: "#/components/headers/Nosniff"
-            Last-Modified:
-              $ref: "#/components/headers/LastModified"
-            Content-Length:
-              schema:
-                type: integer
-                format: int64
-          content:
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
-        "206":
-          description: Partial content (Range)
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-            Content-Range:
-              schema:
-                type: string
-                example: bytes 0-1023/4096
-            X-Content-Type-Options:
-              $ref: "#/components/headers/Nosniff"
-          content:
-            application/octet-stream:
-              schema:
-                type: string
-                format: binary
-        "304":
-          description: Not modified (conditional GET)
-        "400":
-          $ref: "#/components/responses/InvalidPath"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          description: Object not found
-        "416":
-          description: Range not satisfiable
-        "500":
-          description: Cache open failure
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: unavailable
-        "502":
-          description: Materialize / decrypt / S3 failure
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: unavailable
-
-    head:
-      tags: [files]
-      summary: File metadata (HEAD)
-      description: Same as GET, but without a response body (`http.ServeContent`).
-      operationId: headFile
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/Range"
-        - $ref: "#/components/parameters/IfNoneMatch"
-        - $ref: "#/components/parameters/IfModifiedSince"
-      responses:
-        "200":
-          description: Headers only
-          headers:
-            ETag:
-              $ref: "#/components/headers/ETag"
-            X-Content-Type-Options:
-              $ref: "#/components/headers/Nosniff"
-            Last-Modified:
-              $ref: "#/components/headers/LastModified"
-            Content-Length:
-              schema:
-                type: integer
-                format: int64
-        "206":
-          description: Partial content headers (Range)
-        "304":
-          description: Not modified
-        "400":
-          $ref: "#/components/responses/InvalidPath"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          description: Object not found
-        "500":
-          description: Cache open failure
-        "502":
-          description: Materialize failure
-
-    put:
-      tags: [files]
-      summary: Ingest plaintext (remote archive)
-      description: |
-        Streams the request body to a temp file (`0600`) while hashing SHA-256,
-        then runs the same Archive identity / encrypt / Put path as CLI `upload`
-        (precomputed hash, no second hash pass).
-
-        Optional `X-S3Vault-Mtime` (RFC3339 or RFC3339Nano) sets the spool file
-        mtime used for archive metadata.
-
-        Response codes encode archive action:
-        - `201` — uploaded
-        - `200` — identical content skip
-        - `204` — policy omit (`on_change=skip` with different content; remote
-          clients must not treat this as delete-if-exists)
-        - `409` — conflict (`on_change=fail` with different checksum)
-      operationId: putFile
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: X-S3Vault-Mtime
-          in: header
-          required: false
-          description: Original file mtime (RFC3339 or RFC3339Nano). Invalid values are ignored; server uses now.
-          schema:
-            type: string
-            format: date-time
-            example: "2026-03-15T12:00:00Z"
-      requestBody:
-        required: true
-        description: Raw plaintext octets (not JSON)
-        content:
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-      responses:
-        "200":
-          description: Identical skip — object already matches plaintext SHA-256
-        "201":
-          description: Uploaded (encrypted and stored)
-        "204":
-          description: Policy omit — content differs and was not stored (`on_change=skip`)
-        "400":
-          description: Invalid path or body spool failure
-          content:
-            text/plain:
-              schema:
-                type: string
-                enum: [invalid path, bad request]
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "409":
-          description: Conflict — object exists with different checksum (`on_change=fail`)
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: conflict
-        "501":
-          description: Archive service not wired (should not happen on `s3vault server`)
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: ingest unavailable
-        "502":
-          description: Upload / encrypt / S3 failure
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: upload failed
-
-  /metrics:
-    get:
-      tags: [metrics]
-      summary: Prometheus metrics
-      description: |
-        Served only on `metrics_listen` (not on the application port). No
-        bearer auth. Low-cardinality labels only (no full object paths).
-      operationId: getMetrics
-      security: []
-      servers:
-        - url: http://127.0.0.1:9090
-          description: Metrics listen (default)
-      responses:
-        "200":
-          description: Prometheus text exposition format
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: |
-                  # HELP s3vault_http_requests_total ...
-                  # TYPE s3vault_http_requests_total counter
-                  s3vault_http_requests_total{code="200",method="GET"} 1
-
-components:
-  securitySchemes:
-    BearerAuth:
-      type: http
-      scheme: bearer
-      description: |
-        Shared token from `server.token` / `S3VAULT_SERVER_TOKEN`.
-        Header value: `Bearer <token>`.
-        When the token is empty (loopback-only binds), auth middleware is a no-op.
-
-  parameters:
-    FilePath:
-      name: path
-      in: path
-      required: true
-      description: |
-        Object-relative path (may contain `/`). Max length 2048.
-        Mapped with server `s3.prefix` the same way as CLI upload.
-        Must be local (no `..` traversal, no NUL, no backslashes).
-      schema:
-        type: string
-        maxLength: 2048
-        example: logs/app.log
-      style: simple
-      explode: false
-
-    Range:
-      name: Range
-      in: header
-      required: false
-      description: Byte range over **plaintext** cache content
-      schema:
-        type: string
-        example: bytes=0-1023
-
-    IfNoneMatch:
-      name: If-None-Match
-      in: header
-      required: false
-      schema:
-        type: string
-
-    IfModifiedSince:
-      name: If-Modified-Since
-      in: header
-      required: false
-      schema:
-        type: string
-        format: date-time
-
-  headers:
-    ETag:
-      description: Quoted cache identity / content tag from ServeContent
-      schema:
-        type: string
-        example: '"abc123"'
-    Nosniff:
-      description: Always `nosniff`
-      schema:
-        type: string
-        enum: [nosniff]
-    LastModified:
-      schema:
-        type: string
-        format: date-time
-
-  responses:
-    Unauthorized:
-      description: Missing or invalid bearer token
-      headers:
-        WWW-Authenticate:
-          schema:
-            type: string
-            example: 'Bearer realm="s3vault"'
-      content:
-        text/plain:
-          schema:
-            type: string
-            example: unauthorized
-    InvalidPath:
-      description: Empty, too long, or traversal path
-      content:
-        text/plain:
-          schema:
-            type: string
-            example: invalid path
-
-security:
-  - BearerAuth: []
+          description: Store unreachable

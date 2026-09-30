@@ -8,9 +8,7 @@ import (
 	"log/slog"
 	"mime"
 	"os"
-	"path"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -32,12 +30,11 @@ type ArchiveOptions struct {
 	DryRun            bool
 	Workers           int
 	FailFast          bool
-	OnChange          identity.OnChange
 	DeleteAfterUpload bool
 	DeleteIfExists    bool   // delete local file when remote already has identical content (skip)
 	ExplicitKey       string // optional path relative to s3.prefix; skips Mapper.Key
 	Op                string // metrics op label; default metrics.OpArchive
-	// PlaintextSHA256, when set, skips hashing the local file (e.g. HTTP ingest hashed while spooling).
+	// PlaintextSHA256, when set, skips hashing the local file (the S3 facade hashed the request body while spooling).
 	PlaintextSHA256 string
 }
 
@@ -47,7 +44,6 @@ type Archive struct {
 	keys    keying.Mapper
 	store   port.ObjectStore
 	enc     port.Encryptor
-	remote  port.RemoteIngest
 	logger  *slog.Logger
 	metrics *metrics.Collector
 }
@@ -66,12 +62,6 @@ func NewArchive(scan port.Scanner, keys keying.Mapper, store port.ObjectStore, e
 // WithMetrics attaches a Prometheus collector. A nil collector is a no-op.
 func (a *Archive) WithMetrics(m *metrics.Collector) *Archive {
 	a.metrics = m
-	return a
-}
-
-// WithRemote sends plaintext to a remote s3vault server instead of local encrypt+S3.
-func (a *Archive) WithRemote(r port.RemoteIngest) *Archive {
-	a.remote = r
 	return a
 }
 
@@ -183,7 +173,7 @@ func (a *Archive) noteResult(op string, action identity.Action, err error, n int
 	case err != nil:
 		failed.Add(1)
 		a.metrics.File(op, metrics.ResultFailed)
-	case action == identity.ActionSkip || action == identity.ActionOmit:
+	case action == identity.ActionSkip:
 		skipped.Add(1)
 		a.metrics.File(op, metrics.ResultSkipped)
 	case action == identity.ActionUpload && !dryRun:
@@ -198,9 +188,11 @@ func (a *Archive) requireBackend(dryRun bool) error {
 	if dryRun {
 		return nil
 	}
-	if a.remote == nil && a.store == nil {
+
+	if a.store == nil {
 		return domain.ErrStoreRequired
 	}
+
 	return nil
 }
 
@@ -209,26 +201,6 @@ func (a *Archive) objectKey(opts ArchiveOptions, info domain.FileInfo) (string, 
 		return a.keys.FromRequestPath(opts.ExplicitKey)
 	}
 	return a.keys.Key(opts.Root, info.AbsPath)
-}
-
-// requestPath is the /files/{path...} segment sent to a remote server.
-// It includes the client Mapper prefix so --prefix / s3.prefix becomes part of the
-// object key (server may add its own s3.prefix as a common root).
-func (a *Archive) requestPath(opts ArchiveOptions, info domain.FileInfo) (string, error) {
-	var rel string
-	if opts.ExplicitKey != "" {
-		rel = strings.Trim(strings.ReplaceAll(opts.ExplicitKey, "\\", "/"), "/")
-	} else {
-		rel = strings.Trim(info.RelPath, "/")
-	}
-	if rel == "" {
-		return "", fmt.Errorf("%w: empty relative path", domain.ErrInvalidPath)
-	}
-	prefix := strings.Trim(strings.ReplaceAll(a.keys.Prefix, "\\", "/"), "/")
-	if prefix == "" {
-		return rel, nil
-	}
-	return path.Join(prefix, rel), nil
 }
 
 func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.FileInfo) (int64, identity.Action, error) {
@@ -249,14 +221,9 @@ func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.F
 		slog.String("key", key),
 		slog.Int64("size", info.Size),
 		slog.Bool("dry_run", opts.DryRun),
-		slog.Bool("remote", a.remote != nil),
 	)
 	if opts.DryRun {
 		return 0, identity.ActionUpload, nil
-	}
-
-	if a.remote != nil {
-		return a.handleRemote(ctx, opts, info, key, op)
 	}
 
 	plaintext := a.storesPlaintext()
@@ -264,16 +231,14 @@ func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.F
 	if err != nil {
 		return 0, identity.ActionUnknown, err
 	}
-	action := identity.Decide(sum, info.Size, remote, opts.OnChange)
+	action := identity.Decide(sum, info.Size, remote)
 	switch action {
-	case identity.ActionSkip, identity.ActionOmit:
+	case identity.ActionSkip:
 		a.logger.Info("skip existing", slog.String("op", op), slog.String("key", key), slog.String("action", actionName(action)))
 		if err := a.maybeDeleteLocal(opts, info, action); err != nil {
 			return 0, action, err
 		}
 		return 0, action, nil
-	case identity.ActionFail:
-		return 0, action, fmt.Errorf("object exists with different checksum: %s", key)
 	}
 
 	if err := a.upload(ctx, key, info, sum, plaintext); err != nil {
@@ -285,37 +250,8 @@ func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.F
 	return info.Size, identity.ActionUpload, nil
 }
 
-func (a *Archive) handleRemote(ctx context.Context, opts ArchiveOptions, info domain.FileInfo, key, op string) (int64, identity.Action, error) {
-	reqPath, err := a.requestPath(opts, info)
-	if err != nil {
-		return 0, identity.ActionUnknown, err
-	}
-	action, err := a.remote.PutFile(ctx, reqPath, info)
-	if err != nil {
-		return 0, action, err
-	}
-	switch action {
-	case identity.ActionSkip, identity.ActionOmit:
-		a.logger.Info("skip existing", slog.String("op", op), slog.String("key", key), slog.String("action", actionName(action)))
-		if err := a.maybeDeleteLocal(opts, info, action); err != nil {
-			return 0, action, err
-		}
-		return 0, action, nil
-	case identity.ActionFail:
-		return 0, action, fmt.Errorf("object exists with different checksum: %s", key)
-	case identity.ActionUpload:
-		if err := a.maybeDeleteLocal(opts, info, action); err != nil {
-			return info.Size, identity.ActionUpload, err
-		}
-		return info.Size, identity.ActionUpload, nil
-	default:
-		return 0, identity.ActionUnknown, fmt.Errorf("unexpected remote action for %s", key)
-	}
-}
-
 // maybeDeleteLocal removes the source file when the matching delete flag is set.
 // ActionSkip (identical remote) → DeleteIfExists; ActionUpload → DeleteAfterUpload.
-// ActionOmit never deletes: local bytes differ from remote and were not archived.
 func (a *Archive) maybeDeleteLocal(opts ArchiveOptions, info domain.FileInfo, action identity.Action) error {
 	switch {
 	case action == identity.ActionUpload && opts.DeleteAfterUpload:
@@ -335,10 +271,6 @@ func actionName(a identity.Action) string {
 		return "upload"
 	case identity.ActionSkip:
 		return "skip"
-	case identity.ActionOmit:
-		return "omit"
-	case identity.ActionFail:
-		return "fail"
 	default:
 		return "unknown"
 	}
@@ -359,7 +291,7 @@ func (a *Archive) storesPlaintext() bool {
 
 // resolveRemote returns the local plaintext SHA-256 and the remote identity.
 // For a plaintext store there is no remote content hash, so hashing and the
-// range peek are wasted I/O and Head alone drives on_change.
+// range peek are wasted I/O and Head alone drives the decision.
 func (a *Archive) resolveRemote(ctx context.Context, opts ArchiveOptions, info domain.FileInfo, key string, plaintext bool) (string, domain.ObjectMeta, error) {
 	if plaintext {
 		meta, err := a.store.Head(ctx, key)
@@ -395,10 +327,39 @@ func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, 
 		}
 	}
 
+	pr, wait := a.encryptPipe(ctx, info.AbsPath)
+
+	body := pr
+	if !plaintext {
+		body = io.MultiReader(bytes.NewReader(hdrBytes), pr)
+	}
+
+	putErr := a.store.Put(ctx, key, body, domain.PutMeta{
+		ContentType: mime.TypeByExtension(filepath.Ext(info.AbsPath)),
+	})
+	waitErr := wait()
+
+	if putErr != nil {
+		return putErr
+	}
+
+	if waitErr != nil {
+		return waitErr
+	}
+
+	a.metrics.ObserveUpload(time.Since(started), info.Size)
+
+	return nil
+}
+
+// encryptPipe opens path and streams a.enc.Encrypt over it through an io.Pipe.
+// The returned reader yields the ciphertext; wait joins the producer goroutine
+// and must be called exactly once after the reader is consumed (or abandoned).
+func (a *Archive) encryptPipe(ctx context.Context, path string) (io.Reader, func() error) {
 	pr, pw := io.Pipe()
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
-		f, err := os.Open(info.AbsPath)
+		f, err := os.Open(path) //nolint:gosec // path comes from the local scanner, not user input
 		if err != nil {
 			_ = pw.CloseWithError(err)
 			return err
@@ -408,21 +369,11 @@ func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, 
 		_ = pw.CloseWithError(err)
 		return err
 	})
-	g.Go(func() error {
-		defer pr.Close()
-		var body io.Reader = pr
-		if !plaintext {
-			body = io.MultiReader(bytes.NewReader(hdrBytes), pr)
-		}
-		return a.store.Put(ctx, key, body, domain.PutMeta{
-			ContentType: mime.TypeByExtension(filepath.Ext(info.AbsPath)),
-		})
-	})
-	if err := g.Wait(); err != nil {
-		return err
+
+	return pr, func() error {
+		_ = pr.Close()
+		return g.Wait()
 	}
-	a.metrics.ObserveUpload(time.Since(started), info.Size)
-	return nil
 }
 
 func buildContainerHeader(shaHex string, size int64, mtime time.Time, encName, wrapName, provider, thumbHex string) ([]byte, error) {

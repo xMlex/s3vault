@@ -11,12 +11,28 @@ import (
 	"testing"
 
 	"github.com/xMlex/s3vault/internal/config"
+	"github.com/xMlex/s3vault/internal/port"
 )
 
 type zeroReader struct{}
 
 func (zeroReader) Read(p []byte) (int, error) {
 	clear(p)
+	return len(p), nil
+}
+
+// foldWriter actually touches every byte (unlike io.Discard, whose Write is a
+// no-op), so copy benchmarks measure real memory traffic.
+type foldWriter struct{ sum byte }
+
+func (w *foldWriter) Write(p []byte) (int, error) {
+	var s byte
+	for _, c := range p {
+		s ^= c
+	}
+
+	w.sum ^= s
+
 	return len(p), nil
 }
 
@@ -69,6 +85,57 @@ func BenchmarkNativeDecrypt(b *testing.B) {
 		if err := n.Decrypt(context.Background(), io.Discard, bytes.NewReader(cipher)); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkDecryptAuto measures the dispatcher overhead of the header-driven
+// branch for the three read shapes: enc=none, enc=native and legacy (no
+// container). At 8 MiB the cost is dominated by io.Copy / AES-GCM; at 1 KiB it
+// isolates the per-object dispatch overhead.
+func BenchmarkDecryptAuto(b *testing.B) {
+	const (
+		big   = 8 << 20
+		small = 1 << 10
+	)
+
+	n := nativeForBench(b, 65536)
+
+	var cipherBuf bytes.Buffer
+	if err := n.Encrypt(context.Background(), &cipherBuf, io.LimitReader(zeroReader{}, big)); err != nil {
+		b.Fatal(err)
+	}
+
+	bigPlain := make([]byte, big)
+	bigNative := cipherBuf.Bytes()
+	smallPlain := make([]byte, small)
+
+	cases := []struct {
+		name    string
+		enc     port.Encryptor
+		objEnc  string
+		payload []byte
+	}{
+		{"container/none/big", Passthrough{}, "none", bigPlain},
+		{"container/native/big", n, "native", bigNative},
+		{"legacy/none/big", Passthrough{}, "", bigPlain},
+		{"container/none/small", Passthrough{}, "none", smallPlain},
+		{"legacy/none/small", Passthrough{}, "", smallPlain},
+		{"container/none/empty", Passthrough{}, "none", nil},
+	}
+
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			b.SetBytes(int64(len(c.payload)))
+			b.ReportAllocs()
+
+			dst := &foldWriter{}
+
+			for b.Loop() {
+				if err := DecryptAuto(context.Background(), c.enc, c.objEnc, dst, bytes.NewReader(c.payload)); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 

@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/xMlex/s3vault/internal/adapter/cache"
 	"github.com/xMlex/s3vault/internal/s3api/s3err"
 )
 
@@ -24,15 +23,8 @@ func (a *API) handleDelete(w http.ResponseWriter, r *http.Request, bucket, clien
 		s3err.WriteError(w, r, s3err.InternalError, "")
 		return
 	}
-	if a.cache != nil {
-		id := cache.ID(a.bucketBackend, backendKey, a.encFP)
-		if err := a.cache.Remove(r.Context(), id); err != nil {
-			a.log.WarnContext(r.Context(), "s3 cache invalidate",
-				slog.String("op", "s3.delete"),
-				slog.String("err", err.Error()),
-			)
-		}
-	}
+	a.invalidateCache(r.Context(), backendKey, "s3.delete")
+
 	w.Header().Set("x-amz-request-id", s3err.RequestID(r))
 	w.WriteHeader(http.StatusNoContent)
 	a.metric("delete", "ok")

@@ -8,30 +8,10 @@ import (
 	"github.com/xMlex/s3vault/internal/domain"
 )
 
-func TestParseOnChange(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name string
-		in   string
-		want OnChange
-		ok   bool
-	}{
-		{name: "overwrite", in: "overwrite", want: OnChangeOverwrite, ok: true},
-		{name: "skip", in: "skip", want: OnChangeSkip, ok: true},
-		{name: "fail", in: "fail", want: OnChangeFail, ok: true},
-		{name: "empty", in: "", want: OnChangeUnknown},
-		{name: "unknown", in: "bogus", want: OnChangeUnknown},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			got, ok := ParseOnChange(tt.in)
-			assert.Equal(t, tt.want, got)
-			assert.Equal(t, tt.ok, ok)
-		})
-	}
-}
-
+// Decide has no policy parameter: an existing object with different content is
+// always overwritten. The old archive.on_change switch returned ActionOmit /
+// ActionFail for skip/fail, which let the S3 facade answer 200 while discarding
+// the uploaded body (docs/reliability-review.md H2).
 func TestDecide(t *testing.T) {
 	t.Parallel()
 
@@ -39,59 +19,59 @@ func TestDecide(t *testing.T) {
 	tests := []struct {
 		name     string
 		remote   domain.ObjectMeta
-		onChange OnChange
 		expected Action
 	}{
 		{
 			name:     "missing object",
 			remote:   domain.ObjectMeta{},
-			onChange: OnChangeOverwrite,
 			expected: ActionUpload,
 		},
 		{
-			name: "same hash",
+			name: "same hash and size is a skip",
 			remote: domain.ObjectMeta{
 				Exists:      true,
 				SHA256:      sha,
 				ContentSize: 3,
 			},
-			onChange: OnChangeOverwrite,
 			expected: ActionSkip,
 		},
 		{
-			name: "changed overwrite",
+			name: "same hash without recorded size is a skip",
+			remote: domain.ObjectMeta{
+				Exists: true,
+				SHA256: sha,
+			},
+			expected: ActionSkip,
+		},
+		{
+			name: "same hash but different size must not skip",
+			remote: domain.ObjectMeta{
+				Exists:      true,
+				SHA256:      sha,
+				ContentSize: 4,
+			},
+			expected: ActionUpload,
+		},
+		{
+			name: "changed content overwrites",
 			remote: domain.ObjectMeta{
 				Exists:      true,
 				SHA256:      "other",
 				ContentSize: 3,
 			},
-			onChange: OnChangeOverwrite,
 			expected: ActionUpload,
 		},
 		{
-			name: "changed skip",
+			name: "changed content without size overwrites",
 			remote: domain.ObjectMeta{
 				Exists: true,
 				SHA256: "other",
 			},
-			onChange: OnChangeSkip,
-			expected: ActionOmit,
+			expected: ActionUpload,
 		},
 		{
-			name: "changed fail",
-			remote: domain.ObjectMeta{
-				Exists: true,
-				SHA256: "other",
-			},
-			onChange: OnChangeFail,
-			expected: ActionFail,
-		},
-		{
-			name: "legacy object without hash",
-			remote: domain.ObjectMeta{
-				Exists: true,
-			},
-			onChange: OnChangeOverwrite,
+			name:     "legacy object without hash overwrites",
+			remote:   domain.ObjectMeta{Exists: true},
 			expected: ActionUpload,
 		},
 	}
@@ -99,8 +79,7 @@ func TestDecide(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := Decide(sha, 3, tt.remote, tt.onChange)
-			assert.Equal(t, tt.expected, got)
+			assert.Equal(t, tt.expected, Decide(sha, 3, tt.remote))
 		})
 	}
 }

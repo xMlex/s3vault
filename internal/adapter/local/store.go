@@ -1,12 +1,14 @@
 // Package localstore keeps objects as files under a single local directory.
 //
 // Default layout (container) stores the same bytes as the S3 backend
-// (S3VCTR01 container plus payload). layout=raw stores plaintext as-is
-// (requires encryption.mode=none). Without a container header, content-hash
-// skip/dedup is unavailable.
+// (S3VCTR01 container plus payload). layout=raw stores the bare payload without
+// the S3VCTR01 container; because there is no enc marker it is only valid with
+// encryption.mode=none (enforced by config), so a raw object is plaintext.
+// Without a container header, content-hash dedup is unavailable.
 package localstore
 
 import (
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -30,9 +32,10 @@ const (
 	fileMode fs.FileMode = 0o600
 	dirMode  fs.FileMode = 0o700
 
-	// shaCacheMax bounds the raw-layout SHA-256 memo per process. One arbitrary
-	// entry is dropped on overflow; entries are cheap and re-derivable.
-	shaCacheMax = 4096
+	// defaultSHACacheMax bounds the raw-layout SHA-256 memo per process. It is a
+	// Store field (see Store.shaCacheMax) so tests can shrink it; on overflow the
+	// least-recently-used entry is evicted deterministically.
+	defaultSHACacheMax = 4096
 )
 
 // tmpSeq makes concurrent Put temp names distinct within a process.
@@ -43,10 +46,15 @@ type Store struct {
 	root   *os.Root
 	dir    string
 	layout string
-	// shaCache memoizes raw-layout plaintext SHA-256 per path. Only touched for
-	// layout=raw, where there is no container header to read the digest from.
-	shaMu    sync.Mutex
-	shaCache map[string]shaEntry
+	// shaCache memoizes raw-layout stored-bytes SHA-256 per path. Only touched for
+	// layout=raw, where there is no container header to read a digest from.
+	// shaOrder/shaElems track access order so overflow evicts the least-recently-
+	// used entry deterministically (problems.md P5).
+	shaMu       sync.Mutex
+	shaCache    map[string]shaEntry
+	shaOrder    *list.List
+	shaElems    map[string]*list.Element
+	shaCacheMax int
 }
 
 // shaEntry is a cached digest validated by size and mtime.
@@ -84,7 +92,16 @@ func New(cfg config.LocalConfig) (*Store, error) {
 		_ = root.Close()
 		return nil, fmt.Errorf("clean local store temp: %w", err)
 	}
-	return &Store{root: root, dir: cfg.Dir, layout: layout, shaCache: make(map[string]shaEntry)}, nil
+
+	return &Store{
+		root:        root,
+		dir:         cfg.Dir,
+		layout:      layout,
+		shaCache:    make(map[string]shaEntry),
+		shaOrder:    list.New(),
+		shaElems:    make(map[string]*list.Element),
+		shaCacheMax: defaultSHACacheMax,
+	}, nil
 }
 
 // Close releases the directory file descriptor.
@@ -101,9 +118,10 @@ func (s *Store) Dir() string { return s.dir }
 // Layout returns the on-disk layout (container or raw).
 func (s *Store) Layout() string { return s.layout }
 
-// StoresPlaintext reports whether objects are stored as bare payload without
-// the S3VCTR01 container (layout=raw). Such a store has no remote content hash,
-// so callers must not hash files for skip decisions or build a container header.
+// StoresPlaintext reports whether objects are stored as bare payload without the
+// S3VCTR01 container (layout=raw). Such a store has no content hash from a
+// header, so callers must not hash files for skip decisions or build a container
+// header.
 func (s *Store) StoresPlaintext() bool { return s.layout == config.LocalLayoutRaw }
 
 func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error) {
@@ -132,6 +150,7 @@ func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error)
 		}
 		meta.SHA256 = sum
 	}
+
 	return meta, nil
 }
 
@@ -201,12 +220,15 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, domain.Obje
 		}
 		meta.SHA256 = sum
 	}
+
 	return f, meta, nil
 }
 
-// sha256For returns a raw-layout object's plaintext SHA-256, reading the file
+// sha256For returns a raw-layout object's stored-bytes SHA-256, reading the file
 // on a cache miss. layout=raw has no container header, so this is the only way
-// to expose identity; the digest is memoized by (path, size, mtime).
+// to expose a digest; the digest is memoized by (path, size, mtime). A raw store
+// is plaintext-only (config enforces encryption.mode=none), so the stored bytes
+// are the plaintext.
 func (s *Store) sha256For(ctx context.Context, key, rel string, fi fs.FileInfo) (string, error) {
 	if sum, ok := s.cachedSHA(rel, fi); ok {
 		return sum, nil
@@ -241,27 +263,45 @@ func (s *Store) cachedSHA(rel string, fi fs.FileInfo) (string, bool) {
 	s.shaMu.Lock()
 	defer s.shaMu.Unlock()
 	e, ok := s.shaCache[rel]
-	return e.sum, ok && e.size == fi.Size() && e.mtime == fi.ModTime().UnixNano()
+	if !ok || e.size != fi.Size() || e.mtime != fi.ModTime().UnixNano() {
+		return "", false
+	}
+
+	if el, ok := s.shaElems[rel]; ok {
+		s.shaOrder.MoveToBack(el)
+	}
+
+	return e.sum, true
 }
 
+// rememberSHA records a digest as the most recently used entry. If the memo is
+// full the least-recently-used entry is evicted, so a hot object is never
+// dropped in favor of a cold one (problems.md P5).
 func (s *Store) rememberSHA(rel string, fi fs.FileInfo, sum string) {
 	s.shaMu.Lock()
 	defer s.shaMu.Unlock()
-	if len(s.shaCache) >= shaCacheMax {
-		for k := range s.shaCache {
-			delete(s.shaCache, k)
-			break
-		}
+
+	if el, ok := s.shaElems[rel]; ok {
+		s.shaOrder.MoveToBack(el)
+	} else {
+		s.shaElems[rel] = s.shaOrder.PushBack(rel)
 	}
 	s.shaCache[rel] = shaEntry{size: fi.Size(), mtime: fi.ModTime().UnixNano(), sum: sum}
+	for s.shaOrder.Len() > s.shaCacheMax {
+		oldest := s.shaOrder.Front()
+		s.shaOrder.Remove(oldest)
+		key, _ := oldest.Value.(string)
+		delete(s.shaElems, key)
+		delete(s.shaCache, key)
+	}
 }
 
 // GetRange returns bytes [start, end] inclusive. An end past the last byte is
 // clamped, and a range starting past the last byte yields an empty body rather
 // than the 416 an S3 backend would raise.
 //
-// layout=raw ranges over the plaintext file (not a reconstructed container).
-// ResolveRemote finds no S3VCTR01 magic, so content-hash skip is unavailable.
+// layout=raw ranges over the stored file (the bare plaintext payload); no
+// digest is exposed on this path.
 func (s *Store) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error) {
 	if start < 0 || end < start {
 		return nil, domain.ObjectMeta{}, fmt.Errorf("get range %s: invalid range %d-%d", key, start, end)
@@ -338,7 +378,8 @@ func objectMeta(key string, fi fs.FileInfo) domain.ObjectMeta {
 
 // etag is a synthetic validator: size and mtime both change when an object is
 // rewritten. Quoted like an S3 ETag so http.ServeContent accepts it. Content
-// identity still comes from the S3VCTR01 header, never from this value.
+// identity still comes from the S3VCTR01 header (or, for raw, the stored-bytes
+// digest), never from this value.
 func etag(fi fs.FileInfo) string {
 	return `"` + strconv.FormatInt(fi.Size(), 16) + "-" + strconv.FormatInt(fi.ModTime().UnixNano(), 16) + `"`
 }

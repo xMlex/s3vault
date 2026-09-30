@@ -79,8 +79,8 @@ func TestRawLayoutStripsContainerToCleanFile(t *testing.T) {
 	assert.Equal(t, "logs/app.log", page.Contents[0].Key)
 }
 
-// raw layout has no container header; the store derives plaintext SHA-256 from
-// the file itself (memoized in memory) so GET/HEAD can expose identity.
+// raw layout has no container header; the store derives the stored-bytes
+// SHA-256 from the file itself (memoized in memory) so GET/HEAD expose identity.
 func TestRawLayoutHeadReportsSHA256(t *testing.T) {
 	t.Parallel()
 	st, _ := newRawStore(t)
@@ -149,7 +149,7 @@ func TestRawLayoutArchivePassesNoLocalDigest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t,
 		identity.ActionUpload,
-		identity.Decide("", int64(len(payload)), remote, identity.OnChangeOverwrite))
+		identity.Decide("", int64(len(payload)), remote))
 }
 
 func TestRawLayoutPassthroughWithoutContainer(t *testing.T) {
@@ -168,22 +168,32 @@ func TestRawLayoutPassthroughWithoutContainer(t *testing.T) {
 	assert.Equal(t, hex.EncodeToString(sha256Sum(payload)), meta.SHA256)
 }
 
-func TestRawLayoutRejectsEncryptedContainer(t *testing.T) {
+// raw strips the container by shape, whatever its enc field, so an encrypted
+// (native) container would be stored as its bare ciphertext payload. Config now
+// refuses layout=raw with encryption (raw ⇒ mode=none, problems.md P1-legacy),
+// so this is adapter-level defence, not a reachable configuration.
+func TestRawLayoutStripsEncryptedContainer(t *testing.T) {
 	t.Parallel()
-	st, _ := newRawStore(t)
-	sum := sha256.Sum256([]byte("x"))
+	st, dir := newRawStore(t)
+	payload := []byte("S3VLT01 fake ciphertext")
+	sum := sha256.Sum256(payload)
 	hdr, err := container.Marshal(container.Header{
 		Version:       container.VersionV1,
-		PlaintextSize: 1,
+		PlaintextSize: int64(len(payload)),
 		SHA256:        sum[:],
 		Enc:           container.EncNative,
 		Wrap:          container.WrapKEK,
 	})
 	require.NoError(t, err)
-	body := append(hdr, []byte("x")...)
-	err = st.Put(context.Background(), "secret.bin", bytes.NewReader(body), domain.PutMeta{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "layout=raw")
+
+	body := append(append([]byte(nil), hdr...), payload...)
+
+	require.NoError(t, st.Put(context.Background(), "secret.bin", bytes.NewReader(body), domain.PutMeta{}))
+
+	raw, err := os.ReadFile(filepath.Join(dir, "secret.bin")) //nolint:gosec // test reads its own temp dir
+	require.NoError(t, err)
+	assert.Equal(t, payload, raw, "container is stripped regardless of enc")
+	assert.False(t, container.IsMagic(raw))
 }
 
 // Magic matches but the header is corrupt → raw Put must fail, not store it.

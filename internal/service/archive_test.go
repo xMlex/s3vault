@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -180,7 +179,6 @@ func TestArchiveUploadAndSkip(t *testing.T) {
 		Root:      root,
 		OlderThan: time.Hour,
 		Workers:   2,
-		OnChange:  identity.OnChangeOverwrite,
 	}
 	st, err := svc.Run(context.Background(), opts)
 	require.NoError(t, err)
@@ -219,7 +217,7 @@ func TestArchiveSkipViaContainerWithoutMetadata(t *testing.T) {
 		nil,
 	)
 	opts := service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 	}
 	st, err := svc.Run(context.Background(), opts)
 	require.NoError(t, err)
@@ -249,7 +247,7 @@ func TestArchivePlaintextStoreSkipsHashAndRangePeek(t *testing.T) {
 		nil,
 	)
 	opts := service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 	}
 	st, err := svc.Run(context.Background(), opts)
 	require.NoError(t, err)
@@ -258,147 +256,14 @@ func TestArchivePlaintextStoreSkipsHashAndRangePeek(t *testing.T) {
 		"plaintext store receives bare payload, no S3VCTR01")
 	assert.Zero(t, store.rangeCalls, "plaintext store must not range-peek for a header")
 
-	// No remote hash → on_change=skip omits instead of dedup-skipping.
-	opts.OnChange = identity.OnChangeSkip
+	// A rerun has no remote content hash to compare, so it re-uploads rather
+	// than content-skipping (archive.on_change was removed; there is no
+	// "skip because we cannot compare" policy any more).
 	st, err = svc.Run(context.Background(), opts)
 	require.NoError(t, err)
-	assert.Zero(t, st.Uploaded)
-	assert.Equal(t, 1, st.Skipped)
+	assert.Equal(t, 1, st.Uploaded)
+	assert.Zero(t, st.Skipped)
 	assert.Zero(t, store.rangeCalls)
-}
-
-// fakeRemote records request paths and returns a canned decision.
-type fakeRemote struct {
-	mu     sync.Mutex
-	action identity.Action
-	err    error
-	paths  []string
-}
-
-func (f *fakeRemote) PutFile(_ context.Context, requestPath string, _ domain.FileInfo) (identity.Action, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.paths = append(f.paths, requestPath)
-	return f.action, f.err
-}
-
-func (f *fakeRemote) requestPaths() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.paths...)
-}
-
-var errRemote = errors.New("remote boom")
-
-func TestArchiveRemoteRequestPath(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	p := filepath.Join(root, "logs", "app.log")
-	require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o700))
-	require.NoError(t, os.WriteFile(p, []byte("payload"), 0o600))
-	old := time.Now().Add(-48 * time.Hour)
-	require.NoError(t, os.Chtimes(p, old, old))
-
-	remote := &fakeRemote{action: identity.ActionUpload}
-	svc := service.NewArchive(
-		scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, nil, nil, nil,
-	).WithRemote(remote)
-	st, err := svc.Run(context.Background(), service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
-	})
-	require.NoError(t, err)
-	assert.Equal(t, 1, st.Uploaded)
-	assert.Equal(t, []string{"pre/logs/app.log"}, remote.requestPaths())
-}
-
-func TestArchiveRemoteExplicitKeyPath(t *testing.T) {
-	t.Parallel()
-	p := filepath.Join(t.TempDir(), "src.log")
-	require.NoError(t, os.WriteFile(p, []byte("x"), 0o600))
-
-	remote := &fakeRemote{action: identity.ActionUpload}
-	svc := service.NewArchive(
-		scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, nil, nil, nil,
-	).WithRemote(remote)
-	info := domain.FileInfo{AbsPath: p, RelPath: "ignored.log", Size: 1, ModTime: time.Now()}
-	st, action, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
-		ExplicitKey: "foo/bar.log", OnChange: identity.OnChangeOverwrite,
-	})
-	require.NoError(t, err)
-	assert.Equal(t, identity.ActionUpload, action)
-	assert.Equal(t, 1, st.Uploaded)
-	assert.Equal(t, []string{"pre/foo/bar.log"}, remote.requestPaths())
-}
-
-func TestArchiveRemoteActionMapping(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name         string
-		action       identity.Action
-		deleteOnSkip bool
-		wantUploaded int
-		wantSkipped  int
-		wantErr      bool
-		wantGone     bool
-	}{
-		{name: "upload", action: identity.ActionUpload, wantUploaded: 1},
-		{name: "skip deletes", action: identity.ActionSkip, deleteOnSkip: true, wantSkipped: 1, wantGone: true},
-		{name: "omit keeps", action: identity.ActionOmit, wantSkipped: 1},
-		{name: "fail", action: identity.ActionFail, wantErr: true},
-		{name: "unknown", action: identity.ActionUnknown, wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			p := filepath.Join(t.TempDir(), "src.log")
-			require.NoError(t, os.WriteFile(p, []byte("x"), 0o600))
-
-			remote := &fakeRemote{action: tt.action}
-			svc := service.NewArchive(
-				scanner.New(scanner.Options{}), keying.Mapper{}, nil, nil, nil,
-			).WithRemote(remote)
-			info := domain.FileInfo{AbsPath: p, RelPath: "src.log", Size: 1, ModTime: time.Now()}
-			st, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
-				ExplicitKey: "src.log", DeleteIfExists: tt.deleteOnSkip,
-			})
-			if tt.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-			assert.Equal(t, tt.wantUploaded, st.Uploaded)
-			assert.Equal(t, tt.wantSkipped, st.Skipped)
-
-			_, statErr := os.Stat(p)
-			if tt.wantGone {
-				assert.True(t, os.IsNotExist(statErr), "skip + DeleteIfExists removes the local file")
-			} else {
-				assert.NoError(t, statErr)
-			}
-		})
-	}
-}
-
-func TestArchiveRemoteFailFast(t *testing.T) {
-	t.Parallel()
-	root := t.TempDir()
-	p := filepath.Join(root, "a.log")
-	require.NoError(t, os.WriteFile(p, []byte("x"), 0o600))
-	old := time.Now().Add(-48 * time.Hour)
-	require.NoError(t, os.Chtimes(p, old, old))
-
-	remote := &fakeRemote{err: errRemote}
-	svc := service.NewArchive(
-		scanner.New(scanner.Options{}), keying.Mapper{}, nil, nil, nil,
-	).WithRemote(remote)
-	opts := service.ArchiveOptions{Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite}
-
-	_, err := svc.Run(context.Background(), opts)
-	require.ErrorIs(t, err, domain.ErrPartialFailures)
-
-	opts.FailFast = true
-	_, err = svc.Run(context.Background(), opts)
-	require.ErrorIs(t, err, errRemote)
 }
 
 func TestArchiveRequiresBackend(t *testing.T) {
@@ -425,7 +290,7 @@ func TestArchiveNilEncryptor(t *testing.T) {
 	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{}, store, nil, nil)
 	info := domain.FileInfo{AbsPath: p, RelPath: "obj.bin", Size: int64(len(plain)), ModTime: time.Now()}
 	_, action, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
-		ExplicitKey: "obj.bin", OnChange: identity.OnChangeOverwrite,
+		ExplicitKey: "obj.bin",
 	})
 	require.NoError(t, err)
 	assert.Equal(t, identity.ActionUpload, action)
@@ -463,7 +328,7 @@ func TestArchiveUploadRejectsBadThumbprint(t *testing.T) {
 	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{}, store, badThumbEncryptor{}, nil)
 	info := domain.FileInfo{AbsPath: p, RelPath: "thumb.bin", Size: 1, ModTime: time.Now()}
 	_, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
-		ExplicitKey: "thumb.bin", OnChange: identity.OnChangeOverwrite,
+		ExplicitKey: "thumb.bin",
 	})
 	require.Error(t, err)
 }
@@ -486,7 +351,7 @@ func TestArchiveFetchNativeThroughContainer(t *testing.T) {
 	store := newMemStore()
 	arch := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, enc, nil)
 	st, err := arch.Run(context.Background(), service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, st.Uploaded)
@@ -522,7 +387,7 @@ func TestArchiveWritesCryptoProThumbprint(t *testing.T) {
 	store := newMemStore()
 	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, enc, nil)
 	st, err := svc.Run(context.Background(), service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, st.Uploaded)
@@ -550,8 +415,7 @@ func TestUploadFileIgnoresMtimeAndHonorsKey(t *testing.T) {
 
 	svc := service.NewArchive(scan, keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
 	st, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
-		Root:     root,
-		OnChange: identity.OnChangeOverwrite,
+		Root: root,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, st.Found)
@@ -560,7 +424,6 @@ func TestUploadFileIgnoresMtimeAndHonorsKey(t *testing.T) {
 
 	st, _, err = svc.UploadFile(context.Background(), info, service.ArchiveOptions{
 		Root:        root,
-		OnChange:    identity.OnChangeOverwrite,
 		ExplicitKey: "custom/name.log",
 	})
 	require.NoError(t, err)
@@ -588,7 +451,6 @@ func TestUploadFileUsesPrecomputedSHA256(t *testing.T) {
 	svc := service.NewArchive(scan, keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
 	st, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
 		Root:            root,
-		OnChange:        identity.OnChangeOverwrite,
 		PlaintextSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 	})
 	require.NoError(t, err)
@@ -609,7 +471,7 @@ func TestDeleteAfterUploadAndDeleteIfExists(t *testing.T) {
 	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
 
 	st, err := svc.Run(context.Background(), service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 		DeleteAfterUpload: true,
 	})
 	require.NoError(t, err)
@@ -621,7 +483,7 @@ func TestDeleteAfterUploadAndDeleteIfExists(t *testing.T) {
 	require.NoError(t, os.Chtimes(p, old, old))
 
 	st, err = svc.Run(context.Background(), service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 		DeleteAfterUpload: true, // upload path not taken
 	})
 	require.NoError(t, err)
@@ -630,7 +492,7 @@ func TestDeleteAfterUploadAndDeleteIfExists(t *testing.T) {
 	require.NoError(t, err, "delete-after-upload must not remove on skip")
 
 	st, err = svc.Run(context.Background(), service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeOverwrite,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 		DeleteIfExists: true,
 	})
 	require.NoError(t, err)
@@ -639,7 +501,12 @@ func TestDeleteAfterUploadAndDeleteIfExists(t *testing.T) {
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
-func TestDeleteIfExistsDoesNotRemoveOnOmit(t *testing.T) {
+// TestDeleteIfExistsOnlyRemovesOnIdenticalSkip pins the delete policy to the
+// one action it was written for: --delete-if-exists removes the source only
+// when the remote already holds identical content (ActionSkip). Differing
+// content is overwritten now (no on_change), and the source must stay in place
+// because an upload failure would otherwise lose the only copy.
+func TestDeleteIfExistsOnlyRemovesOnIdenticalSkip(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	p := filepath.Join(root, "a.log")
@@ -656,11 +523,11 @@ func TestDeleteIfExistsDoesNotRemoveOnOmit(t *testing.T) {
 	}
 	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
 	st, err := svc.Run(context.Background(), service.ArchiveOptions{
-		Root: root, OlderThan: time.Hour, Workers: 1, OnChange: identity.OnChangeSkip,
+		Root: root, OlderThan: time.Hour, Workers: 1,
 		DeleteIfExists: true,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 1, st.Skipped)
+	assert.Equal(t, 1, st.Uploaded, "differing content is overwritten")
 	_, err = os.Stat(p)
-	require.NoError(t, err, "omit must keep local file with different content")
+	require.NoError(t, err, "overwrite path must keep the local file: DeleteIfExists only applies to a skip")
 }

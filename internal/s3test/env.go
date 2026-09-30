@@ -40,7 +40,6 @@ func ConfigFromEnv(t *testing.T) config.S3Config {
 		AccessKey: access,
 		SecretKey: secret,
 		PathStyle: pathStyle,
-		TLS:       !strings.HasPrefix(endpoint, "http://"),
 	}
 	return cfg
 }

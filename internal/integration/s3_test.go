@@ -21,7 +21,6 @@ import (
 	"github.com/xMlex/s3vault/internal/adapter/scanner"
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/domain"
-	"github.com/xMlex/s3vault/internal/identity"
 	"github.com/xMlex/s3vault/internal/keying"
 	"github.com/xMlex/s3vault/internal/port"
 	"github.com/xMlex/s3vault/internal/s3test"
@@ -79,7 +78,6 @@ func TestArchiveUploadThenSkip(t *testing.T) {
 		Root:      root,
 		OlderThan: time.Hour,
 		Workers:   2,
-		OnChange:  identity.OnChangeOverwrite,
 	}
 
 	st, err := svc.Run(ctx, opts)
@@ -131,7 +129,6 @@ func TestEncryptedUploadDownload(t *testing.T) {
 		Root:      root,
 		OlderThan: time.Hour,
 		Workers:   1,
-		OnChange:  identity.OnChangeOverwrite,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, st.Uploaded)

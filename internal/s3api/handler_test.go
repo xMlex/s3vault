@@ -29,7 +29,6 @@ import (
 	"github.com/xMlex/s3vault/internal/adapter/scanner"
 	"github.com/xMlex/s3vault/internal/container"
 	"github.com/xMlex/s3vault/internal/domain"
-	"github.com/xMlex/s3vault/internal/identity"
 	"github.com/xMlex/s3vault/internal/keying"
 	"github.com/xMlex/s3vault/internal/port"
 	"github.com/xMlex/s3vault/internal/s3api"
@@ -371,7 +370,6 @@ func newTestAPIStore(t *testing.T, bucket string, bucketAsPrefix bool) (*s3api.A
 		Bucket:         bucket,
 		Fetch:          fetch,
 		Archive:        archive,
-		OnChange:       identity.OnChangeOverwrite,
 		Keys:           keying.Mapper{Prefix: "backups"},
 		Store:          store,
 		Cache:          disk,

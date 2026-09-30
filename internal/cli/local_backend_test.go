@@ -113,7 +113,7 @@ cache:
 	require.NoError(t, err)
 	assert.Equal(t, payload, raw, "layout=raw stores plaintext without S3VCTR01")
 
-	// No remote SHA-256 without a container → re-upload, not content-hash skip.
+	// No content hash without a container → re-upload, not content-hash skip.
 	out, err = run(t, "upload", src, "--config", cfg, "--output", "json")
 	require.NoError(t, err)
 	assert.Contains(t, out, `"uploaded":1`)
@@ -124,6 +124,48 @@ cache:
 	got, err := os.ReadFile(dest)
 	require.NoError(t, err)
 	assert.Equal(t, payload, got)
+}
+
+// layout=raw drops the S3VCTR01 header, so it cannot carry the enc marker and
+// is refused with encryption: the CLI must fail before writing anything rather
+// than store ciphertext that a mismatched reader would copy verbatim
+// (problems.md P1-legacy).
+func TestLocalBackendRawLayoutRejectsEncryption(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	objects := filepath.Join(base, "objects")
+
+	kek := make([]byte, 32)
+	_, err := rand.Read(kek)
+	require.NoError(t, err)
+
+	keyFile := filepath.Join(base, "kek.bin")
+	require.NoError(t, os.WriteFile(keyFile, kek, 0o600))
+
+	cfg := writeConfig(t, base, fmt.Sprintf(`
+backend:
+  type: local
+  local:
+    dir: %q
+    layout: raw
+encryption:
+  mode: native
+  native:
+    wrap: keyfile
+    key_file: %q
+    chunk_size: 65536
+cache:
+  dir: %q
+`, objects, keyFile, filepath.Join(base, "cache")))
+
+	src := filepath.Join(base, "secret.log")
+	require.NoError(t, os.WriteFile(src, []byte("secret\n"), 0o600))
+
+	_, err = run(t, "upload", src, "--config", cfg, "--output", "json")
+	require.ErrorContains(t, err, "cannot be combined with encryption.mode")
+
+	_, statErr := os.Stat(filepath.Join(objects, "secret.log"))
+	assert.True(t, os.IsNotExist(statErr), "nothing may be written when the config is refused")
 }
 
 func TestLocalBackendNativeEncryptionRoundtrip(t *testing.T) {

@@ -8,7 +8,6 @@ User=root
 Group=root
 Type=simple
 ExecStart=/opt/s3vault/s3vault server
-ExecReload=/bin/kill -SIGUSR1 $MAINPID
 Restart=always
 RestartSec=5
 
@@ -32,7 +31,10 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 NoNewPrivileges=yes
 PrivateDevices=yes
-ReadWritePaths=/tmp /opt/s3vault/tmp
+# ProtectHome=yes makes the default cache dir (~/.cache/s3vault) unwritable, so
+# cache.dir must point here and be set in .env as S3VAULT_CACHE_DIR=/var/cache/s3vault.
+# Add the backend.local.dir here too when running backend.type: local.
+ReadWritePaths=/tmp /var/cache/s3vault
 WorkingDirectory=/opt/s3vault
 
 SyslogIdentifier=s3vault

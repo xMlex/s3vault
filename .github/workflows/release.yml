@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  # Только теги: workflow создаёт GitHub Release, то есть пишет в репозиторий.
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+
+  goreleaser:
+    # contents: write нужен только для публикации релиза; остальные джобы
+    # остаются на read по принципу наименьших прав.
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # Полная история: changelog собирается из тегов и коммитов.
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.26'
+        check-latest: true
+
+    - name: Run GoReleaser
+      uses: goreleaser/goreleaser-action@v7
+      with:
+        # Конфиг .goreleaser.yml — version 2, поэтому distribution=goreleaser
+        # (Pro не нужен). `args: release --clean` публикует релиз сам;
+        # отдельного distribute-шага в v7 уже нет.
+        distribution: goreleaser
+        version: latest
+        args: release --clean
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

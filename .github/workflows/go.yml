@@ -1,6 +1,5 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
+# Build + unit tests. Integration lives in integration.yml, the full MinIO
+# stand in e2e.yml, static analysis in lint.yml/security.yml.
 name: Go
 
 on:
@@ -9,20 +8,66 @@ on:
   pull_request:
     branches: [ "main" ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: go-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
 
-  build:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      # Один упавший Go не должен отменять проверку остальных.
+      fail-fast: false
+      matrix:
+        # go.mod: go 1.26.6 -> "1.26" (минимум) + "stable" (что свежее).
+        go: [ '1.26', 'stable' ]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v7
       with:
-        go-version: '1.26.7'
+        go-version: ${{ matrix.go }}
+        check-latest: true
 
     - name: Build
-      run: go build -v ./...
+      run: go build ./...
+
+    - name: Vet
+      run: go vet ./...
 
     - name: Test
-      run: go test -v ./...
+      # -race ловит гонки, -shuffle=on — скрытые зависимости между тестами,
+      # -count=1 — не кэшировать результат.
+      run: go test -race -shuffle=on -count=1 ./...
+
+    - name: gofmt
+      run: |
+        unformatted="$(gofmt -l .)"
+        if [ -n "$unformatted" ]; then
+          echo "not gofmt'd:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+  tidy:
+    # go.mod/go.sum обязаны быть уже приведены в порядок, иначе версии
+    # разъезжаются между машинами. Пин 1.26: "stable" переписал бы go.mod.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version: '1.26'
+        check-latest: true
+
+    - name: Check go.mod/go.sum are tidy
+      run: |
+        go mod tidy
+        git diff --exit-code -- go.mod go.sum

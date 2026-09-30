@@ -11,8 +11,9 @@ import (
 )
 
 // peekContainer reads up to HeaderSize bytes. When the prefix is a valid
-// EncNone S3VCTR01 header, rest is positioned at the payload. Otherwise rest
-// restores the peeked bytes for a passthrough write.
+// S3VCTR01 header, rest is positioned at the payload: raw stores the bare
+// payload, whether it is plaintext (mode=none) or ciphertext (native/command).
+// Otherwise rest restores the peeked bytes for a passthrough write.
 func peekContainer(r io.Reader) (rest io.Reader, err error) {
 	buf := make([]byte, container.HeaderSize)
 	n, readErr := io.ReadFull(r, buf)
@@ -24,12 +25,8 @@ func peekContainer(r io.Reader) (rest io.Reader, err error) {
 		return restored, nil
 	}
 	// IsMagic already matched, so Parse can only fail with ErrCorruptHeader.
-	h, parseErr := container.Parse(buf)
-	if parseErr != nil {
+	if _, parseErr := container.Parse(buf); parseErr != nil {
 		return nil, parseErr
-	}
-	if h.Enc != container.EncNone {
-		return nil, fmt.Errorf("layout=raw rejects encrypted objects (enc=%s)", container.EncName(h.Enc))
 	}
 	return r, nil
 }

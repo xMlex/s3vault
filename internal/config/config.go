@@ -10,7 +10,6 @@ import (
 
 	"github.com/spf13/viper"
 
-	"github.com/xMlex/s3vault/internal/identity"
 	"github.com/xMlex/s3vault/internal/period"
 )
 
@@ -22,7 +21,6 @@ type Config struct {
 	Encryption EncryptionConfig `mapstructure:"encryption"`
 	Cache      CacheConfig      `mapstructure:"cache"`
 	Server     ServerConfig     `mapstructure:"server"`
-	Remote     RemoteConfig     `mapstructure:"remote"`
 	Archive    ArchiveConfig    `mapstructure:"archive"`
 }
 
@@ -45,7 +43,9 @@ type BackendConfig struct {
 // Local filesystem object layouts for LocalConfig.Layout.
 const (
 	LocalLayoutContainer = "container" // S3VCTR01 || payload (S3-parity default)
-	LocalLayoutRaw       = "raw"       // plaintext file as-is (no S3VCTR01)
+	// LocalLayoutRaw stores the bare payload without S3VCTR01, so it carries no
+	// enc marker and is only valid with encryption.mode=none (see Normalize).
+	LocalLayoutRaw = "raw"
 )
 
 // LocalConfig configures the local filesystem object store.
@@ -63,7 +63,6 @@ type S3Config struct {
 	SecretKey          string `mapstructure:"secret_key"`
 	SessionTok         string `mapstructure:"session_token"`
 	PathStyle          bool   `mapstructure:"path_style"`
-	TLS                bool   `mapstructure:"tls"`
 	AllowSecretsInFile bool   `mapstructure:"allow_secrets_in_config"`
 }
 
@@ -109,8 +108,7 @@ type CacheConfig struct {
 type ServerConfig struct {
 	Listen        string `mapstructure:"listen"`
 	MetricsListen string `mapstructure:"metrics_listen"`
-	Token         string `mapstructure:"token"`
-	// S3 API (SigV4 plaintext facade). Enabled when both access and secret are set.
+	// S3 API (SigV4 plaintext facade). Required: it is the gateway's only data frontend.
 	S3Listen         string `mapstructure:"s3_listen"` // empty = multiplex on listen
 	S3AccessKey      string `mapstructure:"s3_access_key"`
 	S3SecretKey      string `mapstructure:"s3_secret_key"`
@@ -119,17 +117,9 @@ type ServerConfig struct {
 	S3BucketAsPrefix bool   `mapstructure:"s3_bucket_as_prefix"` // client bucket → key prefix under s3.bucket
 }
 
-// RemoteConfig is used by archive/upload clients that send plaintext to a
-// remote s3vault server (CryptoPro/S3 stay on that host). Auth reuses server.token.
-type RemoteConfig struct {
-	URL          string `mapstructure:"url"`            // e.g. https://s3vault.example:8080
-	RateLimitBPS int64  `mapstructure:"rate_limit_bps"` // max upload bytes/sec across workers; 0 = unlimited
-}
-
 type ArchiveConfig struct {
 	OlderThan         string `mapstructure:"older_than"`
 	Workers           int    `mapstructure:"workers"`
-	OnChange          string `mapstructure:"on_change"`
 	FollowSymlinks    bool   `mapstructure:"follow_symlinks"`
 	FailFast          bool   `mapstructure:"fail_fast"`
 	DeleteAfterUpload bool   `mapstructure:"delete_after_upload"`
@@ -142,7 +132,6 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("backend.type", BackendS3)
 	v.SetDefault("backend.local.layout", LocalLayoutContainer)
 	v.SetDefault("s3.region", "us-east-1")
-	v.SetDefault("s3.tls", true)
 	v.SetDefault("encryption.mode", "none")
 	v.SetDefault("encryption.native.wrap", "rsa-oaep")
 	v.SetDefault("encryption.native.chunk_size", 65536)
@@ -159,7 +148,6 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("server.s3_bucket_as_prefix", false)
 	v.SetDefault("archive.older_than", "7d")
 	v.SetDefault("archive.workers", 4)
-	v.SetDefault("archive.on_change", "overwrite")
 }
 
 // envKeys are all Config fields that may be set via S3VAULT_* environment
@@ -179,7 +167,6 @@ var envKeys = []string{
 	"s3.secret_key",
 	"s3.session_token",
 	"s3.path_style",
-	"s3.tls",
 	"s3.allow_secrets_in_config",
 	"encryption.mode",
 	"encryption.native.wrap",
@@ -190,6 +177,8 @@ var envKeys = []string{
 	"encryption.command.provider",
 	"encryption.command.thumbprint",
 	"encryption.command.timeout",
+	"encryption.command.encrypt",
+	"encryption.command.decrypt",
 	"cache.enabled",
 	"cache.dir",
 	"cache.ttl",
@@ -198,18 +187,14 @@ var envKeys = []string{
 	"cache.max_bytes",
 	"server.listen",
 	"server.metrics_listen",
-	"server.token",
 	"server.s3_listen",
 	"server.s3_access_key",
 	"server.s3_secret_key",
 	"server.s3_region",
 	"server.s3_bucket",
 	"server.s3_bucket_as_prefix",
-	"remote.url",
-	"remote.rate_limit_bps",
 	"archive.older_than",
 	"archive.workers",
-	"archive.on_change",
 	"archive.follow_symlinks",
 	"archive.fail_fast",
 	"archive.delete_after_upload",
@@ -229,6 +214,9 @@ func BindEnv(v *viper.Viper) error {
 
 // Load unmarshals viper into Config and validates.
 func Load(v *viper.Viper) (Config, error) {
+	if err := CheckRemovedKeys(v); err != nil {
+		return Config{}, err
+	}
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
 		return Config{}, fmt.Errorf("unmarshal config: %w", err)
@@ -239,6 +227,28 @@ func Load(v *viper.Viper) (Config, error) {
 	return cfg, nil
 }
 
+// removedKeys are config keys deleted in the switch to an S3-only gateway. Viper
+// silently ignores unknown keys, so a stale key would change behavior without a
+// word; refuse to start and name the replacement.
+var removedKeys = []struct{ key, hint string }{
+	{"remote.url", "remote HTTP ingest was removed; point s3.endpoint and s3.access_key/s3.secret_key at the gateway S3 facade instead"},
+	{"remote.rate_limit_bps", "remote HTTP ingest was removed; there is no S3-path bandwidth limiter"},
+	{"server.token", "the bearer HTTP /files frontend was removed; authenticate to the gateway with server.s3_access_key/server.s3_secret_key (SigV4)"},
+	{"archive.on_change", "the overwrite/skip/fail switch was removed: an upload with differing content is now always written. It was a single global policy read by archive, upload and server alike, which let the gateway answer 200 while discarding the uploaded body (docs/reliability-review.md H2). If you need a per-run policy, add it as an archive-command flag"},
+}
+
+// CheckRemovedKeys returns an error if any key removed from the schema is still
+// present in the config file or the environment.
+func CheckRemovedKeys(v *viper.Viper) error {
+	for _, rk := range removedKeys {
+		if v.InConfig(rk.key) || v.IsSet(rk.key) {
+			return fmt.Errorf("config key %q was removed: %s", rk.key, rk.hint)
+		}
+	}
+
+	return nil
+}
+
 // Normalize fills derived fields and checks invariants.
 func (c *Config) Normalize() error {
 	c.Log.Level = strings.ToLower(strings.TrimSpace(c.Log.Level))
@@ -246,11 +256,6 @@ func (c *Config) Normalize() error {
 		return err
 	}
 	c.Encryption.Mode = strings.ToLower(strings.TrimSpace(c.Encryption.Mode))
-	c.Archive.OnChange = strings.ToLower(strings.TrimSpace(c.Archive.OnChange))
-	c.Remote.URL = strings.TrimRight(strings.TrimSpace(c.Remote.URL), "/")
-	if c.Remote.RateLimitBPS < 0 {
-		return fmt.Errorf("remote.rate_limit_bps: must be >= 0")
-	}
 	if c.Archive.Workers < 1 {
 		c.Archive.Workers = 1
 	}
@@ -264,16 +269,21 @@ func (c *Config) Normalize() error {
 	if _, err := period.Parse(c.Archive.OlderThan); err != nil {
 		return fmt.Errorf("archive.older_than: %w", err)
 	}
-	if _, ok := identity.ParseOnChange(c.Archive.OnChange); !ok {
-		return fmt.Errorf("archive.on_change: unknown value %q", c.Archive.OnChange)
-	}
 	switch c.Encryption.Mode {
 	case "none", "native", "command":
 	default:
 		return fmt.Errorf("encryption.mode: unknown value %q", c.Encryption.Mode)
 	}
+	// layout=raw drops the S3VCTR01 header, which is the only place the object's
+	// enc mode lives. Without it a reader cannot tell ciphertext from plaintext,
+	// so the refusal-on-mismatch guard has nothing to compare against. Refuse the
+	// combination at startup instead of silently copying ciphertext (problems.md
+	// P1-legacy): raw = bare plaintext files, encryption requires the container.
 	if c.Backend.Type == BackendLocal && c.Backend.Local.Layout == LocalLayoutRaw && c.Encryption.Mode != "none" {
-		return fmt.Errorf("backend.local.layout=%q requires encryption.mode=none", LocalLayoutRaw)
+		return fmt.Errorf(
+			"backend.local.layout %q stores bare payload without the S3VCTR01 enc marker and cannot be combined with encryption.mode=%q; use layout %q for encryption, or encryption.mode=none",
+			LocalLayoutRaw, c.Encryption.Mode, LocalLayoutContainer,
+		)
 	}
 	c.Encryption.Command.Provider = strings.ToLower(strings.TrimSpace(c.Encryption.Command.Provider))
 	if c.Encryption.Mode == "command" && c.Encryption.Command.Provider == "" {
@@ -387,7 +397,8 @@ func SecretsInPlainConfig(v *viper.Viper) bool {
 	if v.GetBool("s3.allow_secrets_in_config") {
 		return false
 	}
-	return v.InConfig("s3.secret_key") || v.InConfig("server.token") || v.InConfig("server.s3_secret_key")
+
+	return v.InConfig("s3.secret_key") || v.InConfig("server.s3_secret_key")
 }
 
 // S3APIEnabled reports whether the SigV4 S3 facade should start.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -31,6 +32,10 @@ type Fetch struct {
 	softTTL time.Duration
 	reval   singleflight.Group
 	metrics *metrics.Collector
+	logger  *slog.Logger
+	// rawLayout downgrades the containerless legacy read warning to debug: for a
+	// layout=raw store, objects without an S3VCTR01 container are expected.
+	rawLayout bool
 }
 
 // CachedPlaintext is a decrypted object on disk ready for http.ServeContent.
@@ -55,7 +60,17 @@ func (c CachedPlaintext) Release() {
 
 // NewFetch constructs a downloader.
 func NewFetch(store port.ObjectStore, enc port.Encryptor) *Fetch {
-	return &Fetch{store: store, enc: enc}
+	return &Fetch{store: store, enc: enc, logger: slog.Default()}
+}
+
+// WithLogger attaches a logger used for legacy objects without an S3VCTR01
+// container. A nil logger is ignored.
+func (f *Fetch) WithLogger(l *slog.Logger) *Fetch {
+	if l != nil {
+		f.logger = l
+	}
+
+	return f
 }
 
 // WithCache enables plaintext disk cache (HTTP). Stdout downloads stay uncached.
@@ -77,6 +92,14 @@ func (f *Fetch) WithSoftTTL(d time.Duration) *Fetch {
 // WithMetrics attaches a Prometheus collector. A nil collector is a no-op.
 func (f *Fetch) WithMetrics(m *metrics.Collector) *Fetch {
 	f.metrics = m
+	return f
+}
+
+// WithRawLayout marks the backing store as layout=raw, where objects have no
+// S3VCTR01 container by design. The legacy containerless read warning is then
+// logged at debug instead of warn.
+func (f *Fetch) WithRawLayout(raw bool) *Fetch {
+	f.rawLayout = raw
 	return f
 }
 
@@ -115,14 +138,19 @@ func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer
 		return 0, err
 	}
 	defer body.Close()
-	ctx, payload, err := unwrapForDecrypt(ctx, body, meta)
+
+	ctx, payload, objEnc, hasContainer, err := unwrapForDecrypt(ctx, body, meta)
 	if err != nil {
 		return 0, err
 	}
 
+	if !hasContainer {
+		f.warnLegacy(key)
+	}
+
 	if dest == "-" {
 		cw := &countWriter{w: stdout}
-		return cw.n, encrypt.DecryptAuto(ctx, f.enc, cw, payload)
+		return cw.n, encrypt.DecryptAuto(ctx, f.enc, objEnc, cw, payload)
 	}
 
 	dir := filepath.Dir(dest)
@@ -137,7 +165,7 @@ func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer
 	defer func() { _ = os.Remove(tmpName) }()
 
 	cw := &countWriter{w: tmp}
-	if err := encrypt.DecryptAuto(ctx, f.enc, cw, payload); err != nil {
+	if err := encrypt.DecryptAuto(ctx, f.enc, objEnc, cw, payload); err != nil {
 		_ = tmp.Close()
 		return 0, err
 	}
@@ -219,12 +247,17 @@ func (f *Fetch) materializeEphemeral(ctx context.Context, key string) (CachedPla
 		return CachedPlaintext{}, err
 	}
 	defer body.Close()
-	decCtx, payload, err := unwrapForDecrypt(ctx, body, getMeta)
+
+	decCtx, payload, objEnc, hasContainer, err := unwrapForDecrypt(ctx, body, getMeta)
 	if err != nil {
 		return CachedPlaintext{}, err
 	}
+
+	if !hasContainer {
+		f.warnLegacy(key)
+	}
 	cw := &countWriter{w: tmp}
-	if err := encrypt.DecryptAuto(decCtx, f.enc, cw, payload); err != nil {
+	if err := encrypt.DecryptAuto(decCtx, f.enc, objEnc, cw, payload); err != nil {
 		f.recordDownload(started, cw.n, err)
 		return CachedPlaintext{}, err
 	}
@@ -303,12 +336,17 @@ func (f *Fetch) populateFromStore(ctx context.Context, key string, id port.Cache
 			return getErr
 		}
 		defer body.Close()
-		decCtx, payload, unwrapErr := unwrapForDecrypt(ctx, body, getMeta)
+
+		decCtx, payload, objEnc, hasContainer, unwrapErr := unwrapForDecrypt(ctx, body, getMeta)
 		if unwrapErr != nil {
 			return unwrapErr
 		}
+
+		if !hasContainer {
+			f.warnLegacy(key)
+		}
 		cw := &countWriter{w: w}
-		decErr := encrypt.DecryptAuto(decCtx, f.enc, cw, payload)
+		decErr := encrypt.DecryptAuto(decCtx, f.enc, objEnc, cw, payload)
 		n = cw.n
 		return decErr
 	})
@@ -386,16 +424,37 @@ func etagForHTTP(meta port.EntryMeta, id port.CacheID) string {
 }
 
 // unwrapForDecrypt strips S3VCTR01 when present and prefers header thumbprint.
-func unwrapForDecrypt(ctx context.Context, body io.Reader, meta domain.ObjectMeta) (context.Context, io.Reader, error) {
+// It returns the container's payload encryption name (container.EncName) and
+// whether a container was found; objEnc is "" for legacy objects.
+func unwrapForDecrypt(ctx context.Context, body io.Reader, meta domain.ObjectMeta) (context.Context, io.Reader, string, bool, error) {
 	hdr, payload, ok, err := container.Unwrap(body)
 	if err != nil {
-		return ctx, nil, err
+		return ctx, nil, "", false, err
 	}
+
+	objEnc := ""
 	tp := meta.CryptoProThumbprint // legacy user-metadata fallback
 	if ok {
+		objEnc = container.EncName(hdr.Enc)
 		if ht := hdr.ThumbprintHex(); ht != "" {
 			tp = ht
 		}
 	}
-	return encrypt.WithCryptoProThumbprint(ctx, tp), payload, nil
+
+	return encrypt.WithCryptoProThumbprint(ctx, tp), payload, objEnc, ok, nil
+}
+
+// warnLegacy flags reads of objects that predate the S3VCTR01 envelope, where
+// the payload encryption is unknown and detection falls back to magic/type.
+// For a layout=raw store this is the normal shape, so it logs at debug.
+func (f *Fetch) warnLegacy(key string) {
+	if f.rawLayout {
+		f.logger.Debug("object has no S3VCTR01 container (layout=raw); using magic/type detection",
+			slog.String("key", key))
+
+		return
+	}
+
+	f.logger.Warn("object has no S3VCTR01 container; falling back to legacy detection",
+		slog.String("key", key))
 }

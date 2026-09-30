@@ -67,8 +67,8 @@ func TestCorruptAutoConfigFallsBackToEnv(t *testing.T) {
 	require.NoError(t, os.Chdir(dir))
 	t.Cleanup(func() { _ = os.Chdir(wd) })
 
-	t.Setenv("S3VAULT_REMOTE_URL", "http://remote.example")
-	t.Setenv("S3VAULT_SERVER_TOKEN", "token")
+	t.Setenv("S3VAULT_S3_PREFIX", "env-prefix")
+	t.Setenv("S3VAULT_LOG_LEVEL", "debug")
 
 	root := t.TempDir()
 	file := filepath.Join(root, "a.log")

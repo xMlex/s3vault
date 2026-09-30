@@ -7,67 +7,48 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/xMlex/s3vault/internal/domain"
-	"github.com/xMlex/s3vault/internal/identity"
-	"github.com/xMlex/s3vault/internal/keying"
 	"github.com/xMlex/s3vault/internal/metrics"
 	"github.com/xMlex/s3vault/internal/port"
-	"github.com/xMlex/s3vault/internal/service"
 )
 
-// Config is HTTP server construction input.
+// Config is HTTP server construction input. The gateway's data frontend is the
+// S3 API (S3Handler); this HTTP listener carries only the health/readiness
+// probes and, when muxed, the S3 API itself.
 type Config struct {
 	Listen        string
 	MetricsListen string
-	S3Listen      string // empty = multiplex S3 on Listen when S3Handler set
-	Token         string
+	S3Listen      string // empty = multiplex S3 on Listen
 	Logger        *slog.Logger
-	Fetch         *service.Fetch
-	Archive       *service.Archive // optional; enables PUT /files/{path...}
-	OnChange      identity.OnChange
-	Keys          keying.Mapper
 	Store         port.ObjectStore
 	Metrics       *metrics.Collector
-	S3Handler     http.Handler // optional SigV4 S3 API
+	S3Handler     http.Handler // required SigV4 S3 API
 }
 
-// Server serves decrypted objects from the plaintext cache and optionally accepts ingest / S3 API.
+// Server serves health probes and the S3 API facade.
 type Server struct {
 	listen        string
 	metricsListen string
 	s3Listen      string
-	token         string
 	log           *slog.Logger
-	fetch         *service.Fetch
-	archive       *service.Archive
-	onChange      identity.OnChange
-	keys          keying.Mapper
 	store         port.ObjectStore
 	handler       http.Handler
 	s3Handler     http.Handler
 	metricsH      http.Handler
 }
 
-// New validates bind/token policy and builds handlers.
+// New validates bind policy and builds handlers.
 func New(cfg Config) (*Server, error) {
-	if cfg.Fetch == nil {
-		return nil, fmt.Errorf("fetch service is required")
-	}
 	if cfg.Store == nil {
 		return nil, fmt.Errorf("object store is required")
 	}
-	s3API := cfg.S3Handler != nil
-	if err := checkBind(cfg.Listen, cfg.Token, s3API); err != nil {
+
+	if err := requireS3API(cfg.S3Handler != nil); err != nil {
 		return nil, err
 	}
-	if err := checkS3Listen(cfg.S3Listen, s3API); err != nil {
-		return nil, err
-	}
+
 	log := cfg.Logger
 	if log == nil {
 		log = slog.Default()
@@ -80,21 +61,12 @@ func New(cfg Config) (*Server, error) {
 			return nil, err
 		}
 	}
-	onChange := cfg.OnChange
-	if onChange == identity.OnChangeUnknown {
-		onChange = identity.OnChangeOverwrite
-	}
 
 	s := &Server{
 		listen:        cfg.Listen,
 		metricsListen: cfg.MetricsListen,
 		s3Listen:      cfg.S3Listen,
-		token:         cfg.Token,
 		log:           log,
-		fetch:         cfg.Fetch,
-		archive:       cfg.Archive,
-		onChange:      onChange,
-		keys:          cfg.Keys,
 		store:         cfg.Store,
 		metricsH:      met.Handler(),
 	}
@@ -102,18 +74,12 @@ func New(cfg Config) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /ready", s.handleReady)
-	mux.HandleFunc("GET /files/{path...}", s.handleFile)
-	mux.HandleFunc("HEAD /files/{path...}", s.handleFile)
-	mux.HandleFunc("PUT /files/{path...}", s.handleIngest)
-	httpH := met.InstrumentHTTP(s.withAuth(mux))
+	httpH := met.InstrumentHTTP(mux)
 
-	var s3H http.Handler
-	if cfg.S3Handler != nil {
-		s3H = met.InstrumentHTTP(cfg.S3Handler)
-		s.s3Handler = s3H
-	}
+	s3H := met.InstrumentHTTP(cfg.S3Handler)
+	s.s3Handler = s3H
 
-	if s3H != nil && cfg.S3Listen == "" {
+	if cfg.S3Listen == "" {
 		s.handler = dispatchHTTPOrS3(httpH, s3H)
 	} else {
 		s.handler = httpH
@@ -132,7 +98,7 @@ func reservedHTTPFirstSegment(p string) bool {
 	}
 	seg, _, _ := strings.Cut(p, "/")
 	switch strings.ToLower(seg) {
-	case "health", "ready", "files":
+	case "health", "ready":
 		return true
 	default:
 		return false
@@ -168,7 +134,8 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	if s.s3Listen != "" && s.s3Handler != nil {
+
+	if s.s3Listen != "" {
 		s3Only := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/health" || r.URL.Path == "/health/" {
 				s.handleHealth(w, r)
@@ -254,35 +221,4 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
-}
-
-func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
-	rel := r.PathValue("path")
-	key, err := s.keys.FromRequestPath(rel)
-	if err != nil {
-		http.Error(w, "invalid path", http.StatusBadRequest)
-		return
-	}
-	cached, err := s.fetch.Materialize(r.Context(), key)
-	if errors.Is(err, domain.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		s.log.ErrorContext(r.Context(), "materialize", slog.String("op", "http"), slog.String("err", err.Error()))
-		http.Error(w, "unavailable", http.StatusBadGateway)
-		return
-	}
-	defer cached.Release()
-	f, err := os.Open(cached.Path)
-	if err != nil {
-		s.log.ErrorContext(r.Context(), "open cache", slog.String("op", "http"), slog.String("err", err.Error()))
-		http.Error(w, "unavailable", http.StatusInternalServerError)
-		return
-	}
-	defer f.Close()
-
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("ETag", strconv.Quote(cached.ETag))
-	http.ServeContent(w, r, cached.Name, cached.ModTime, f)
 }

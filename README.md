@@ -4,17 +4,17 @@
 
 Повторная загрузка того же содержимого пропускается по идентичности из заголовка объекта `S3VCTR01` (SHA-256 plaintext); ETag как хеш содержимого не используется. Legacy-объекты со старым `s3vault-*` user-metadata читаются как fallback, но новые Put его не пишут. После успешного upload локальный файл **не удаляется**, пока не указан `--delete-after-upload`. Если объект уже есть с тем же содержимым (skip) — `--delete-if-exists`.
 
-Архитектура: [architecture.md](architecture.md).
+Архитектура: [architecture.md](architecture.md). Известные расхождения с кодом: [problems.md](problems.md).
 
 ## Что уже есть и чего нет
 
-Работает: `archive` (включая `--dry-run`), `upload`, `download`, `server` (HTTP `/files` + optional S3 SigV4 API), `cache stats|clear`, шифрование `none` / `native` / `command`, Prometheus-метрики (HTTP, S3 API, кэш, upload/download). Бэкенд хранения — S3 или локальная директория (`backend.type`).
+Работает: `archive` (включая `--dry-run`), `upload`, `download`, `server` (S3 SigV4 API, `/health` + `/ready`), `cache stats|clear`, шифрование `none` / `native` / `command`, Prometheus-метрики (HTTP, S3 API, кэш, upload/download). Бэкенд хранения — S3 или локальная директория (`backend.type`).
 
-Docker-образа и systemd-unit в репозитории нет — ниже запуск бинарём.
+Systemd-юнит есть в репозитории — `s3vault.service`, положить в `/etc/systemd/system/`. Ниже запуск бинарём. `Dockerfile` есть, см. «Образ» в разделе «Сборка».
 
 ## Сборка
 
-Нужен Go 1.26+ (в `go.mod` зафиксирована версия toolchain).
+Нужен Go 1.26+ (в `go.mod` зафиксирована версия языка, директивы `toolchain` нет — используйте установленный тулчейн).
 
 ```bash
 git clone <repo>
@@ -33,6 +33,293 @@ gofmt -l .
 golangci-lint run --new-from-rev=HEAD ./...                  # дерево не lint-clean: смотрите только свою дельту
 go test -tags=integration -count=1 ./internal/integration/   # нужен доступ к S3, иначе skip; см. ниже
 ```
+
+### Образ
+
+```bash
+docker build --build-arg VERSION=$(git describe --tags --always --dirty) -t s3vault .
+```
+
+Двухстадийная сборка: `golang:1.26-alpine` собирает статический бинарь (`CGO_ENABLED=0`), рантайм — `distroless/static-debian12:nonroot`, без shell и без libc.
+
+Что стоит знать перед запуском:
+
+- `server` по умолчанию слушает `127.0.0.1`, из контейнера это недостижимо, поэтому в образе задан `S3VAULT_SERVER_LISTEN=0.0.0.0:8080`. Сервер стартует только с ключами S3-фасада (`S3VAULT_SERVER_S3_ACCESS_KEY`/`S3VAULT_SERVER_S3_SECRET_KEY`), так что их придётся задать.
+- Кэш выключен по умолчанию (`cache.enabled: false`) и не переживает перезапуск контейнера. Чтобы plaintext не терялся, смонтируйте том на `/cache` (`S3VAULT_CACHE_DIR=/cache`) — и держите в нём `0700`.
+- `encryption.mode=command` из этого образа **не работает**: режим зовёт внешний `cryptcp`, которого в distroless нет. Берите `encryption.mode=native` либо свой образ с cryptcp.
+- `encryption.mode=command` из этого образа **не работает**: режим зовёт внешний `cryptcp`, которого в distroless нет. Берите `encryption.mode=native` либо свой образ с cryptcp.
+- Секреты в образ не запекаются: `.env`, `*.pem`, `kek.bin` перечислены в `.dockerignore`, конфигурация приходит через env или смонтированный файл.
+
+## Быстрый старт: шлюз + архив
+
+Сквозной сценарий целиком: файлы → клиент → шлюз → хранилище и обратно. Команды копируются как есть; порты по умолчанию — `8080` (`/health`, `/ready`), `8333` (S3-фасад), `9090` (метрики). Термины ниже — **хранилище**, **клиент**, **шлюз**, см. «Режимы работы».
+
+```bash
+make build                                        # ./s3vault
+
+D=/tmp/demo; mkdir -p "$D/logs"                   # данные для архива
+head -c 4096 /dev/urandom > "$D/logs/app.log"
+printf 'hello from s3vault\n' > "$D/logs/notes.txt"
+touch -d '10 days ago' "$D/logs/"*                # mtime старше 7 дней, иначе archive их не увидит
+
+umask 077 && dd if=/dev/urandom of="$D/kek.bin" bs=32 count=1   # боевой путь — /etc/s3vault/kek.bin, 0600
+```
+
+### 1. Хранилище
+
+```bash
+docker compose -f compose.e2e.yaml up -d   # из корня репозитория: MinIO на :9000, бакет s3vault, креды s3vault/s3vaulttest
+```
+
+### 2. Шлюз
+
+`S3VAULT_S3_*` — доступ шлюза к хранилищу, `S3VAULT_SERVER_S3_*` — ключи фасада, по которым с ним говорят клиенты. Шифрование — `native` с KEK, слой шлюза.
+
+```bash
+export S3VAULT_S3_ENDPOINT=http://127.0.0.1:9000
+export S3VAULT_S3_REGION=us-east-1
+export S3VAULT_S3_BUCKET=s3vault
+export S3VAULT_S3_ACCESS_KEY=s3vault
+export S3VAULT_S3_SECRET_KEY=s3vaulttest
+export S3VAULT_S3_PATH_STYLE=true
+
+export S3VAULT_ENCRYPTION_MODE=native
+export S3VAULT_ENCRYPTION_NATIVE_WRAP=keyfile
+export S3VAULT_ENCRYPTION_NATIVE_KEY_FILE="$D/kek.bin"
+
+export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
+export S3VAULT_SERVER_S3_SECRET_KEY=vaultsk
+export S3VAULT_SERVER_S3_BUCKET=s3vault   # виртуальный бакет фасада
+
+s3vault server --s3-listen 127.0.0.1:8333
+```
+
+Клиентский `S3VAULT_S3_BUCKET` обязан совпасть с виртуальным бакетом фасада, иначе `403 Forbidden` на первой же операции. Бакет шлюза по умолчанию равен его же `s3.bucket` (здесь `s3vault`), а при `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` подходит любое имя — оно становится префиксом ключа.
+
+Ключи в этой схеме три, и их легко спутать, потому что все три живут в одном пространстве имён — `S3VAULT_S3_*`:
+
+| пара | где задаётся | чья это пара |
+| --- | --- | --- |
+| креды хранилища | `S3VAULT_S3_ACCESS_KEY` / `S3VAULT_S3_SECRET_KEY` у шлюза | MinIO: `s3vault` / `s3vaulttest` |
+| фронтенд шлюза | `S3VAULT_SERVER_S3_ACCESS_KEY` / `S3VAULT_SERVER_S3_SECRET_KEY` | свои; ими шлюз проверяет входящий SigV4 |
+| креды клиента | `S3VAULT_S3_ACCESS_KEY` / `S3VAULT_S3_SECRET_KEY` у клиента | копия фронтенд-пары шлюза: `vaultak` / `vaultsk` |
+
+Правило: `S3VAULT_S3_*` — это всегда «кем я являюсь для своего хранилища», а `S3VAULT_SERVER_S3_*` — «кем я пускаю к себе». Проверить, что пары разные, нечем, и задать их одинаковыми можно — тогда шлюз держит и ключи от себя, и ключи, которыми ходит в хранилище. В шагах 4 и 5 клиент намеренно меняет `S3VAULT_S3_*` на креды MinIO: то же место конфигурации, другой адресат.
+
+### 3. Клиент архивирует через шлюз
+
+Отдельный терминал. `s3.endpoint` теперь смотрит на шлюз, и S3-кредами клиента становятся фронтенд-ключи шлюза из шага 2 — не креды MinIO, а другая пара.
+
+```bash
+export S3VAULT_S3_ENDPOINT=http://127.0.0.1:8333
+export S3VAULT_S3_BUCKET=s3vault
+export S3VAULT_S3_ACCESS_KEY=vaultak
+export S3VAULT_S3_SECRET_KEY=vaultsk
+export S3VAULT_S3_PATH_STYLE=true
+export S3VAULT_ENCRYPTION_MODE=native
+export S3VAULT_ENCRYPTION_NATIVE_WRAP=keyfile
+export S3VAULT_ENCRYPTION_NATIVE_KEY_FILE="$D/kek.bin"
+
+s3vault archive "$D/logs" --older-than 7d --prefix demo --dry-run
+s3vault archive "$D/logs" --older-than 7d --prefix demo
+```
+
+```text
+level=INFO msg=file op=archive path=notes.txt key=demo/notes.txt size=19 dry_run=false
+level=INFO msg=file op=archive path=app.log key=demo/app.log size=4096 dry_run=false
+found=2 uploaded=2 skipped=0 failed=0 bytes_uploaded=4115 duration=14ms
+```
+
+Ключ объекта — `--prefix` клиента плюс путь относительно `/tmp/demo/logs`; `s3.prefix` шлюза пуст, поэтому общего корня сверху нет. Шифрование можно целиком отдать шлюзу (клиент с `encryption.mode=none` без CryptoPro) — см. топологию B.
+
+### 4. Что видит хранилище
+
+Один и тот же `notes.txt` (19 байт) — напрямую в хранилище и через шлюз:
+
+```bash
+# тот же файл мимо шлюза: 1 слой
+S3VAULT_S3_ENDPOINT=http://127.0.0.1:9000 S3VAULT_S3_BUCKET=s3vault \
+S3VAULT_S3_ACCESS_KEY=s3vault S3VAULT_S3_SECRET_KEY=s3vaulttest S3VAULT_S3_PATH_STYLE=true \
+S3VAULT_ENCRYPTION_MODE=native S3VAULT_ENCRYPTION_NATIVE_WRAP=keyfile S3VAULT_ENCRYPTION_NATIVE_KEY_FILE="$D/kek.bin" \
+  s3vault upload "$D/logs/notes.txt" --prefix demo-direct
+
+AWS_ACCESS_KEY_ID=s3vault AWS_SECRET_ACCESS_KEY=s3vaulttest \
+  aws --endpoint-url http://127.0.0.1:9000 s3 ls s3://s3vault/ --recursive
+```
+
+```text
+2026-09-29 20:29:20        390 demo-direct/notes.txt
+2026-09-29 20:29:20        761 demo/notes.txt
+```
+
+Лишние 371 байт — слой шлюза: ещё один контейнер `S3VCTR01` плюс конверт `S3VLT01`. **Вложенный слой в сырых байтах не виден**: шифротекст внешнего слоя лежит поверх всего объекта клиента, а не рядом с ним, поэтому подряд двух `S3VCTR01` в объекте не будет. Вложенность проверяется чтением.
+
+### 5. Чтение: шлюз обязан быть и на пути чтения
+
+```bash
+s3vault download demo/notes.txt "$D/back.txt"      # тем же клиентским окружением
+cmp "$D/logs/notes.txt" "$D/back.txt" && echo ok
+```
+
+`ok` — два процесса сняли по одному слою. Две типовые ошибки дают не мусор, а ровно «снят один слой»:
+
+```bash
+# мимо шлюза, прямо из хранилища: снят слой шлюза, шифротекст клиента остался
+S3VAULT_S3_ENDPOINT=http://127.0.0.1:9000 S3VAULT_S3_BUCKET=s3vault \
+S3VAULT_S3_ACCESS_KEY=s3vault S3VAULT_S3_SECRET_KEY=s3vaulttest \
+  s3vault download demo/notes.txt "$D/direct.bin"   # 390 байт вместо 19
+head -c 8 "$D/direct.bin"                           # S3VCTR01
+
+# через фасад, но сторонним клиентом: снят слой шлюза, слой клиента — наружу
+AWS_ACCESS_KEY_ID=vaultak AWS_SECRET_ACCESS_KEY=vaultsk \
+  aws --endpoint-url http://127.0.0.1:8333 s3 cp s3://s3vault/demo/notes.txt "$D/aws.bin" \
+  --region us-east-1                                 # тоже 390 байт, не plaintext
+```
+
+Оба файла — корректные объекты в один слой, просто не то, чего ждали. Для отдачи plaintext клиент должен идти в фасад тем же путём, каким шёл записью.
+
+### 6. Повторный прогон, health, метрики
+
+```bash
+s3vault archive "$D/logs" --older-than 7d --prefix demo
+# found=2 uploaded=0 skipped=2 failed=0 bytes_uploaded=0 duration=7ms
+
+curl -fsS http://127.0.0.1:8080/health; echo   # ok
+curl -fsS http://127.0.0.1:8080/ready; echo    # ok — дешёвый HEAD в хранилище
+curl -s http://127.0.0.1:9090/metrics | grep s3vault_s3_requests_total
+# s3vault_s3_requests_total{op="put",result="ok"} 2
+```
+
+Skip срабатывает по SHA-256 plaintext, а не по ETag, поэтому смена ключей сама по себе не перезаливает объект. Локальные файлы остаются на месте — убрать их можно только `--delete-after-upload`.
+
+### 7. То же без Docker: хранилище в локальной директории
+
+```bash
+# шлюз: шифрование и ключи фасада из шага 2, вместо доступа в MinIO — директория
+S3VAULT_BACKEND_TYPE=local S3VAULT_BACKEND_LOCAL_DIR="$D/objects" S3VAULT_S3_ENDPOINT= S3VAULT_S3_BUCKET= \
+  s3vault server --s3-listen 127.0.0.1:8333
+
+# клиент — как в шаге 3, меняется только S3VAULT_S3_ENDPOINT
+find "$D/objects" -type f
+```
+
+Настоящий бакет не нужен: виртуальный бакет фасада тогда дефолтный (`s3vault`), слои и ключи ведут себя так же.
+
+### 8. Уборка
+
+```bash
+docker compose -f compose.e2e.yaml down -v
+rm -rf "$D"
+```
+
+## Режимы работы
+
+В проекте три сущности. Путать их не надо — из этого путания растут почти все вопросы конфигурации.
+
+| Сущность | Что это | Как задаётся |
+| --- | --- | --- |
+| **Хранилище** | Где физически лежат объекты: чужой S3/MinIO **или** локальная директория | `backend.type: s3 \| local` |
+| **Клиент** | s3vault, который читает или пишет в хранилище. Своего хранилища у него нет | `archive`, `upload`, `download` |
+| **Шлюз** | s3vault, у которого **тоже нет своего хранилища**: он стоит перед хранилищем, отдаёт plaintext и **сам является клиентом этого хранилища** | `s3vault server` |
+
+Слово «server» в имени команды означает **шлюз**, а не хранилище. Сторонний S3-сервер в этих доках называется **хранилищем**. Ключа `role:` или `mode:` в конфиге нет и не нужно: роль задаётся командой, второго источника истины быть не должно.
+
+Шлюз отдаёт наружу **один** фронтенд — **S3-фасад** (SigV4, для `aws-cli` и SDK). Обычный HTTP-слушатель несёт только `/health` и `/ready`. Bearer-фронтенд `HTTP /files` и режим `remote.url` удалены: и шлюз, и его клиенты говорят на одном протоколе — S3.
+
+Ровно так же расходятся и ключи: `S3VAULT_SERVER_S3_*` — фронтенд самого шлюза, те, кто входит в него; `S3VAULT_S3_*` — пара, которой шлюз сам представляется своему хранилищу (фронтенд-ключи следующего шлюза, если хранилище — шлюз, иначе креды S3). Это разные пары, задать их одинаковыми не мешает ничего, но тогда шлюз держит и ключи от себя, и ключи в хранилище. Наглядная разбивка — в «Быстрый старте», назначение полей по ролям — в [architecture.md](architecture.md#which-config-keys-each-role-reads).
+
+```text
+исходные файлы на диске
+   │
+   ▼
+клиент: archive | upload                     клиент: download
+   │                                              │
+   └──────── S3-протокол ────────────► шлюз ────► хранилище
+      (или напрямую в хранилище       (server; сам клиент хранилища)
+       когда s3.endpoint — реальный S3)
+```
+
+Отсюда два правила, которые иначе приходится выводить самим:
+
+- **Слоёв в объекте столько, сколько s3vault-процессов обернули байты.** Клиент пишет прямо в хранилище — 1 слой. На пути есть шлюз — 2 (внешний шлюзовой, внутренний клиентский). `aws s3 cp` в шлюз даёт 1 слой: клиент, который не s3vault, ничего не добавляет.
+- **Чтение снимает ровно один слой.** Поэтому объект читается как plaintext одним процессом только если в нём ровно один слой. Если шлюз есть на пути записи, он обязан быть и на пути чтения: два слоя снимают два разных процесса, по порядку.
+
+### Топология A — клиент напрямую в S3
+
+Самая обычная. Шлюза нет, слоёв один, клиент ходит в S3 напрямую.
+
+```bash
+export S3VAULT_S3_ENDPOINT=http://s3.local.example
+export S3VAULT_S3_BUCKET=test
+export S3VAULT_S3_ACCESS_KEY=... S3VAULT_S3_SECRET_KEY=...
+s3vault archive /data/app --older-than 7d
+s3vault download backups/logs/app.log /tmp/app.log
+```
+
+### Топология B — клиенты без CryptoPro через шлюз
+
+Шлюз с `encryption.mode: command` держит СКЗИ. Клиент без CryptoPro указывает `s3.endpoint` **на S3-фасад шлюза** и использует его frontend-ключи как свои S3-креды. Отдельного канала записи нет: `archive`/`upload` кладут объект по `PutObject`, шлюз добавляет свой слой.
+
+```bash
+# на хосте-шлюзе
+# ── Хранилище: доступ шлюза к S3 (backend.type=s3 по умолчанию) ──
+export S3VAULT_S3_ENDPOINT=http://s3.local.example:9000
+export S3VAULT_S3_REGION=us-east-1
+export S3VAULT_S3_BUCKET=s3vault           # реальный бакет в хранилище
+export S3VAULT_S3_ACCESS_KEY=...
+export S3VAULT_S3_SECRET_KEY=...
+export S3VAULT_S3_PATH_STYLE=true          # обычно для MinIO
+# S3VAULT_S3_PREFIX=backups                # необязательно: общий корень ключей
+
+# ── СКЗИ: command + КриптоПро (cryptcp через обёртки) ──
+export S3VAULT_ENCRYPTION_MODE=command
+export S3VAULT_ENCRYPTION_COMMAND_PROVIDER=cryptopro      # дефолт cryptopro
+export S3VAULT_ENCRYPTION_COMMAND_THUMBPRINT=afa43c43975fbfc700f051fd62016e1571e7e025
+export S3VAULT_ENCRYPTION_COMMAND_ENCRYPT=/usr/local/libexec/s3vault/cryptcp-encrypt
+export S3VAULT_ENCRYPTION_COMMAND_DECRYPT=/usr/local/libexec/s3vault/cryptcp-decrypt
+export S3VAULT_ENCRYPTION_COMMAND_TIMEOUT=30m             # дефолт 30m
+export CRYPTOPRO_PIN=...            # только download/server, если контейнер защищён паролем
+# CRYPTCP=/opt/cprocsp/bin/ia32/cryptcp                    # 32-bit; дефолт amd64
+
+# ── S3-фасад: ключи, по которым в шлюз ходят клиенты ──
+export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
+export S3VAULT_SERVER_S3_SECRET_KEY=vaultsk
+export S3VAULT_SERVER_S3_BUCKET=my-bucket  # виртуальный бакет фасада
+s3vault server --s3-listen 127.0.0.1:8333
+
+# на хосте-клиенте — s3.* смотрит на шлюз, своих ключей CryptoPro/S3 нет
+export S3VAULT_S3_ENDPOINT=http://gw.example:8333
+export S3VAULT_S3_ACCESS_KEY=vaultak
+export S3VAULT_S3_SECRET_KEY=vaultsk
+export S3VAULT_S3_BUCKET=my-bucket
+export S3VAULT_S3_PATH_STYLE=true
+s3vault archive /var/log/app --older-than 7d
+s3vault download logs/app/app.log /tmp/app.log   # читается тем же путём
+```
+
+Обязательны `S3VAULT_ENCRYPTION_MODE=command` и обе argv-обёртки `..._ENCRYPT`/`..._DECRYPT` — без них старт падает (`encryption.command encrypt and decrypt argv must be set`). `PROVIDER=cryptopro` и `TIMEOUT=30m` — дефолтные. `THUMBPRINT` здесь обязателен: в argv только путь обёртки, авто-вывод из argv пуст, а обёртка без `CRYPTOPRO_THUMBPRINT`/аргумента завершается ошибкой; списки argv из env — через запятую. `CRYPTOPRO_PIN` — только env и только для защищённого контейнера на `download`/`server`. Сертификат, контейнер и обёртки — раздел «КриптоПро CSP (`cryptcp`)» ниже; YAML-эквивалент — `s3vault.example.yaml:37–43`.
+
+`S3VAULT_S3_*` на шлюзе — это доступ **шлюза к хранилищу** (backend), а `S3VAULT_SERVER_S3_*` — frontend-ключи и виртуальный бакет **S3-фасада**, по которым в шлюз ходят клиенты. Это две независимые пары: backend-креды на клиент не попадают, а бакет хранилища (`S3VAULT_S3_BUCKET=s3vault`) не обязан совпадать с виртуальным бакетом фасада (`S3VAULT_SERVER_S3_BUCKET=my-bucket`). Полная форма — секции `s3:` и `server:` в [s3vault.example.yaml](s3vault.example.yaml); при `backend.type: local` вместо `S3VAULT_S3_*` см. топологию C.
+
+`S3VAULT_SERVER_S3_BUCKET` в примере не декоративный: клиентский `S3VAULT_S3_BUCKET` должен совпасть с виртуальным бакетом фасада, иначе первая же операция вернёт `403 Forbidden`. Без этой строки бакет шлюза берётся из его `s3.bucket`; `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` допускает любое имя на стороне клиента, превращая его в префикс ключа.
+
+**Клиент читает и пишет симметрично.** Оба направления идут через один и тот же `s3.endpoint`, поэтому объект в двух слоях (внешний шлюзовой, внутренний клиентский) снимается двумя процессами по порядку: шлюз снимает свой слой на `GetObject`, клиент — свой на `download`. Былого «только запись» больше нет. Удалены вместе с режимом: `remote.url`, `S3VAULT_SERVER_TOKEN` и лимитер `remote.rate_limit_bps`.
+
+Рабочий пример этого контура — [example/command/gateway.sh](example/command/gateway.sh) (шлюз с `encryption.mode=command`, где внешняя команда — `openssl`, ключ из thumbprint) и [example/command/archive.sh](example/command/archive.sh) (архив каталога через фасад).
+
+### Топология C — шлюз поверх локального каталога
+
+`backend.type: local` — хранилище на той же машине. Шлюз при этом всё равно клиент хранилища, и S3-фасад работает без настоящего бакета (имя виртуального бакета — `server.s3_bucket`, иначе `s3.bucket`, иначе `s3vault`).
+
+```bash
+export S3VAULT_BACKEND_TYPE=local
+export S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
+export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
+export S3VAULT_SERVER_S3_SECRET_KEY=vaultsk
+s3vault server --s3-listen 127.0.0.1:8333
+```
+
+Подробности ролей и таблица «какие ключи читает какая роль» — [architecture.md](architecture.md#roles-and-topology).
 
 ## Развёртывание
 
@@ -59,7 +346,7 @@ go test -tags=integration -count=1 ./internal/integration/   # нужен дос
 | --- | --- |
 | `S3VAULT_BACKEND_TYPE` | Бэкенд хранения: `s3` (по умолчанию) или `local` |
 | `S3VAULT_BACKEND_LOCAL_DIR` | Директория объектов при `backend.type=local` |
-| `S3VAULT_BACKEND_LOCAL_LAYOUT` | `container` (по умолчанию) или `raw` (чистые файлы; только с `encryption.mode=none`) |
+| `S3VAULT_BACKEND_LOCAL_LAYOUT` | `container` (по умолчанию) или `raw` (голый payload без `S3VCTR01`; только при `encryption.mode=none`) |
 | `S3VAULT_S3_ENDPOINT` | URL API. Пусто = AWS. Для MinIO: `http://s3.example:9000` |
 | `S3VAULT_S3_REGION` | Регион (для MinIO часто `us-east-1`) |
 | `S3VAULT_S3_BUCKET` | Бакет |
@@ -68,12 +355,10 @@ go test -tags=integration -count=1 ./internal/integration/   # нужен дос
 | `S3VAULT_S3_SECRET_KEY` | Secret key |
 | `S3VAULT_S3_SESSION_TOKEN` | Session token, если нужен |
 | `S3VAULT_S3_PATH_STYLE` | `true` для большинства MinIO |
-| `S3VAULT_S3_TLS` | Проверка TLS (по умолчанию включена) |
 | `S3VAULT_ENCRYPTION_MODE` | `none`, `native`, `command` |
 | `S3VAULT_LOG_LEVEL` | `debug`, `info`, `warn`, `error` |
 | `S3VAULT_CACHE_ENABLED` | `true` — persistent plaintext disk cache for HTTP/S3 (default `false`) |
-| `S3VAULT_SERVER_TOKEN` | Bearer для HTTP `/files` |
-| `S3VAULT_SERVER_S3_ACCESS_KEY` | Frontend SigV4 access key (включает S3 API вместе с secret) |
+| `S3VAULT_SERVER_S3_ACCESS_KEY` | Frontend SigV4 access key (обязателен вместе с secret) |
 | `S3VAULT_SERVER_S3_SECRET_KEY` | Frontend SigV4 secret |
 | `S3VAULT_SERVER_S3_LISTEN` | Отдельный bind для S3; пусто = multiplex на `server.listen` |
 | `S3VAULT_SERVER_S3_BUCKET` | Virtual bucket name (default = `s3.bucket`) |
@@ -92,7 +377,7 @@ backend:
   local:
     dir: /srv/s3vault/objects
     # layout: container  # default — S3VCTR01 || payload (как в S3)
-    # layout: raw        # plaintext as-is; требует encryption.mode=none
+    # layout: raw        # bare payload без контейнера (см. ниже)
 ```
 
 То же самое только через окружение — YAML при этом не нужен вовсе:
@@ -109,9 +394,13 @@ s3vault download backups/app.log /tmp/app.log
 
 Как и для остальных настроек, приоритет прежний: флаги > `S3VAULT_*` > YAML > умолчания, так что `S3VAULT_BACKEND_TYPE=local` переопределяет `backend.type: s3` из файла.
 
-При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. По умолчанию (`layout: container`) формат объекта тот же, что в S3 (контейнер `S3VCTR01` + payload), поэтому шифрование, dedup по SHA-256, `download`, HTTP `/files` и S3 SigV4-фасад работают одинаково на обоих бэкендах. `layout: raw` пишет только plaintext без заголовка (только при `encryption.mode=none`); skip/dedup по SHA-256 в этом режиме недоступен. Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
+При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. По умолчанию (`layout: container`) формат объекта тот же, что в S3 (контейнер `S3VCTR01` + payload), поэтому шифрование, dedup по SHA-256, `download` и S3 SigV4-фасад работают одинаково на обоих бэкендах. Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
 
-Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime), а идентичность содержимого берётся из `S3VCTR01` (в `layout: container`).
+`layout: raw` пишет **голый payload без заголовка `S3VCTR01`** — получается обычная директория с файлами. Это удобно, если содержимое каталога должны читать/писать другие инструменты или человек. Файлы при этом — чистый plaintext, поэтому `layout: raw` допускается **только вместе с `encryption.mode=none`**: заголовок `S3VCTR01` — единственное место, где хранится `enc`, и без него читатель не отличит шифртекст от plaintext. Комбинация `raw` + `native`/`command` отвергается на старте с явной ошибкой (иначе объект, зашифрованный одним режимом, читался бы `mode=none` как есть — тихий мусор).
+
+Ограничения raw: нет content-hash → dedup/`skip` по SHA недоступен (повторная заливка перезаписывает); `ETag` синтетический, а `Head`/`x-amz-checksum-sha256` для raw — SHA-256 **хранимых байтов**. Объект без контейнера читается legacy-детекцией по магии; для raw-стора это ожидаемо (все объекты — plaintext) и логируется на уровне `debug`.
+
+Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime) и служит только fallback, а идентичность содержимого — plaintext SHA-256 из заголовка `S3VCTR01` (container) или SHA-256 файла (raw).
 
 Смена бэкенда меняет namespace дискового кэша, поэтому записи S3 и локального хранилища в кэше не пересекаются.
 
@@ -124,10 +413,11 @@ s3:
   bucket: test
   prefix: backups
   path_style: true
-  tls: true
 ```
 
 Для `http://` endpoint задайте его явно; `path_style: true` обычно обязателен. Регион нужен SDK даже если MinIO его не использует.
+
+TLS отдельным ключом не настраивается: его определяет схема `endpoint`. `https://` проверяет сертификат по системному хранилищу (проверка включена по умолчанию), `http://` отключает TLS. Это сознательно — иначе булев флаг и URL смогли бы разойтись, и оператор думал бы, что управляет TLS, не управляя им.
 
 Либо:
 
@@ -164,7 +454,7 @@ s3vault upload /data/app/logs/app.log --root /data/app --prefix backups --key lo
 s3vault download backups/logs/app.log /tmp/app.log
 ```
 
-Ключ объекта: `prefix` + путь относительно корня скана (`archive <dir>` / `upload --root`). Префикс: `--prefix`, `S3VAULT_S3_PREFIX` или `s3.prefix` в YAML (флаг сильнее). В remote-режиме клиентский `--prefix` уходит в путь `PUT /files/...`; на сервере `s3.prefix` — общий корень (часто пустой, если префиксы задаёт только клиент).
+Ключ объекта: `prefix` + путь относительно корня скана (`archive <dir>` / `upload --root`). Префикс: `--prefix`, `S3VAULT_S3_PREFIX` или `s3.prefix` в YAML (флаг сильнее). Когда клиент ходит через шлюз, его `--prefix` входит в ключ `PutObject`, а `s3.prefix` шлюза — общий корень (часто пустой, если префиксы задаёт только клиент).
 
 `--older-than`: Go-duration (`24h`, `90m`) плюс `7d`, `30d`, `1w`.
 
@@ -187,7 +477,7 @@ level=INFO msg="object store ready" op=backend backend=s3 bucket=my-bucket endpo
 
 Identity и CryptoPro thumbprint берутся из `S3VCTR01` (на archive — Range GET первых 128 байт). S3 user-metadata на новых Put **не** пишется. Бэкенд должен поддерживать HTTP Range.
 
-Один и тот же режим и те же ключи нужны на archive и на download.
+Один и тот же режим и те же ключи нужны на archive и на download. Режим читателя сверяется с полем `enc` контейнера `S3VCTR01`: если объект зашифрован одним режимом, а читатель настроен на другой, `download`/HTTP/S3-выдача завершаются ошибкой (`object requires encryption.mode=…`), а не отдают шифротекст или мусор. Объекты без контейнера (legacy) читаются как раньше — с предупреждением в лог.
 
 ### `none` — без шифрования
 
@@ -257,7 +547,7 @@ encryption:
     timeout: 30m
 ```
 
-Подходит `age`, `gpg` (осторожно с pinentry), КриптоПро `cryptcp` (через обёртку, см. ниже), любой фильтр stdin→stdout. Формат объекта тогда свой у команды; download в режиме `command` всегда гоняет decrypt-команду.
+Подходит `age`, `gpg` (осторожно с pinentry), КриптоПро `cryptcp` (через обёртку, см. ниже), любой фильтр stdin→stdout. Формат объекта тогда свой у команды; `download` запускает decrypt-команду только для объектов с `enc=command` в заголовке (и для legacy-объектов без контейнера); если объект помечен `enc=0`, читатель `command` отказывается.
 
 Пример identity `age`:
 
@@ -354,7 +644,7 @@ export CRYPTOPRO_PIN="..."
 
 На машине **archive** достаточно сертификата получателя в хранилище (thumbprint). На машине **download** / **server** должен быть контейнер закрытого ключа того же получателя (и старых thumbprint’ов из контейнера/metadata, пока объекты не перешифрованы); процесс s3vault запускают от пользователя, у которого CSP эти контейнеры видит. Если контейнер закрыт паролем, без `CRYPTOPRO_PIN` расшифровка не пройдёт.
 
-Если на источнике логов **нет** CryptoPro, а на `s3vault server` уже настроены `encryption.mode=command` и S3: задайте `S3VAULT_REMOTE_URL` + `S3VAULT_SERVER_TOKEN` на клиенте — `archive`/`upload` отправят plaintext на сервер (`PUT /files/...`), шифрование и Put выполнятся там.
+Если на источнике логов **нет** CryptoPro, а на шлюзе (`s3vault server`) уже настроены `encryption.mode=command` и S3-фасад: укажите на клиенте `s3.endpoint` **на шлюз** и его frontend-ключи `server.s3_access_key`/`server.s3_secret_key` (см. «Режимы работы», топология B). `archive`/`upload` положат объект на шлюз по S3, шифрование выполнится там; `download` читает тем же путём. Ключи `S3VAULT_REMOTE_URL`/`S3VAULT_SERVER_TOKEN` удалены.
 
 Legacy-объекты без `S3VCTR01` / без metadata расшифровываются thumbprint’ом из конфига / argv.
 
@@ -397,7 +687,7 @@ Legacy-объекты без `S3VCTR01` / без metadata расшифровыв
 
 **`command` + КриптоПро (`cryptcp`)**
 
-- Плюсы: шифрование ГОСТ / сертификаты CSP; соответствует требованиям, где нужен СКЗИ; на archive достаточно сертификата получателя; thumbprint в `S3VCTR01`/metadata позволяет расшифровывать старые объекты после смены сертификата; remote-клиент без CryptoPro может слать plaintext на `s3vault server`.
+- Плюсы: шифрование ГОСТ / сертификаты CSP; соответствует требованиям, где нужен СКЗИ; на archive достаточно сертификата получателя; thumbprint в `S3VCTR01`/metadata позволяет расшифровывать старые объекты после смены сертификата; клиент без CryptoPro может держать `mode: none` и переложить шифрование на шлюз — тогда объект уходит в фасад открытым, а слой кладёт шлюз.
 - Минусы: лицензия и установка CSP; обёртки вместо прямого `cryptcp` (stdin/stdout); PIN только через `CRYPTOPRO_PIN`; срок закрытого ключа ГОСТ обычно 1–3 года — нужна плановая перешифровка; тяжелее и медленнее native AES; на download/server нужен контейнер того же (и старых) получателя.
 
 
@@ -419,56 +709,64 @@ go test -tags=integration -count=1 -v ./internal/integration/
 
 Объекты пишутся под `s3vault-it/` и удаляются в cleanup.
 
+## E2E-стенд
+
+`make e2e` поднимает MinIO из `compose.e2e.yaml` (бакет создаётся через `minio-init`, сам код `CreateBucket` не вызывает) и прогоняет все фазы: `go test -race ./...`, integration-тесты, CLI (archive/upload/download, перезапись по ключу, delete-политики, симлинки, multipart), все режимы шифрования, HTTP-сервер (health/ready, Range, метрики, кэш), SigV4-фасад, локальный бэкенд и отказы.
+
+```bash
+make e2e            # всё
+make e2e-up         # только MinIO
+make e2e-down       # снести стенд
+make e2e-clean      # снести стенд и рабочий каталог
+./scripts/e2e.sh server   # одна фаза: go|cli|encrypt|server|facade|local|resilience
+```
+
+Стенды детектора шифрования живут отдельно от `e2e.sh` (они проверяют не
+сценарии CLI, а инварианты чтения), но тоже прогоняются в CI шагом `make verify`.
+Локально нужен поднятый MinIO на `127.0.0.1:9000` и бакет `s3vault` — то есть
+`make e2e-up`:
+
+```bash
+make verify                  # все три
+make verify-detect           # детектор шифрования, T0–T7
+make verify-layers           # матрица «сервер × клиент» через фасад
+make verify-drift            # дрейф encryption.mode на сервере
+```
+
+Подробности — в [docs/decrypt-detection.md](docs/decrypt-detection.md).
+
+Нужен `socat` (для имитации отказа S3) и доступ к Docker. Рабочий каталог — per-uid, `/tmp/s3vault-e2e-$(id -u)`, чтобы два пользователя на одной машине не ломали друг другу сборку бинаря и кэш.
+
+Если MinIO уже поднят (CI-сервис или чужой стенд), compose не трогается:
+
+```bash
+S3VAULT_E2E_NO_COMPOSE=1 ./scripts/e2e.sh all
+```
+
+Переопределяются через окружение: `S3VAULT_E2E_MINIO_API`, `S3VAULT_E2E_HTTP_PORT`, `S3VAULT_E2E_S3_PORT`, `S3VAULT_E2E_METRICS_PORT`, `S3VAULT_E2E_WORK`, `S3VAULT_E2E_RUN_ID`.
+
+Режим `encryption.mode=command` проверяется подменой `cryptcp` — скриптом `scripts/e2e/fakecryptcp`, который повторяет контракт настоящего `cryptcp` (argv, `CRYPTOPRO_THUMBPRINT` из env, ключевой материал из SHA-1 thumbprint), но **не является криптографией и не ГОСТ**. Он существует, чтобы проверить конвейер s3vault — argv без shell, roundtrip, ротацию ключа, — а не реализацию CryptoPro.
+
+Полезно знать при чтении тестов:
+
+- Ключ объекта = `s3.prefix` + путь **относительно сканируемого корня**. `archive /data/logs` над единственным `app.log` кладёт объект в `<prefix>/app.log`, а не `<prefix>/logs/app.log`.
+- Формат native-шифрования — `S3VCTR01 || S3VLT01 || chunks`: магия контейнера в начале объекта, магия шифротекста — сразу за 128-байтовым заголовком.
+- Идентичность читается из CRC-заголовка `S3VCTR01`, тело при `Head` не проверяется. Повреждённый AEAD-тег поэтому не мешает `archive` пройти как «идентичный» объект — порчу ловит только `download`. Это осознанный контракт (смена ключей не перезаливает неизменный plaintext), а не пропущенная проверка.
+- Клиент, ходящий через шлюз, включает свой `s3.prefix` в ключ объекта (`PutObject`), а шлюз добавляет свой `s3.prefix` общим корнем. Одинаковые префиксы у клиента и шлюза дают ключ с удвоением.
+- `--fail-fast` видно только при `--workers 1`. При 4 воркерах все файлы уже в полёте и падают заподряд, поэтому счётчик отказов одинаковый. Стенд проверяет обе стороны, чтобы отличие флагов не осталось на словах.
+- Приоритет флагов над окружением проверяется на `--prefix`: объект обязан лечь в `flagprefix/...`, а не в `$S3VAULT_S3_PREFIX/flagprefix/...`.
+
 ## HTTP-сервер
 
-`s3vault server` слушает `127.0.0.1:8080` по умолчанию и отдаёт **plaintext** через `Fetch.Materialize` + `http.ServeContent` (включая Range). По умолчанию диск-кэш **выключен** (`cache.enabled: false`) — на запрос создаётся временный файл и удаляется после ответа. С `cache.enabled: true` / `S3VAULT_CACHE_ENABLED=true` plaintext хранится в `cache.dir` (soft-TTL / SWR). Тот же процесс принимает **PUT** plaintext для архивации (шифрование CryptoPro/S3 — на сервере).
+Здесь `s3vault server` — это **шлюз** (см. «Режимы работы»): своего хранилища у него нет, он стоит перед хранилищем и сам ходит в него как клиент. Слушает `127.0.0.1:8080` по умолчанию. Единственный фронтенд данных — **S3-совместимый API** (SigV4, path-style): Get/Put/Delete/List через `Fetch`/`Archive` (и кэш, если включён). Список — только ListObjectsV2; запрос v1 (`list-type` ≠ 2 или `marker` без `list-type`) отклоняется с `501 NotImplemented`. Обычный HTTP-слушатель отдаёт только `/health` и `/ready`.
 
-Опционально — **S3-совместимый API** (SigV4, path-style): те же Get/Put/Delete/List через `Fetch`/`Archive` (и кэш, если включён).
-
-```bash
-export S3VAULT_SERVER_TOKEN=...   # обязателен, если listen не loopback (или включите S3 keys)
-s3vault server --listen 127.0.0.1:8080
-curl -H "Authorization: Bearer $S3VAULT_SERVER_TOKEN" http://127.0.0.1:8080/files/logs/app.log
-# ingest (клиент без CryptoPro):
-curl -X PUT -H "Authorization: Bearer $S3VAULT_SERVER_TOKEN" \
-  --data-binary @./app.log http://127.0.0.1:8080/files/logs/app.log
-```
-
-### Доступ извне: аутентификация обязательна
-
-По умолчанию сервер слушает loopback и стартует без токена. Как только `server.listen` смотрит наружу (`0.0.0.0:8080`, LAN-адрес и т.п.), процесс откажется стартовать, пока не настроен хотя бы один способ аутентификации:
-
-```text
-unauthenticated server on a non-loopback address: listen "0.0.0.0:8080" accepts remote clients,
-so set one of: server.token (env S3VAULT_SERVER_TOKEN) for the HTTP API,
-or both server.s3_access_key and server.s3_secret_key
-(env S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY) for the S3 API;
-or bind to 127.0.0.1 instead
-```
-
-Проверка касается только адреса прослушивания и не зависит от `backend.type` — на локальном бэкенде она ровно такая же. Любой из трёх вариантов снимает ошибку:
-
-```bash
-# 1) Bearer-токен для HTTP API /files
-export S3VAULT_SERVER_TOKEN='<длинная случайная строка>'
-
-# 2) или ключи S3-фасада (SigV4) — включают S3 API и одновременно закрывают bind
-export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
-export S3VAULT_SERVER_S3_SECRET_KEY=vaultsk
-
-# 3) или оставить сервер на loopback и ходить через reverse proxy / SSH-туннель
-s3vault server --listen 127.0.0.1:8080
-```
-
-Отдельно: если задан `server.s3_listen` (или `--s3-listen`), но ключи `server.s3_access_key` / `server.s3_secret_key` не заданы, сервер тоже не стартует — S3-фасад без ключей включить нельзя (`S3 API listen address without S3 credentials`). Уберите `s3_listen` или задайте пару ключей.
-
-### S3 API (aws-cli / SDK)
+S3-фасад **обязателен**: без пары `server.s3_access_key` / `server.s3_secret_key` процесс не стартует. Bearer-токен `server.token` и маршруты `HTTP /files` удалены — шлюз говорит с клиентами только по S3.
 
 ```bash
 export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
 export S3VAULT_SERVER_S3_SECRET_KEY=vaultsk
 # опционально отдельный порт: --s3-listen 127.0.0.1:8333
-# иначе multiplex на --listen (пути /health /ready /files остаются HTTP API)
+# иначе multiplex на --listen (/health /ready остаются HTTP-путями)
 s3vault server --listen 127.0.0.1:8080
 
 aws --endpoint-url http://127.0.0.1:8080 s3api list-objects-v2 --bucket my-bucket
@@ -476,30 +774,33 @@ aws --endpoint-url http://127.0.0.1:8080 s3 cp ./file s3://my-bucket/logs/file -
 # клиенту нужен path-style (UsePathStyle / s3ForcePathStyle)
 ```
 
+### Доступ извне
+
+Любой bind — и loopback, и внешний — требует ключей `server.s3_access_key` / `server.s3_secret_key` (env `S3VAULT_SERVER_S3_ACCESS_KEY` / `S3VAULT_SERVER_S3_SECRET_KEY`): это единственный фронтенд и единственный способ аутентификации. Без них старт падает с `S3 API credentials required`. Если внешний доступ не нужен, всё равно задайте пару ключей и ходите через reverse proxy / SSH-туннель. Если задан `server.s3_listen` (или `--s3-listen`) без ключей — старт тоже падает.
+
+### S3 API (aws-cli / SDK)
+
 Ключи `S3VAULT_SERVER_S3_*` — **frontend** (SigV4 к vault), не путать с `S3VAULT_S3_*` к backend storage. Virtual bucket: `server.s3_bucket` (по умолчанию = `s3.bucket`, а при локальном бэкенде без него — `s3vault`). При `server.s3_bucket_as_prefix` / `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` любое имя bucket в path-style URL допускается и становится префиксом ключа в backend (`s3://reports/a.log` → `{s3.prefix}/reports/a.log` в `s3.bucket`). Head/Get/Put отдают `x-amz-checksum-sha256` (base64 plaintext SHA-256). Multipart upload в v1 нет.
 
-На хосте **без** CryptoPro / S3-ключей:
+На хосте **без** CryptoPro / S3-ключей клиент указывает `s3.endpoint` **на фасад шлюза** и его frontend-ключи (см. «Режимы работы», топология B) — `download` читает тем же путём, отдельного канала записи нет.
 
-```bash
-export S3VAULT_REMOTE_URL=https://s3vault.example:8080
-export S3VAULT_SERVER_TOKEN=...          # тот же Bearer, что на сервере
-export S3VAULT_REMOTE_RATE_LIMIT_BPS=10485760  # опционально, суммарный лимит B/s
-s3vault archive /var/log/app --older-than 7d
-s3vault upload /var/log/app/app.log --key logs/app.log
-```
-
-- `GET`/`HEAD /files/{path...}` — тот же prefix, что у archive; путь не длиннее 2048.
-- `PUT /files/{path...}` — plaintext → identity/encrypt/Put на сервере; `201` uploaded, `200` identical skip, `204` policy omit (`on_change=skip`), `409` conflict (`on_change=fail`).
-- `GET /health` — процесс жив (без токена).
+- `GET /health` — процесс жив.
 - `GET /ready` — дешёвый HEAD в бэкенде хранения.
 - Prometheus: отдельный `server.metrics_listen` (по умолчанию `127.0.0.1:9090`), путь `/metrics`. Без меток с полным path. На `archive`/`upload`/`download` тот же endpoint можно поднять на время команды через `--metrics-listen`.
 - Кэш: по умолчанию выкл. (`cache.enabled` / `S3VAULT_CACHE_ENABLED`). Вкл.: каталог `0700`, файлы `0600`, id = SHA-256(namespace бэкенда, key, enc fingerprint). `s3vault cache stats` / `cache clear`.
-- Пустой `server.token` и bind не на loopback — процесс не стартует (достаточно S3 frontend keys, если включён S3 API). См. «Доступ извне: аутентификация обязательна».
+- Удалённые ключи (`remote.url`, `remote.rate_limit_bps`, `server.token`) отвергаются на старте — Viper молча игнорирует неизвестные ключи, поэтому устаревший ключ без этого guard’а тихо менял бы поведение.
 
 SIGTERM/SIGINT — graceful `Shutdown` (HTTP + optional S3 listen + metrics).
 
 ## Дальше
 
-GitHub Actions (`.github/workflows/go.yml`) уже есть: `go build -v ./...` + `go test -v ./...` на push/PR в `main`.
+CI настроен и живёт в `.github/workflows/`, всё на push/PR в `main`, кроме `release.yml` — он на тегах `v*`:
 
-Ещё нет: Docker-образа / compose и CI-джобы с MinIO; в CI не запускаются `-race`, golangci-lint, gosec, govulncheck; GoReleaser. Unit-тесты (включая `-race`) и integration против живого S3/MinIO гоняйте локально — см. «Тесты против живого S3».
+- `go.yml` — build, vet, `go test -race -shuffle=on -count=1`, gofmt, проверка `go.mod`/`go.sum` на tidiness; матрица `1.26` + `stable`;
+- `lint.yml` — golangci-lint; `security.yml` — govulncheck (гейт) и gosec (`continue-on-error`);
+- `integration.yml` и `e2e.yml` — свои MinIO-сервисы, бакет создаётся через awscli, сам код `CreateBucket` не зовёт;
+- `release.yml` + `.goreleaser.yml` — сборка и публикация по тегу.
+
+Две оговорки про обходные пути — это калибровка, а не недосмотр: `lint.yml` гоняется с `only-new-issues: true` (в дереве сотни давних находок, в основном `wsl_v5`, массово их править запрещено — новые всё равно роняют сборку), а `gosec` помечен `continue-on-error` по той же причине.
+
+Чего правда нет: Docker-образ **ни разу не собран** — у исполнителя не было доступа к docker daemon, так что проверялось только то, что проверяется без него. Первую `docker build` прогнать руками. Локально гоняются `make test`, `make e2e` и `make verify` — см. «Тесты против живого S3» и «E2E-стенд».
