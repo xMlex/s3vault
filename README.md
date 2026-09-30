@@ -346,7 +346,6 @@ s3vault server --s3-listen 127.0.0.1:8333
 | --- | --- |
 | `S3VAULT_BACKEND_TYPE` | Бэкенд хранения: `s3` (по умолчанию) или `local` |
 | `S3VAULT_BACKEND_LOCAL_DIR` | Директория объектов при `backend.type=local` |
-| `S3VAULT_BACKEND_LOCAL_LAYOUT` | `container` (по умолчанию) или `raw` (голый payload без `S3VCTR01`; только при `encryption.mode=none`) |
 | `S3VAULT_S3_ENDPOINT` | URL API. Пусто = AWS. Для MinIO: `http://s3.example:9000` |
 | `S3VAULT_S3_REGION` | Регион (для MinIO часто `us-east-1`) |
 | `S3VAULT_S3_BUCKET` | Бакет |
@@ -376,16 +375,17 @@ backend:
   type: local
   local:
     dir: /srv/s3vault/objects
-    # layout: container  # default — S3VCTR01 || payload (как в S3)
-    # layout: raw        # bare payload без контейнера (см. ниже)
 ```
+
+Форму объекта задаёт **только** `encryption.mode`, на любом бэкенде: `none` — голый
+payload без контейнера, `native`/`command` — `S3VCTR01` + payload. Отдельного ключа
+`backend.local.layout` больше нет, и оставшийся ключ отвергается на старте.
 
 То же самое только через окружение — YAML при этом не нужен вовсе:
 
 ```bash
 export S3VAULT_BACKEND_TYPE=local
 export S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
-# export S3VAULT_BACKEND_LOCAL_LAYOUT=raw
 export S3VAULT_S3_PREFIX=backups          # необязательно: общий префикс ключей
 
 s3vault archive /data/app --older-than 7d
@@ -394,13 +394,15 @@ s3vault download backups/app.log /tmp/app.log
 
 Как и для остальных настроек, приоритет прежний: флаги > `S3VAULT_*` > YAML > умолчания, так что `S3VAULT_BACKEND_TYPE=local` переопределяет `backend.type: s3` из файла.
 
-При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. По умолчанию (`layout: container`) формат объекта тот же, что в S3 (контейнер `S3VCTR01` + payload), поэтому шифрование, dedup по SHA-256, `download` и S3 SigV4-фасад работают одинаково на обоих бэкендах. Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
+При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. Бэкенд хранит байты ровно как их отдали, поэтому при одном и том же `encryption.mode` формат объекта совпадает с S3, и шифрование, dedup по SHA-256, `download` и S3 SigV4-фасад работают одинаково на обоих. Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
 
-`layout: raw` пишет **голый payload без заголовка `S3VCTR01`** — получается обычная директория с файлами. Это удобно, если содержимое каталога должны читать/писать другие инструменты или человек. Файлы при этом — чистый plaintext, поэтому `layout: raw` допускается **только вместе с `encryption.mode=none`**: заголовок `S3VCTR01` — единственное место, где хранится `enc`, и без него читатель не отличит шифртекст от plaintext. Комбинация `raw` + `native`/`command` отвергается на старте с явной ошибкой (иначе объект, зашифрованный одним режимом, читался бы `mode=none` как есть — тихий мусор).
+`encryption.mode: none` пишет **голый payload без заголовка `S3VCTR01`** — в каталоге (и в бакете) получаются обычные файлы. Это удобно, если содержимое должны читать/писать другие инструменты или человек, и верно на любом бэкенде, включая S3.
 
-Ограничения raw: нет content-hash → dedup/`skip` по SHA недоступен (повторная заливка перезаписывает); `ETag` синтетический, а `Head`/`x-amz-checksum-sha256` для raw — SHA-256 **хранимых байтов**. Объект без контейнера читается legacy-детекцией по магии; для raw-стора это ожидаемо (все объекты — plaintext) и логируется на уровне `debug`.
+Что из этого следует: без заголовка хранить `enc` некуда, но и не нужно — режим `none` по определению ничего не шифрует, поэтому payload всегда plaintext. Идентичность объекта едет в S3 user-metadata (`s3vault-sha256`, `s3vault-size`), а на локальном бэкенде выводится хешированием файла, поэтому dedup по SHA, `--delete-if-exists` и `x-amz-checksum-sha256` продолжают работать. `ETag` локального бэкенда остаётся синтетическим (размер + mtime) и используется только как fallback.
 
-Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime) и служит только fallback, а идентичность содержимого — plaintext SHA-256 из заголовка `S3VCTR01` (container) или SHA-256 файла (raw).
+Единственное место, где объект без контейнера читается «на глаз», — `decryptLegacy`: без заголовка нет `enc`, и остаётся magic/type-детекция. Она проверяет обе магии шифротекста (`S3VLT01` и конверт OpenSSL `Salted__`) и при совпадении **отказывается**, а не копирует мусор. Ложное срабатывание возможно только на 8-байтовом префиксе: plaintext-файл, начинающийся с `Salted__`, будет отвергнут с внятной ошибкой.
+
+Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime) и служит только fallback, а идентичность содержимого — plaintext SHA-256 из заголовка `S3VCTR01`, а для объекта без контейнера — SHA-256 самого файла, вычисляемый один раз на объект и мемоизируемый в процессе.
 
 Смена бэкенда меняет namespace дискового кэша, поэтому записи S3 и локального хранилища в кэше не пересекаются.
 
@@ -465,7 +467,7 @@ s3vault download backups/logs/app.log /tmp/app.log
 Первая строка лога любой команды, работающей с хранилищем (`archive`, `upload`, `download`, `server`), показывает выбранный бэкенд и куда именно пишутся объекты:
 
 ```text
-level=INFO msg="object store ready" op=backend backend=local dir=/srv/s3vault/objects layout=container prefix=backups
+level=INFO msg="object store ready" op=backend backend=local dir=/srv/s3vault/objects prefix=backups
 level=INFO msg="object store ready" op=backend backend=s3 bucket=my-bucket endpoint="" prefix=backups
 ```
 
@@ -473,11 +475,11 @@ level=INFO msg="object store ready" op=backend backend=s3 bucket=my-bucket endpo
 
 Режим задаётся `encryption.mode`. RSA **не** шифрует тело файла: только оборачивает случайный AES-ключ (envelope). Большие файлы идут потоком, чанками AES-256-GCM.
 
-Формат объекта: сначала фиксированный контейнер `S3VCTR01` (identity, enc, wrap, provider, thumbprint; +128 байт), затем payload. Native-шифрование внутри — magic `S3VLT01`. При `download` программа снимает контейнер и расшифровывает payload сама.
+Формат объекта зависит от `encryption.mode`. `native`/`command`: сначала фиксированный контейнер `S3VCTR01` (identity, enc, wrap, provider, thumbprint; +128 байт), затем payload; native-шифрование внутри — magic `S3VLT01`. `none`: только payload, без контейнера, а SHA-256 plaintext кладётся в user-metadata объекта. В обоих случаях `download` снимает свой слой сам.
 
-Identity и CryptoPro thumbprint берутся из `S3VCTR01` (на archive — Range GET первых 128 байт). S3 user-metadata на новых Put **не** пишется. Бэкенд должен поддерживать HTTP Range.
+Identity и CryptoPro thumbprint берутся из `S3VCTR01` (на archive — Range GET первых 128 байт). Исключение — `mode=none`: контейнера нет, и identity пишется в S3 user-metadata (`s3vault-sha256`, `s3vault-size`), который читается на `HEAD`. Для контейнерных объектов user-metadata по-прежнему не пишется. Бэкенд должен поддерживать HTTP Range.
 
-Один и тот же режим и те же ключи нужны на archive и на download. Режим читателя сверяется с полем `enc` контейнера `S3VCTR01`: если объект зашифрован одним режимом, а читатель настроен на другой, `download`/HTTP/S3-выдача завершаются ошибкой (`object requires encryption.mode=…`), а не отдают шифротекст или мусор. Объекты без контейнера (legacy) читаются как раньше — с предупреждением в лог.
+Объект без контейнера читается по magic/type-детекции, и громкость сообщения зависит от режима читателя: при `mode=none` это его собственная форма объекта (debug), при `native`/`command` — неожиданная (warn).
 
 ### `none` — без шифрования
 

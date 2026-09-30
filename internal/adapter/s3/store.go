@@ -101,6 +101,15 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, meta domain.Pu
 	if meta.ContentType != "" {
 		in.ContentType = aws.String(meta.ContentType)
 	}
+	// A containerless object has no header to carry its identity, so it travels
+	// in user-metadata instead. fillObjectMeta reads these keys back on HEAD,
+	// which is what identity.ResolveRemote and Decide consume.
+	if meta.PlaintextSHA256 != "" {
+		in.Metadata = map[string]string{
+			metaSHA256: meta.PlaintextSHA256,
+			metaSize:   strconv.FormatInt(meta.PlaintextSize, 10),
+		}
+	}
 	if _, err := s.put.Upload(ctx, in); err != nil {
 		return fmt.Errorf("put %s: %w", key, err)
 	}

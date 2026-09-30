@@ -394,7 +394,6 @@ func newDownloadCmd(state *runState) *cobra.Command {
 			defer stop()
 
 			return service.NewFetch(store, enc).WithMetrics(met).WithLogger(state.logger).
-				WithRawLayout(rawLocalLayout(state.cfg)).
 				Download(ctx, args[0], dest, cmd.OutOrStdout())
 		},
 	}
@@ -443,8 +442,7 @@ func newServerCmd(state *runState) *cobra.Command {
 			}
 
 			encFP := encrypt.Fingerprint(cfg.Encryption)
-			fetch := service.NewFetch(store, enc).WithMetrics(met).WithLogger(state.logger).
-				WithRawLayout(rawLocalLayout(cfg))
+			fetch := service.NewFetch(store, enc).WithMetrics(met).WithLogger(state.logger)
 			var disk port.PlaintextCache
 			if cfg.Cache.Enabled {
 				d, err := cache.New(cache.Options{
@@ -474,7 +472,11 @@ func newServerCmd(state *runState) *cobra.Command {
 				FollowSymlinks: cfg.Archive.FollowSymlinks,
 				Logger:         state.logger,
 			})
-			arch := service.NewArchive(scan, keys, store, enc, state.logger).WithMetrics(met)
+			// The gateway is a hop, not a leaf writer: it frames objects even at
+			// encryption.mode=none so the next reader can see that a layer was
+			// removed. See service.Archive.WithFraming.
+			arch := service.NewArchive(scan, keys, store, enc, state.logger).WithMetrics(met).
+				WithFraming(true)
 
 			var s3Handler http.Handler
 			if cfg.Server.S3APIEnabled() {
@@ -630,12 +632,6 @@ func startMetrics(listen string) (*metrics.Collector, func(), error) {
 	return m, stop, nil
 }
 
-// rawLocalLayout reports whether the local backend stores bare payloads without
-// the S3VCTR01 container, so containerless reads are expected rather than anomalous.
-func rawLocalLayout(cfg config.Config) bool {
-	return cfg.Backend.Type == config.BackendLocal && cfg.Backend.Local.Layout == config.LocalLayoutRaw
-}
-
 // newObjectStore builds the backend selected by backend.type and logs where
 // objects live. The returned closer releases backend resources and is always
 // safe to call.
@@ -649,7 +645,7 @@ func newObjectStore(ctx context.Context, cfg config.Config, log *slog.Logger) (p
 			return nil, nil, err
 		}
 		log.Info("object store ready", "op", "backend", "backend", config.BackendLocal,
-			"dir", store.Dir(), "layout", store.Layout(), "prefix", cfg.KeyPrefix())
+			"dir", store.Dir(), "prefix", cfg.KeyPrefix())
 		return store, func() { _ = store.Close() }, nil
 	}
 	store, err := s3store.New(ctx, cfg.S3)
@@ -662,7 +658,8 @@ func newObjectStore(ctx context.Context, cfg config.Config, log *slog.Logger) (p
 }
 
 // newArchiveService builds archive/upload with a local backend store plus
-// encryptor. The returned closer releases the store.
+// encryptor. The returned closer releases the store. No framing: this is the
+// leaf client path, where encryption.mode alone decides the object shape.
 func newArchiveService(ctx context.Context, state *runState, cfg config.Config, keys keying.Mapper, dryRun bool) (*service.Archive, func(), error) {
 	noop := func() {}
 	scan := scanner.New(scanner.Options{

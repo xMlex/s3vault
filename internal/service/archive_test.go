@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -31,7 +32,6 @@ type memStore struct {
 	meta           map[string]domain.ObjectMeta
 	body           map[string][]byte
 	omitMetaOnHead bool // simulate S3 that strips user-metadata
-	plaintext      bool // StoresPlaintext: bare payload, no container header
 	rangeCalls     int
 }
 
@@ -58,7 +58,10 @@ func (m *memStore) Head(_ context.Context, key string) (domain.ObjectMeta, error
 	return meta, nil
 }
 
-func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ domain.PutMeta) error {
+// Put models the real store contract: the writer declares the object's shape, so
+// identity comes from PutMeta for a containerless object and from the body
+// header for a container one. Nothing is inferred from the payload's own bytes.
+func (m *memStore) Put(_ context.Context, key string, r io.Reader, meta domain.PutMeta) error {
 	b, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -68,7 +71,11 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ domain.PutM
 		Exists: true,
 		Size:   int64(len(b)),
 	}
-	if len(b) >= container.HeaderSize && container.IsMagic(b) {
+	switch {
+	case meta.PlaintextSHA256 != "":
+		om.SHA256 = meta.PlaintextSHA256
+		om.ContentSize = meta.PlaintextSize
+	case len(b) >= container.HeaderSize && container.IsMagic(b):
 		if hdr, err := container.Parse(b[:container.HeaderSize]); err == nil {
 			om.SHA256 = hdr.SHA256Hex()
 			om.ContentSize = hdr.PlaintextSize
@@ -124,8 +131,6 @@ func (m *memStore) Delete(_ context.Context, key string) error {
 	delete(m.meta, key)
 	return nil
 }
-
-func (m *memStore) StoresPlaintext() bool { return m.plaintext }
 
 func (m *memStore) List(_ context.Context, opts domain.ListOptions) (domain.ListPage, error) {
 	m.mu.Lock()
@@ -186,12 +191,10 @@ func TestArchiveUploadAndSkip(t *testing.T) {
 	assert.Equal(t, 1, st.Found)
 
 	body := store.body["pre/a.log"]
-	require.True(t, len(body) >= container.HeaderSize)
-	assert.True(t, container.IsMagic(body))
-	hdr, err := container.Parse(body[:container.HeaderSize])
-	require.NoError(t, err)
-	assert.Equal(t, container.EncNone, hdr.Enc)
-	assert.Equal(t, []byte("payload"), body[container.HeaderSize:])
+	assert.Equal(t, []byte("payload"), body,
+		"encryption.mode=none writes the bare payload, no S3VCTR01")
+	assert.Equal(t, sumHex([]byte("payload")), store.meta["pre/a.log"].SHA256,
+		"the writer declares the digest, so content-skip still works")
 
 	st, err = svc.Run(context.Background(), opts)
 	require.NoError(t, err)
@@ -199,6 +202,50 @@ func TestArchiveUploadAndSkip(t *testing.T) {
 	assert.Equal(t, 1, st.Skipped)
 }
 
+// An encrypting mode wraps, and identity travels in the header.
+func TestArchiveUploadAndSkipEncryptingMode(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	p := filepath.Join(root, "a.log")
+	require.NoError(t, os.WriteFile(p, []byte("payload"), 0o600))
+
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(p, old, old))
+
+	store := newMemStore()
+	svc := service.NewArchive(
+		scanner.New(scanner.Options{}),
+		keying.Mapper{Prefix: "pre"},
+		store,
+		&namedEncryptor{name: "native"},
+		nil,
+	)
+	opts := service.ArchiveOptions{
+		Root:      root,
+		OlderThan: time.Hour,
+		Workers:   1,
+	}
+	st, err := svc.Run(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, 1, st.Uploaded)
+
+	body := store.body["pre/a.log"]
+	require.GreaterOrEqual(t, len(body), container.HeaderSize)
+	require.True(t, container.IsMagic(body))
+	hdr, err := container.Parse(body[:container.HeaderSize])
+	require.NoError(t, err)
+	assert.Equal(t, container.EncNative, hdr.Enc)
+	assert.Equal(t, []byte("payload"), body[container.HeaderSize:])
+	assert.Equal(t, sumHex([]byte("payload")), store.meta["pre/a.log"].SHA256)
+
+	st, err = svc.Run(context.Background(), opts)
+	require.NoError(t, err)
+	assert.Equal(t, 0, st.Uploaded)
+	assert.Equal(t, 1, st.Skipped)
+}
+
+// The range peek is how identity is recovered when HEAD carries no digest, so
+// a container object must still skip with metadata omitted on Head.
 func TestArchiveSkipViaContainerWithoutMetadata(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -213,7 +260,7 @@ func TestArchiveSkipViaContainerWithoutMetadata(t *testing.T) {
 		scanner.New(scanner.Options{}),
 		keying.Mapper{Prefix: "pre"},
 		store,
-		encrypt.Passthrough{},
+		&namedEncryptor{name: "native"},
 		nil,
 	)
 	opts := service.ArchiveOptions{
@@ -229,7 +276,10 @@ func TestArchiveSkipViaContainerWithoutMetadata(t *testing.T) {
 	assert.Equal(t, 1, st.Skipped)
 }
 
-func TestArchivePlaintextStoreSkipsHashAndRangePeek(t *testing.T) {
+// A containerless object declares its digest in PutMeta, so it content-skips
+// like a container object does. Before the digest moved into PutMeta a
+// containerless object could never be compared and every run re-uploaded.
+func TestArchiveContainerlessContentSkips(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	p := filepath.Join(root, "a.log")
@@ -238,7 +288,6 @@ func TestArchivePlaintextStoreSkipsHashAndRangePeek(t *testing.T) {
 	require.NoError(t, os.Chtimes(p, old, old))
 
 	store := newMemStore()
-	store.plaintext = true
 	svc := service.NewArchive(
 		scanner.New(scanner.Options{}),
 		keying.Mapper{Prefix: "pre"},
@@ -253,17 +302,45 @@ func TestArchivePlaintextStoreSkipsHashAndRangePeek(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, st.Uploaded)
 	assert.Equal(t, []byte("payload"), store.body["pre/a.log"],
-		"plaintext store receives bare payload, no S3VCTR01")
-	assert.Zero(t, store.rangeCalls, "plaintext store must not range-peek for a header")
+		"encryption.mode=none writes the bare payload, no S3VCTR01")
 
-	// A rerun has no remote content hash to compare, so it re-uploads rather
-	// than content-skipping (archive.on_change was removed; there is no
-	// "skip because we cannot compare" policy any more).
 	st, err = svc.Run(context.Background(), opts)
 	require.NoError(t, err)
+	assert.Equal(t, 0, st.Uploaded)
+	assert.Equal(t, 1, st.Skipped, "identical content must skip, not re-upload")
+}
+
+// Changing the content under the same key must overwrite, whatever the shape.
+func TestArchiveContainerlessOverwritesChangedContent(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	p := filepath.Join(root, "a.log")
+	require.NoError(t, os.WriteFile(p, []byte("first"), 0o600))
+
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(p, old, old))
+
+	store := newMemStore()
+	svc := service.NewArchive(
+		scanner.New(scanner.Options{}),
+		keying.Mapper{Prefix: "pre"},
+		store,
+		encrypt.Passthrough{},
+		nil,
+	)
+	opts := service.ArchiveOptions{
+		Root: root, OlderThan: time.Hour, Workers: 1,
+	}
+	_, err := svc.Run(context.Background(), opts)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(p, []byte("second"), 0o600))
+	require.NoError(t, os.Chtimes(p, old, old))
+
+	st, err := svc.Run(context.Background(), opts)
+	require.NoError(t, err)
 	assert.Equal(t, 1, st.Uploaded)
-	assert.Zero(t, st.Skipped)
-	assert.Zero(t, store.rangeCalls)
+	assert.Equal(t, []byte("second"), store.body["pre/a.log"])
 }
 
 func TestArchiveRequiresBackend(t *testing.T) {
@@ -317,8 +394,25 @@ func TestArchiveUploadRejectsBadSHA(t *testing.T) {
 
 type badThumbEncryptor struct{ encrypt.Passthrough }
 
+func (badThumbEncryptor) Name() string                { return "command" }
 func (badThumbEncryptor) CryptoProThumbprint() string { return "not-hex" }
 
+// namedEncryptor reports an encryption mode while copying bytes unchanged, so a
+// test can exercise the wrapping path without a real cipher.
+type namedEncryptor struct {
+	encrypt.Passthrough
+	name string
+}
+
+func (e *namedEncryptor) Name() string { return e.name }
+
+func sumHex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// The thumbprint belongs to a command-mode layer, so it is only validated where
+// such a layer is actually written.
 func TestArchiveUploadRejectsBadThumbprint(t *testing.T) {
 	t.Parallel()
 	p := filepath.Join(t.TempDir(), "thumb.bin")

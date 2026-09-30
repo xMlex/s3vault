@@ -20,8 +20,18 @@ type ObjectMeta struct {
 	Exists              bool
 }
 
-// PutMeta is optional upload hints (Content-Type). Identity lives in the
-// S3VCTR01 body header, not in S3 user-metadata.
+// PutMeta carries upload hints and the plaintext identity of a containerless
+// object. Identity for a container object lives in the S3VCTR01 body header;
+// without a container there is nowhere to put it in the body, so it travels in
+// PutMeta and the store exposes it on HEAD (S3 user-metadata).
 type PutMeta struct {
 	ContentType string
+	// PlaintextSHA256 is the hex digest of the plaintext payload, set only when
+	// the object is written without a container (encryption.mode=none). Empty for
+	// container objects, whose header already carries it.
+	PlaintextSHA256 string
+	// PlaintextSize is the plaintext payload length, the same two values the
+	// container header would carry. Used by identity.Decide to reject a digest
+	// match against an object of a different size.
+	PlaintextSize int64
 }

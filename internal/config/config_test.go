@@ -35,52 +35,33 @@ func TestBackendLocal(t *testing.T) {
 	cfg, err := Load(v)
 	require.NoError(t, err)
 	assert.Equal(t, BackendLocal, cfg.Backend.Type)
-	assert.Equal(t, LocalLayoutContainer, cfg.Backend.Local.Layout)
 	assert.True(t, filepath.IsAbs(cfg.Backend.Local.Dir), "dir is resolved to an absolute path")
 	assert.Equal(t, "local:"+cfg.Backend.Local.Dir, cfg.CacheNamespace())
 }
 
-func TestBackendLocalRawLayout(t *testing.T) {
+// backend.local.layout is gone: encryption.mode alone decides the object shape.
+// A stale key would be ignored by viper, so it must be named at startup instead
+// of silently changing what gets written.
+func TestBackendLocalLayoutRemoved(t *testing.T) {
 	t.Parallel()
+
 	v := viper.New()
 	SetDefaults(v)
 	v.Set("backend.type", "local")
 	v.Set("backend.local.dir", "objects")
-	v.Set("backend.local.layout", " RAW ")
-	cfg, err := Load(v)
-	require.NoError(t, err)
-	assert.Equal(t, LocalLayoutRaw, cfg.Backend.Local.Layout)
-}
+	v.Set("backend.local.layout", "raw")
 
-// layout=raw drops the S3VCTR01 header, so it cannot carry the enc marker and
-// must not be combined with encryption: refuse at load (problems.md P1-legacy).
-func TestBackendLocalRawRejectsEncryption(t *testing.T) {
-	t.Parallel()
-
-	for _, mode := range []string{"native", "command"} {
-		t.Run(mode, func(t *testing.T) {
-			t.Parallel()
-
-			v := viper.New()
-			SetDefaults(v)
-			v.Set("backend.type", "local")
-			v.Set("backend.local.dir", "objects")
-			v.Set("backend.local.layout", "raw")
-			v.Set("encryption.mode", mode)
-
-			_, err := Load(v)
-			require.ErrorContains(t, err, "cannot be combined with encryption.mode")
-		})
-	}
+	_, err := Load(v)
+	require.ErrorContains(t, err, "backend.local.layout")
+	require.ErrorContains(t, err, "encryption.mode=none writes the bare payload")
 }
 
 func TestBackendInvalid(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]map[string]any{
-		"unknown type":         {"backend.type": "gcs"},
-		"local without dir":    {"backend.type": "local"},
-		"unknown local layout": {"backend.type": "local", "backend.local.dir": "objects", "backend.local.layout": "mirror"},
+		"unknown type":      {"backend.type": "gcs"},
+		"local without dir": {"backend.type": "local"},
 	}
 	for name, values := range tests {
 		t.Run(name, func(t *testing.T) {

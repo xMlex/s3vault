@@ -33,9 +33,6 @@ type Fetch struct {
 	reval   singleflight.Group
 	metrics *metrics.Collector
 	logger  *slog.Logger
-	// rawLayout downgrades the containerless legacy read warning to debug: for a
-	// layout=raw store, objects without an S3VCTR01 container are expected.
-	rawLayout bool
 }
 
 // CachedPlaintext is a decrypted object on disk ready for http.ServeContent.
@@ -63,8 +60,8 @@ func NewFetch(store port.ObjectStore, enc port.Encryptor) *Fetch {
 	return &Fetch{store: store, enc: enc, logger: slog.Default()}
 }
 
-// WithLogger attaches a logger used for legacy objects without an S3VCTR01
-// container. A nil logger is ignored.
+// WithLogger attaches a logger used for reads of objects that arrive without an
+// S3VCTR01 container. A nil logger is ignored.
 func (f *Fetch) WithLogger(l *slog.Logger) *Fetch {
 	if l != nil {
 		f.logger = l
@@ -95,14 +92,6 @@ func (f *Fetch) WithMetrics(m *metrics.Collector) *Fetch {
 	return f
 }
 
-// WithRawLayout marks the backing store as layout=raw, where objects have no
-// S3VCTR01 container by design. The legacy containerless read warning is then
-// logged at debug instead of warn.
-func (f *Fetch) WithRawLayout(raw bool) *Fetch {
-	f.rawLayout = raw
-	return f
-}
-
 type countWriter struct {
 	w io.Writer
 	n int64
@@ -125,6 +114,10 @@ func (f *Fetch) recordDownload(started time.Time, n int64, err error) {
 }
 
 // Download writes key to dest. dest "-" writes to stdout.
+//
+// Download is a client read: the last hop on the path. It removes its own layer
+// and refuses a layer it cannot, because handing the caller a file that still
+// carries a container is the one unacceptable outcome.
 func (f *Fetch) Download(ctx context.Context, key, dest string, stdout io.Writer) error {
 	started := time.Now()
 	n, err := f.download(ctx, key, dest, stdout)
@@ -444,12 +437,18 @@ func unwrapForDecrypt(ctx context.Context, body io.Reader, meta domain.ObjectMet
 	return encrypt.WithCryptoProThumbprint(ctx, tp), payload, objEnc, ok, nil
 }
 
-// warnLegacy flags reads of objects that predate the S3VCTR01 envelope, where
-// the payload encryption is unknown and detection falls back to magic/type.
-// For a layout=raw store this is the normal shape, so it logs at debug.
+// warnLegacy flags a read of an object that arrives without an S3VCTR01
+// container, where the payload encryption is not declared by a header.
+//
+// encryption.mode is the same source of truth the write path uses: mode=none
+// writes containerless objects itself, so for such a reader the shape is its own
+// normal output and is logged at debug. For an encrypting reader the shape is
+// unexpected — it means the object was written by a process that does not
+// encrypt, or its container was lost — and the read falls back to magic/type
+// detection, which stays a warn.
 func (f *Fetch) warnLegacy(key string) {
-	if f.rawLayout {
-		f.logger.Debug("object has no S3VCTR01 container (layout=raw); using magic/type detection",
+	if encryptName(f.enc) == "none" {
+		f.logger.Debug("object has no S3VCTR01 container (encryption.mode=none writes none); using magic/type detection",
 			slog.String("key", key))
 
 		return

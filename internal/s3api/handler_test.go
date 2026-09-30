@@ -56,7 +56,10 @@ func (m *memStore) Head(_ context.Context, key string) (domain.ObjectMeta, error
 	return meta, nil
 }
 
-func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ domain.PutMeta) error {
+// Put models the real store contract for identity: a container carries it in the
+// body header, a containerless object in PutMeta (the S3 adapter persists it as
+// user-metadata, the local store derives it from the file).
+func (m *memStore) Put(_ context.Context, key string, r io.Reader, meta domain.PutMeta) error {
 	b, err := io.ReadAll(r)
 	if err != nil {
 		return err
@@ -68,7 +71,11 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, _ domain.PutM
 		ETag:         `"etag-` + key + `"`,
 		LastModified: time.Unix(1_700_000_000, 0).UTC(),
 	}
-	if len(b) >= container.HeaderSize && container.IsMagic(b) {
+	switch {
+	case meta.PlaintextSHA256 != "":
+		om.SHA256 = meta.PlaintextSHA256
+		om.ContentSize = meta.PlaintextSize
+	case len(b) >= container.HeaderSize && container.IsMagic(b):
 		if hdr, err := container.Parse(b[:container.HeaderSize]); err == nil {
 			om.SHA256 = hdr.SHA256Hex()
 			om.ContentSize = hdr.PlaintextSize

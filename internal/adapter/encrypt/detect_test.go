@@ -130,30 +130,35 @@ func TestDecryptAutoRefusesCommandMismatchWithRealCommand(t *testing.T) { //noli
 
 // TestDecryptAutoLegacy pins the no-container path: without an S3VCTR01 header
 // there is no enc, so the local encryptor's type and the payload magic decide.
-// Behaviour is deliberately unchanged for backward compatibility.
+// encryption.mode=none writes such objects itself, so the copy path is the
+// common case — and the two ciphertext shapes must still fail loudly rather than
+// be copied out as plaintext.
 func TestDecryptAutoLegacy(t *testing.T) {
 	t.Parallel()
 
 	nativeCiphertext := append([]byte(magicV1), []byte("native-aead-body")...)
-	commandCiphertext := append([]byte("Salted__"), []byte("openssl-ciphertext-body")...)
+	commandCiphertext := append([]byte(opensslMagic), []byte("openssl-ciphertext-body")...)
 
 	tests := []struct {
-		name        string
-		reader      port.Encryptor
-		input       []byte
-		wantErr     bool
-		wantDecrypt bool
+		name           string
+		reader         port.Encryptor
+		input          []byte
+		wantErr        string
+		wantErrContain string
+		wantDecrypt    bool
 	}{
 		{
-			name:    "none reader refuses native magic",
-			reader:  Passthrough{},
-			input:   nativeCiphertext,
-			wantErr: true,
+			name:           "none reader refuses native magic",
+			reader:         Passthrough{},
+			input:          nativeCiphertext,
+			wantErr:        "object is encrypted",
+			wantErrContain: "encryption.mode=native",
 		},
 		{
-			name:   "none reader copies command ciphertext verbatim (legacy limit)",
-			reader: Passthrough{},
-			input:  commandCiphertext,
+			name:           "none reader refuses openssl envelope",
+			reader:         Passthrough{},
+			input:          commandCiphertext,
+			wantErrContain: "encryption.mode=command",
 		},
 		{
 			name:   "none reader copies arbitrary plaintext",
@@ -161,10 +166,24 @@ func TestDecryptAutoLegacy(t *testing.T) {
 			input:  []byte("just some plaintext"),
 		},
 		{
+			// An 8-byte prefix is not proof of ciphertext, so a plaintext file
+			// that happens to start this way is refused too. A loud error the
+			// operator can act on beats a corrupt file with exit code 0.
+			name:           "none reader refuses plaintext starting with the openssl marker",
+			reader:         Passthrough{},
+			input:          append([]byte(opensslMagic), []byte(" but actually a config file")...),
+			wantErrContain: "cannot be read as plaintext",
+		},
+		{
 			name:        "native reader decrypts native magic",
 			reader:      &fakeEncryptor{name: "native"},
 			input:       nativeCiphertext,
 			wantDecrypt: true,
+		},
+		{
+			name:   "native reader copies plaintext",
+			reader: &fakeEncryptor{name: "native"},
+			input:  []byte("just some plaintext"),
 		},
 	}
 
@@ -176,8 +195,15 @@ func TestDecryptAutoLegacy(t *testing.T) {
 
 			err := DecryptAuto(context.Background(), tt.reader, "", &dst, bytes.NewReader(tt.input))
 
-			if tt.wantErr {
-				require.ErrorContains(t, err, "object is encrypted")
+			if tt.wantErr != "" || tt.wantErrContain != "" {
+				require.Error(t, err)
+
+				if tt.wantErr != "" {
+					require.ErrorContains(t, err, tt.wantErr)
+				}
+
+				require.ErrorContains(t, err, tt.wantErrContain)
+				assert.Empty(t, dst.String(), "a refused read must not emit bytes")
 				return
 			}
 

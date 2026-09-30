@@ -40,18 +40,9 @@ type BackendConfig struct {
 	Local LocalConfig `mapstructure:"local"`
 }
 
-// Local filesystem object layouts for LocalConfig.Layout.
-const (
-	LocalLayoutContainer = "container" // S3VCTR01 || payload (S3-parity default)
-	// LocalLayoutRaw stores the bare payload without S3VCTR01, so it carries no
-	// enc marker and is only valid with encryption.mode=none (see Normalize).
-	LocalLayoutRaw = "raw"
-)
-
 // LocalConfig configures the local filesystem object store.
 type LocalConfig struct {
-	Dir    string `mapstructure:"dir"`
-	Layout string `mapstructure:"layout"` // container | raw
+	Dir string `mapstructure:"dir"`
 }
 
 type S3Config struct {
@@ -130,7 +121,6 @@ type ArchiveConfig struct {
 func SetDefaults(v *viper.Viper) {
 	v.SetDefault("log.level", "info")
 	v.SetDefault("backend.type", BackendS3)
-	v.SetDefault("backend.local.layout", LocalLayoutContainer)
 	v.SetDefault("s3.region", "us-east-1")
 	v.SetDefault("encryption.mode", "none")
 	v.SetDefault("encryption.native.wrap", "rsa-oaep")
@@ -158,7 +148,6 @@ var envKeys = []string{
 	"log.level",
 	"backend.type",
 	"backend.local.dir",
-	"backend.local.layout",
 	"s3.endpoint",
 	"s3.region",
 	"s3.bucket",
@@ -235,6 +224,7 @@ var removedKeys = []struct{ key, hint string }{
 	{"remote.rate_limit_bps", "remote HTTP ingest was removed; there is no S3-path bandwidth limiter"},
 	{"server.token", "the bearer HTTP /files frontend was removed; authenticate to the gateway with server.s3_access_key/server.s3_secret_key (SigV4)"},
 	{"archive.on_change", "the overwrite/skip/fail switch was removed: an upload with differing content is now always written. It was a single global policy read by archive, upload and server alike, which let the gateway answer 200 while discarding the uploaded body (docs/reliability-review.md H2). If you need a per-run policy, add it as an archive-command flag"},
+	{"backend.local.layout", "the container/raw switch was removed: encryption.mode alone decides the object shape, on every backend. encryption.mode=none writes the bare payload, native/command write the S3VCTR01 container. Delete the key"},
 }
 
 // CheckRemovedKeys returns an error if any key removed from the schema is still
@@ -274,17 +264,11 @@ func (c *Config) Normalize() error {
 	default:
 		return fmt.Errorf("encryption.mode: unknown value %q", c.Encryption.Mode)
 	}
-	// layout=raw drops the S3VCTR01 header, which is the only place the object's
-	// enc mode lives. Without it a reader cannot tell ciphertext from plaintext,
-	// so the refusal-on-mismatch guard has nothing to compare against. Refuse the
-	// combination at startup instead of silently copying ciphertext (problems.md
-	// P1-legacy): raw = bare plaintext files, encryption requires the container.
-	if c.Backend.Type == BackendLocal && c.Backend.Local.Layout == LocalLayoutRaw && c.Encryption.Mode != "none" {
-		return fmt.Errorf(
-			"backend.local.layout %q stores bare payload without the S3VCTR01 enc marker and cannot be combined with encryption.mode=%q; use layout %q for encryption, or encryption.mode=none",
-			LocalLayoutRaw, c.Encryption.Mode, LocalLayoutContainer,
-		)
-	}
+	// encryption.mode is the single source of truth for the object shape: mode=none
+	// writes the bare payload with no S3VCTR01 container, every other mode wraps.
+	// There is no layout switch, so there is no combination to reject here — a
+	// containerless object is only ever produced by a process that does not
+	// encrypt, and its payload is therefore plaintext by construction.
 	c.Encryption.Command.Provider = strings.ToLower(strings.TrimSpace(c.Encryption.Command.Provider))
 	if c.Encryption.Mode == "command" && c.Encryption.Command.Provider == "" {
 		c.Encryption.Command.Provider = "cryptopro"
@@ -313,16 +297,6 @@ func (c *Config) normalizeBackend() error {
 			return fmt.Errorf("backend.local.dir: %w", err)
 		}
 		c.Backend.Local.Dir = abs
-		layout := strings.ToLower(strings.TrimSpace(c.Backend.Local.Layout))
-		if layout == "" {
-			layout = LocalLayoutContainer
-		}
-		switch layout {
-		case LocalLayoutContainer, LocalLayoutRaw:
-			c.Backend.Local.Layout = layout
-		default:
-			return fmt.Errorf("backend.local.layout: unknown value %q", c.Backend.Local.Layout)
-		}
 	default:
 		return fmt.Errorf("backend.type: unknown value %q", c.Backend.Type)
 	}

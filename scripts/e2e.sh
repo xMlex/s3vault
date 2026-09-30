@@ -359,12 +359,12 @@ phase_cli() {
 	assert_eq "dry-run: found=1, uploaded=0" \
 		"$(stat_field "$out" found)/$(stat_field "$out" uploaded)" "1/0"
 
-	# Первый прогон — upload, второй — skip по идентичности из S3VCTR01.
+	# Первый прогон — upload, второй — skip по идентичности объекта.
 	out=$(vault archive "$src/arch" --older-than 1d --output json 2>/dev/null)
 	assert_eq "archive #1: uploaded=1 skipped=0" \
 		"$(stat_field "$out" uploaded)/$(stat_field "$out" skipped)" "1/0"
 	out=$(vault archive "$src/arch" --older-than 1d --output json 2>/dev/null)
-	assert_eq "archive #2: skip по идентичности контейнера" \
+	assert_eq "archive #2: skip по идентичности объекта" \
 		"$(stat_field "$out" uploaded)/$(stat_field "$out" skipped)" "0/1"
 
 	assert_ok "объект archive лежит в $PREFIX/hello.txt" s3_head_raw "$PREFIX/hello.txt"
@@ -419,11 +419,18 @@ phase_cli() {
 	assert_same_bytes "download совпадает с исходником" "$src/arch/hello.txt" "$WORK/out-cli.bin"
 	assert_eq "download в stdout" "$(vault download "$PREFIX/hello.txt" - 2>/dev/null)" "s3vault e2e payload"
 
-	# Контейнер: магия S3VCTR01 + 128-байтовый заголовок перед payload.
+	# encryption.mode=none — голый payload, без контейнера S3VCTR01.
 	s3_get_raw "$PREFIX/hello.txt" "$WORK/raw-cli.bin"
-	assert_eq "S3VCTR01 в теле объекта" "$(head -c 8 "$WORK/raw-cli.bin")" "S3VCTR01"
-	assert_eq "размер объекта = 128 + payload" \
-		"$(wc -c <"$WORK/raw-cli.bin")" "$((128 + $(wc -c <"$src/arch/hello.txt")))"
+	assert_ne "mode=none: в теле объекта нет магии контейнера" \
+		"$(head -c 8 "$WORK/raw-cli.bin")" "S3VCTR01"
+	assert_eq "mode=none: размер объекта = payload" \
+		"$(wc -c <"$WORK/raw-cli.bin")" "$(wc -c <"$src/arch/hello.txt")"
+
+	# Повтор того же контента при mode=none обязан скипнуть по хешу: идентичность
+	# containerless-объекта едет в user-metadata, а не в заголовке.
+	out=$(vault archive "$src/arch" --older-than 1d --output json 2>/dev/null)
+	assert_eq "mode=none: повтор -> skipped=1" "$(stat_field "$out" skipped)" "1"
+	assert_eq "mode=none: повтор -> uploaded=0" "$(stat_field "$out" uploaded)" "0"
 
 	# --- перезапись по ключу: один ключ, меняющееся содержимое ---
 	printf 'single upload\n' >"$src/pol/one.txt"
@@ -756,7 +763,7 @@ phase_facade() {
 # ---------------------------------------------------------------- local ---
 
 phase_local() {
-	log "Локальный бэкенд: container и raw (MinIO не нужен)"
+	log "Локальный бэкенд: контейнер при шифровании, raw при mode=none (MinIO не нужен)"
 	local src="$WORK/src-local"
 	rm -rf "$src"
 	mkdir -p "$src/loc"
@@ -764,42 +771,49 @@ phase_local() {
 	touch -d '2020-01-01T00:00:00Z' "$src/loc/a.txt"
 	head -c 32 /dev/urandom >"$WORK/kek-local.bin"
 
-	local container="$WORK/store-container" raw="$WORK/store-raw" rc=0 out
-	rm -rf "$container" "$raw"
+	local none="$WORK/store-none" enc="$WORK/store-enc" rc=0 out
+	rm -rf "$none" "$enc"
 	local base=(S3VAULT_BACKEND_TYPE=local S3VAULT_S3_ENDPOINT=)
+	local native=(
+		S3VAULT_ENCRYPTION_MODE=native
+		S3VAULT_ENCRYPTION_NATIVE_WRAP=keyfile
+		S3VAULT_ENCRYPTION_NATIVE_KEY_FILE="$WORK/kek-local.bin"
+	)
 
-	# container — S3VCTR01 || payload, как в S3.
-	out=$(vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$container" \
+	# mode=none — голый payload, контейнера нет, и это относится к любому бэкенду.
+	out=$(vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$none" \
 		upload "$src/loc/a.txt" --key loc/a.txt --output json 2>/dev/null)
-	assert_eq "local container: uploaded=1" "$(stat_field "$out" uploaded)" "1"
-	assert_eq "local container: магия S3VCTR01" "$(head -c 8 "$container/$PREFIX/loc/a.txt")" "S3VCTR01"
+	assert_eq "local none: uploaded=1" "$(stat_field "$out" uploaded)" "1"
+	assert_eq "local none: файл = plaintext без заголовка" "$(cat "$none/$PREFIX/loc/a.txt")" "local payload"
 
-	out=$(vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$container" \
+	# Тот же контент скипается по хешу из user-metadata/derived digest.
+	out=$(vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$none" \
 		upload "$src/loc/a.txt" --key loc/a.txt --output json 2>/dev/null)
-	assert_eq "local container: повтор -> skipped=1" "$(stat_field "$out" skipped)" "1"
+	assert_eq "local none: повтор -> skipped=1" "$(stat_field "$out" skipped)" "1"
 
-	vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$container" \
-		download "$PREFIX/loc/a.txt" "$WORK/local-container.out"
-	assert_same_bytes "local container roundtrip" "$src/loc/a.txt" "$WORK/local-container.out"
+	vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$none" \
+		download "$PREFIX/loc/a.txt" "$WORK/local-none.out"
+	assert_same_bytes "local none roundtrip" "$src/loc/a.txt" "$WORK/local-none.out"
 
-	# raw (mode=none) — payload без контейнера, чистый plaintext.
-	out=$(vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$raw" S3VAULT_BACKEND_LOCAL_LAYOUT=raw \
+	# native — S3VCTR01 || S3VLT01, контейнер обязателен.
+	out=$(vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$enc" "${native[@]}" \
 		upload "$src/loc/a.txt" --key loc/a.txt --output json 2>/dev/null)
-	assert_eq "local raw: uploaded=1" "$(stat_field "$out" uploaded)" "1"
-	assert_eq "local raw: файл = plaintext без заголовка" "$(cat "$raw/$PREFIX/loc/a.txt")" "local payload"
+	assert_eq "local native: uploaded=1" "$(stat_field "$out" uploaded)" "1"
+	assert_eq "local native: магия S3VCTR01" "$(head -c 8 "$enc/$PREFIX/loc/a.txt")" "S3VCTR01"
 
-	vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$raw" S3VAULT_BACKEND_LOCAL_LAYOUT=raw \
-		download "$PREFIX/loc/a.txt" "$WORK/local-raw.out"
-	assert_same_bytes "local raw roundtrip" "$src/loc/a.txt" "$WORK/local-raw.out"
+	vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$enc" "${native[@]}" \
+		download "$PREFIX/loc/a.txt" "$WORK/local-enc.out"
+	assert_same_bytes "local native roundtrip" "$src/loc/a.txt" "$WORK/local-enc.out"
 
-	# raw + шифрование отвергается на старте: raw не несёт заголовок S3VCTR01,
-	# поэтому enc-маркера нет и детектор не отличит шифртекст от plaintext.
+	# Устаревший backend.local.layout отвергается на старте: viper молча игнорирует
+	# неизвестные ключи, и оператор получил бы не ту форму объекта, чем просил.
 	rc=0
-	vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$raw" S3VAULT_BACKEND_LOCAL_LAYOUT=raw \
-		S3VAULT_ENCRYPTION_MODE=native S3VAULT_ENCRYPTION_NATIVE_WRAP=keyfile \
-		S3VAULT_ENCRYPTION_NATIVE_KEY_FILE="$WORK/kek-local.bin" \
-		upload "$src/loc/a.txt" --key loc/enc.txt >/dev/null 2>&1 || rc=$?
-	assert_ne "local raw + native отвергается" "$rc" "0"
+	vault S3VAULT_BACKEND_TYPE=local S3VAULT_BACKEND_LOCAL_DIR="$none" \
+		S3VAULT_BACKEND_LOCAL_LAYOUT=raw S3VAULT_S3_ENDPOINT= \
+		upload "$src/loc/a.txt" --key loc/stale.txt >/dev/null 2>&1 || rc=$?
+	assert_ne "local layout=raw отвергается" "$rc" "0"
+	assert_eq "local layout=raw ничего не записал" \
+		"$([ -e "$none/$PREFIX/loc/stale.txt" ] && echo yes || echo no)" "no"
 
 	# Локальный бэкенд без dir.
 	rc=0

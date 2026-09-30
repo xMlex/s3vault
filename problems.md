@@ -26,14 +26,31 @@ PUT и удалял его, не записав (`docs/reliability-review.md` H2
 
 **Статус:** ✅ закрыт.
 
-Достижимый случай был в `layout=raw`: он срезает контейнер `S3VCTR01` при записи, а вместе с ним теряется и `enc`-маркер, поэтому дрейф `command → none` давал тихую копию шифртекста (`rc=0`). Закрыт двумя решениями:
+Достижимый случай был в `layout=raw`: он срезал контейнер `S3VCTR01` при записи,
+а вместе с ним терялся и `enc`-маркер, поэтому дрейф `command → none` давал тихую
+копию шифротекста (`rc=0`). Закрыт тремя решениями:
 
-1. **Гард конфига.** `Config.Normalize` (`internal/config/config.go`) отвергает `backend.local.layout=raw` вместе с `encryption.mode != none` — в raw-сторе нет заголовка, сверять `enc` не с чем, поэтому raw допускает только `mode=none`, и его payload всегда plaintext. Отказ на старте, до записи байт. Тесты: `internal/config/config_test.go` (`TestBackendLocalRawRejectsEncryption`), `internal/cli/local_backend_test.go` (`TestLocalBackendRawLayoutRejectsEncryption`), `scripts/e2e.sh` (`phase_local`).
-2. **Разделение миров.** Каталоги/бакеты не пересекаются (подтверждено оператором): raw-стенды только `mode=none`, шифрующие стенды только `layout=container` (там всегда `S3VCTR01` и работает header-driven-детектор). Продюсера и потребителя containerless-шифртекста не осталось; настоящих до-конвертных объектов в описанном развёртывании нет.
+1. **Форма объекта больше не зависит от бэкенда.** `encryption.mode` единолично
+   решает её: `none` пишет голый payload, `native`/`command` — контейнер. Ключ
+   `backend.local.layout` удалён и отвергается на старте (`config.CheckRemovedKeys`),
+   local-стор больше ничего не срезает. Продюсера containerless-шифротекста,
+   создаваемого конфигурацией, не осталось вовсе.
+2. **Громкий отказ вместо копии.** `decryptLegacy`
+   (`internal/adapter/encrypt/detect.go`) проверяет обе магии шифротекста —
+   `S3VLT01\n` и конверт OpenSSL `Salted__` — и возвращает ошибку, а не копирует
+   пейлоад. Тест `TestDecryptAutoLegacy` переписан: обе клетки `wantErr`, и
+   утверждается, что отказ не оставил байт на диске.
+3. **Разделение миров** (подтверждено оператором) осталось в силе для каталогов и
+   бакетов: настоящих до-конвертных объектов в описанном развёртывании нет.
 
-**Остаток в коде — защитная совместимость, не дефект:** `decryptLegacy` (`internal/adapter/encrypt/detect.go`) всё ещё копирует containerless-пейлоад не-native-формата при читателе `none`/`native` (только warning). Для гипотетического до-конвертного объекта это единственное возможное поведение: без контейнера нет `enc`, по телу отличить шифртекст от plaintext нельзя. Ветка недостижима при описанном развёртывании.
+**Остаток в коде — осознанный компромисс, а не ловушка.** Containerless-объект при
+читателе `none` читается копированием, если первые 8 байт не совпали ни с одной
+магией шифротекста. Ложное срабатывание возможно только на префиксе `Salted__`:
+plaintext-файл с таким началом будет отвергнут с внятной ошибкой, а не испорчен.
+Обратный вариант — тихо отдать испорченный файл с кодом 0 — хуже.
 
-**Если понадобится убрать ловушку окончательно:** сделать containerless-объект вне `layout=raw` жёсткой ошибкой вместо копирования (сломает чтение настоящих legacy-объектов) — тогда `decryptLegacy`-fallback удаляется. Документация: `architecture.md` (Backend, Local filesystem backend, Decrypt detection), `README.md`, `docs/decrypt-detection.md` §3/§7/§8.
+**Документация:** `architecture.md` (Backend, Object container, Layer ownership,
+Local filesystem backend), `README.md`, `docs/decrypt-detection.md` §3/§7/§8.
 
 ---
 

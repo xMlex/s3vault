@@ -11,10 +11,10 @@ import (
 	"github.com/xMlex/s3vault/internal/domain"
 )
 
-func benchStore(b *testing.B, layout string, objects int) *localstore.Store {
+func benchStore(b *testing.B, objects int) *localstore.Store {
 	b.Helper()
 
-	st, err := localstore.New(config.LocalConfig{Dir: b.TempDir(), Layout: layout})
+	st, err := localstore.New(config.LocalConfig{Dir: b.TempDir()})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -30,27 +30,23 @@ func benchStore(b *testing.B, layout string, objects int) *localstore.Store {
 }
 
 func BenchmarkPut(b *testing.B) {
-	for _, layout := range []string{config.LocalLayoutContainer, config.LocalLayoutRaw} {
-		b.Run(layout, func(b *testing.B) {
-			st := benchStore(b, layout, 0)
-			ctx := context.Background()
-			payload := bytes.Repeat([]byte("x"), 4096)
-			b.SetBytes(int64(len(payload)))
-			b.ReportAllocs()
+	st := benchStore(b, 0)
+	ctx := context.Background()
+	payload := bytes.Repeat([]byte("x"), 4096)
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
 
-			for b.Loop() {
-				if err := st.Put(ctx, "k.bin", bytes.NewReader(payload), domain.PutMeta{}); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
+	for b.Loop() {
+		if err := st.Put(ctx, "k.bin", bytes.NewReader(payload), domain.PutMeta{}); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
 func BenchmarkList(b *testing.B) {
 	for _, n := range []int{100, 1_000, 10_000} {
 		b.Run(fmt.Sprintf("objects=%d", n), func(b *testing.B) {
-			st := benchStore(b, config.LocalLayoutContainer, n)
+			st := benchStore(b, n)
 			ctx := context.Background()
 			b.ReportAllocs()
 			for b.Loop() {
@@ -69,7 +65,7 @@ func BenchmarkList(b *testing.B) {
 // BenchmarkListPaged walks every page of a 10k-object store, re-walking and
 // re-sorting the whole tree per page (the documented linear cost).
 func BenchmarkListPaged(b *testing.B) {
-	st := benchStore(b, config.LocalLayoutContainer, 10_000)
+	st := benchStore(b, 10_000)
 	ctx := context.Background()
 	b.ReportAllocs()
 	for b.Loop() {

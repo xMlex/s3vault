@@ -17,6 +17,7 @@ import (
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/container"
 	"github.com/xMlex/s3vault/internal/domain"
+	"github.com/xMlex/s3vault/internal/port"
 	"github.com/xMlex/s3vault/internal/service"
 )
 
@@ -110,36 +111,76 @@ func TestFetchDownloadEncryptedRoundTrip(t *testing.T) {
 	assert.FileExists(t, marker)
 }
 
-// TestFetchDownloadLegacyWarns covers objects without an S3VCTR01 container:
-// legacy detection still decrypts/copies, and the read is flagged in the log.
-func TestFetchDownloadLegacyWarns(t *testing.T) {
+// TestFetchDownloadContainerlessRead covers objects without an S3VCTR01
+// container. The reader's own encryption.mode decides how loud that is: mode=none
+// writes such objects itself, so it is quiet; an encrypting reader meeting one is
+// reading something it did not write and says so.
+func TestFetchDownloadContainerlessRead(t *testing.T) {
 	t.Parallel()
 
-	store := newMemStore()
-	require.NoError(t, store.Put(context.Background(), "k", bytes.NewReader([]byte("bare plaintext")), domain.PutMeta{}))
+	tests := []struct {
+		name      string
+		enc       port.Encryptor
+		wantLog   string
+		wantNoLog string
+	}{
+		{
+			name:      "none reader stays quiet on its own object shape",
+			enc:       encrypt.Passthrough{},
+			wantNoLog: "level=WARN",
+		},
+		{
+			name:    "encrypting reader warns about an unexpected shape",
+			enc:     &namedEncryptor{name: "native"},
+			wantLog: "legacy detection",
+		},
+	}
 
-	var logs bytes.Buffer
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
+			store := newMemStore()
+			require.NoError(t, store.Put(context.Background(), "k",
+				bytes.NewReader([]byte("bare plaintext")), domain.PutMeta{
+					PlaintextSHA256: "d0",
+					PlaintextSize:   13,
+				}))
 
-	dest := filepath.Join(t.TempDir(), "out")
-	require.NoError(t, service.NewFetch(store, encrypt.Passthrough{}).WithLogger(logger).
-		Download(context.Background(), "k", dest, io.Discard))
+			var logs bytes.Buffer
 
-	b, err := os.ReadFile(dest) //nolint:gosec // dest is a test temp file
-	require.NoError(t, err)
-	assert.Equal(t, "bare plaintext", string(b))
-	assert.Contains(t, logs.String(), "legacy detection")
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+			dest := filepath.Join(t.TempDir(), "out")
+			require.NoError(t, service.NewFetch(store, tt.enc).WithLogger(logger).
+				Download(context.Background(), "k", dest, io.Discard))
+
+			b, err := os.ReadFile(dest) //nolint:gosec // dest is a test temp file
+			require.NoError(t, err)
+			assert.Equal(t, "bare plaintext", string(b))
+
+			if tt.wantLog != "" {
+				assert.Contains(t, logs.String(), tt.wantLog)
+			}
+
+			if tt.wantNoLog != "" {
+				assert.NotContains(t, logs.String(), tt.wantNoLog)
+			}
+		})
+	}
 }
 
-// TestFetchMaterializeRefusesEncMismatch checks the HTTP/S3 ephemeral path uses
-// the same header-driven check.
-func TestFetchMaterializeRefusesEncMismatch(t *testing.T) {
+// A read is the last hop on the path, so a layer the reader cannot remove is
+// drift: it must be reported rather than written to disk.
+// A read is the last hop on the path, so a layer the reader cannot remove is
+// drift: it must be reported rather than written to disk.
+func TestFetchReadRefusesForeignLayer(t *testing.T) {
 	t.Parallel()
 
 	store := newMemStore()
-	require.NoError(t, store.Put(context.Background(), "k",
-		bytes.NewReader(containedPayload(t, container.EncCommand, []byte("Salted__ciphertext"))), domain.PutMeta{}))
+	payload := []byte("Salted__ciphertext")
+	body := containedPayload(t, container.EncCommand, payload)
+	require.NoError(t, store.Put(context.Background(), "k", bytes.NewReader(body), domain.PutMeta{}))
 
 	_, err := service.NewFetch(store, encrypt.Passthrough{}).Materialize(context.Background(), "k")
 	require.ErrorContains(t, err, "requires encryption.mode=command")

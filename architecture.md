@@ -91,7 +91,7 @@ Two unrelated key pairs live in one config schema, and mixing them is a misconfi
 
 ### Two consequences of that topology
 
-**Layer count = the number of s3vault processes that wrapped the bytes.** A non-s3vault S3 client is transparent: `aws s3 cp` into a gateway yields one layer, the gateway's. An s3vault client writing straight to the storage yields one layer, its own. An s3vault client writing *through* a gateway yields two — the gateway's outer, the client's inner. The harness pins the direct and the through-gateway cases: `scripts/e2e.sh` asserts `128 + payload` for a direct `archive`, and `S3VLT01` at offset 128 for a single layer. Wherever this document says "two nested layers", read it as "a gateway is on the path".
+**Layer count = the number of s3vault processes that framed the bytes.** A process frames when it encrypts, and the gateway frames even when it does not (see [Object shape](#object-shape)). A non-s3vault S3 client is transparent: `aws s3 cp` into a gateway yields one layer, the gateway's. An s3vault client with `mode=none` writing straight to the storage yields **no** layer — its object is the bare payload, readable as an ordinary file. An s3vault client with `mode=none` writing *through* a gateway yields one layer, the gateway's; with `mode=native`/`command`, two — the gateway's outer, the client's inner. Wherever this document says "two nested layers", read it as "a gateway is on the path and the client encrypts".
 
 **A read strips exactly one layer.** `unwrapForDecrypt` calls `container.Unwrap` once (`internal/service/fetch.go`) and `DecryptAuto` undoes at most one payload encryption, so a process always returns one layer fewer than it found. An object is plaintext to a single process only when it holds exactly one layer — meaning the writer wrote straight into the storage that the reader reads. If a gateway is on the write path it must also be on the read path: two layers are removed by two processes, in order, never by one process twice.
 
@@ -195,7 +195,7 @@ Search path: `--config`, then `./s3vault.yaml`, `./s3vault.yml`, then the same t
 
 Secrets belong in env (`S3VAULT_S3_SECRET_KEY`, AWS SDK chain) or `0600` key files. If `s3.secret_key` or `server.s3_secret_key` appear in the YAML, log a warning unless `s3.allow_secrets_in_config: true`. The check uses `InConfig`, so env-supplied secrets are not flagged.
 
-Backend: `backend.type` is `s3` (default) or `local`; `local` requires `backend.local.dir`, resolved to an absolute path in `Normalize`. `backend.local.layout` is `container` (default) or `raw` (see [Local filesystem backend](#local-filesystem-backend)); because `raw` stores no `S3VCTR01` enc marker, it is only valid with `encryption.mode=none` — `Normalize` rejects `raw` + `native`/`command` at startup instead of letting a mismatched reader copy ciphertext.
+Backend: `backend.type` is `s3` (default) or `local`; `local` requires `backend.local.dir`, resolved to an absolute path in `Normalize`. The object shape is not a backend setting: `encryption.mode` alone decides it, on every backend — `none` writes the bare payload, `native`/`command` write the `S3VCTR01` container (see [Object shape](#object-shape)). The former `backend.local.layout` key is rejected at startup by `config.CheckRemovedKeys`.
 
 Removed keys: `config.Load` calls `config.CheckRemovedKeys`, which fails startup if `remote.url`, `remote.rate_limit_bps`, or `server.token` is still present in the file or environment. Viper silently ignores unknown keys, so without this guard an upgrade would change behavior (or silently drop a token) without a word.
 
@@ -207,16 +207,15 @@ The object key prefix stays in `s3.prefix` for both backends (`--prefix`, `S3VAU
 
 `internal/adapter/local` stores each object as one file under `backend.local.dir`.
 
-- **`layout: container` (default):** each file holds exactly the bytes S3 would hold (`S3VCTR01` container plus payload), so identity, dedup, encryption and the S3 facade behave the same.
-- **`layout: raw`:** the file holds the bare plaintext payload with no `S3VCTR01` prefix. The `S3VCTR01` header is the only carrier of `enc`, so a raw store cannot tell ciphertext from plaintext on read; `Normalize` therefore requires `encryption.mode=none` here and rejects `raw` + `native`/`command` at startup (problems.md P1-legacy). An incoming container is still stripped whatever its `enc` field, so the invariant is "raw file = payload"; with the config guard the payload is always plaintext. There is no stored container hash, so the store derives the stored-bytes SHA-256 from the file and memoizes it in memory per `(store-relative path, size, mtime.UnixNano())`; a cache miss reads the object once (first `Head`/`Get` per process). The memo holds at most 4096 entries, evicting the least-recently-used (a deterministic LRU, never an arbitrary entry), and is never persisted. `Head`/`Get` expose that digest, and the S3 facade answers carry `ETag` and `x-amz-checksum-sha256` (`GetRange` deliberately does **not** expose a digest). `Archive` keeps its `Store.StoresPlaintext()` fast path — it does not hash the local file and passes no digest to `Decide` — so a `layout=raw` archive never content-skips and always re-uploads. Reads of a raw object have no container, so `DecryptAuto` falls back to magic/type detection; with `mode=none` and plaintext payloads the copy path is correct, and `Fetch` logs it at debug (not warn) because the shape is expected.
-
+- The store keeps the bytes it is given, so a file holds exactly what an S3 backend would hold for the same `encryption.mode` and identity, dedup, encryption and the S3 facade behave the same on both. Whether those bytes carry the `S3VCTR01` container is the writer's decision, not the store's: an incoming container is kept whole, never stripped.
+- An object with no container has no header to read a digest from, so the store exposes one as described under [Content identity](#content-identity). The config guard that used to police this combination is gone with `backend.local.layout`: `encryption.mode` alone decides the object shape, on every backend, so there is no combination left to reject.
 - Access goes through `os.Root`; keys must survive `path.Clean` unchanged and be `filepath.IsLocal`, otherwise `domain.ErrInvalidPath`. `.s3vault-tmp/` is reserved and never listed.
 - The directory is created `0700` when missing (an existing directory keeps its mode); object files are `0600`.
 - `Put` streams into a temp file in `.s3vault-tmp/`, then `Sync` (file data) + `rename`; interrupted writes are dropped when the store is opened (`New` does `RemoveAll(.s3vault-tmp)` and fails if that cleanup fails). Parent directories are created `0700`. The `rename` is atomic for readers, but its durability is left to the filesystem: no directory `fsync` is issued, deliberately, for cross-platform simplicity (Windows and some network filesystems cannot fsync a directory anyway). The same applies to the disk cache's `rename`.
-- `Put` ignores `domain.PutMeta` entirely; `ContentType` is not stored by this backend.
+- `Put` stores the bytes unchanged and ignores `domain.PutMeta` except for the identity fields: a `PlaintextSHA256` in `PutMeta` is what tells the store the object has no container, so it records it for `Head`/`Get`. Nothing is persisted next to the object, and `ContentType` is not stored by this backend.
 - `Head` reports `Exists=false` for a missing key (and for a path whose parent is a regular file); `Get`/`GetRange` return `domain.ErrNotFound`.
 - `Delete` succeeds on a missing key and prunes directories it leaves empty.
-- Deliberate differences from S3: the store's `ETag` is synthetic (size + mtime, quoted) but it is only a last-resort fallback — content identity is the plaintext SHA-256 parsed from the `S3VCTR01` header (container layout) or the stored-bytes SHA-256 derived from the file (raw layout), so a same-size, same-mtime overwrite cannot masquerade as the old object; a range starting past the last byte yields an empty body instead of `416`; a key cannot be both a file and a directory (S3 allows `a` and `a/b`); `List` walks and sorts the whole tree under the prefix, so it is linear in object count.
+- Deliberate differences from S3: the store's `ETag` is synthetic (size + mtime, quoted) but it is only a last-resort fallback — content identity is the plaintext SHA-256 parsed from the `S3VCTR01` header, or, for an object with no container, the SHA-256 of the stored bytes, so a same-size, same-mtime overwrite cannot masquerade as the old object; a range starting past the last byte yields an empty body instead of `416`; a key cannot be both a file and a directory (S3 allows `a` and `a/b`); `List` walks and sorts the whole tree under the prefix, so it is linear in object count.
 
 ## Scanner and symlinks
 
@@ -249,7 +248,7 @@ Before Put:
    - `HeadObject` for existence / ETag / LastModified (and any identity already on Head: legacy user-metadata).
    - `GetRange` bytes `0-127`, parse S3VCTR01 (CRC-checked).
    - If not a container (or peek is corrupt while Head already has SHA-256): keep Head identity.
-   - For a plaintext store (`layout=raw`, `Store.StoresPlaintext()`) `Head` returns the plaintext SHA-256 the store derives from the file (memoized in memory; the first call reads the object once). `Archive` does not hash the local file for such a store, so its `Decide` gets an empty local digest and never skips; HTTP/S3 GET/HEAD still get full identity without a container.
+   - For a containerless object the store exposes the digest it was given: `Put` records `PutMeta.PlaintextSHA256` under the object's `(path, size, mtime)` key, so an object this process wrote is never re-read to identify itself. Only objects left by an earlier process fall back to hashing the file, and even then a body counts as a container only if `container.Parse` accepts it, so a plaintext file that happens to start with the magic is hashed rather than misread. The digest is memoized in memory; the memo holds at most 4096 entries, evicting the least-recently-used, and is never persisted. `Archive` always hashes the local file, so `Decide` gets a real local digest for both object shapes and content-skip works either way.
 3. Compare identity fields:
 
 | Source | Meaning |
@@ -297,24 +296,32 @@ Detection by magic bytes (not file extension). Layout (big-endian), fixed **128*
 128..   opaque payload (plaintext | S3VLT01 stream | command ciphertext)
 ```
 
-Upload writes header then streams encrypt/copy into Put (`io.MultiReader`). Download unwraps before `DecryptAuto`. Native objects are `S3VCTR01 || S3VLT01 || chunks`. Legacy objects without the container remain readable via legacy metadata / existing decrypt paths.
+Upload writes header then streams encrypt/copy into Put (`io.MultiReader`); at `encryption.mode=none` there is no header and the payload is stored as-is, with its digest declared in `domain.PutMeta`. Download unwraps before `DecryptAuto`. Native objects are `S3VCTR01 || S3VLT01 || chunks`. Objects without the container remain readable via the magic/type path described under [Layer ownership](#layer-ownership--every-hop-frames-its-own-layer).
 
-### Layer ownership — every hop wraps its own layer
+### Layer ownership — every hop frames its own layer
 
 **There is no marker of who encrypted.** `enc` answers *whether* a layer exists, never *whose*. This is the single most misunderstood part of the format, so the invariant is stated explicitly.
 
-Each side that passes bytes on wraps them in its **own** `S3VCTR01` container. An object in the storage therefore holds **two nested layers** — the client's inside, the gateway's outside — exactly when a gateway is on its path, and one when it is not (see [Roles and topology](#roles-and-topology)):
+Each side that passes bytes on frames them in its **own** `S3VCTR01` container, and the rule for *whether* to frame is `encryption.mode` plus one exception:
+
+| writer | frames? | why |
+| --- | --- | --- |
+| client, `mode=native`/`command` | yes | the container is the only carrier of `enc`, and a reader must be able to tell ciphertext from plaintext by the header alone |
+| client, `mode=none` | no | there is nothing to declare: the payload is plaintext, `enc` would be the constant 0, and the only thing left in the container is the plaintext digest — which travels in `PutMeta` and in S3 user-metadata instead. The result is a bucket of ordinary files, readable by anything |
+| gateway, any `mode` | yes | see below |
+
+The gateway is a hop, not a leaf writer: it is a client of the storage in front of it, and its `mode` may be `none`. It still frames, because the container is how the next reader knows a layer was removed — and the format has no marker of whose layer that is. Without it a `mode=none` gateway would strip the client's own container as if it were its own, and the client would find nothing left. `service.Archive.WithFraming` is set only by the `server` command; it is wiring fixed by the command, not a configuration key.
 
 | hop | code | effect |
 | --- | --- | --- |
-| client upload | `service.upload` (`internal/service/archive.go:386`) | client container + client payload encryption |
-| gateway ingress (S3 facade `PutObject`) | `internal/s3api/put.go:48` → `UploadFile` | **wraps and encrypts again**, by the gateway's own `mode` |
-| gateway egress | `Fetch.Materialize` / `download` | `unwrapForDecrypt` strips the gateway container, `DecryptAuto` strips the gateway payload encryption |
-| client download | same two functions, client's `mode` | strips the client's own layer |
+| client upload | `Archive.upload` (`internal/service/archive.go`) | client container + client payload encryption, or the bare payload at `mode=none` |
+| gateway ingress (S3 facade `PutObject`) | `internal/s3api/put.go` → `UploadFile` | **frames and encrypts again**, by the gateway's own `mode` |
+| gateway egress | `Fetch.Materialize` | `unwrapForDecrypt` strips the gateway container, `DecryptAuto` strips the gateway payload encryption |
+| client download | `Fetch.Download` | the same two steps, on the client's `mode` |
 
-Note that a non-s3vault S3 client (`aws s3 cp`) contributes no layer at all — it hands the gateway plaintext and the gateway's wrap is the only one.
+Note that a non-s3vault S3 client (`aws s3 cp`) contributes no layer at all — it hands the gateway plaintext and the gateway's frame is the only one.
 
-**The invariant:** each side strips exactly one container and at most one payload encryption. Symmetric `mode` on both sides is what makes the exchange correct — verified for all four combinations in `scripts/verify-layer-ownership.sh`. The container is stripped by magic (`container.Unwrap`, called at `internal/service/fetch.go`) **independently of `encryption.mode`**; `DecryptAuto` then branches on the container's `Enc` field — the object, not the local encryptor type — and only ever sees the payload of one layer.
+**The invariant:** each side strips exactly one container and at most one payload encryption. The container is stripped by magic (`container.Unwrap`, called at `internal/service/fetch.go`) **independently of `encryption.mode`**, which is why the framing rule above is load-bearing: a process must never find a layer it cannot account for. `DecryptAuto` then branches on the container's `Enc` field — the object, not the local encryptor type — and only ever sees the payload of one layer. All four server×client mode combinations are verified in `scripts/verify-layer-ownership.sh`.
 
 Consequences, all measured (`scripts/verify-server-drift.sh`):
 
@@ -326,9 +333,9 @@ Consequences, all measured (`scripts/verify-server-drift.sh`):
 
 `DecryptAuto` (`internal/adapter/encrypt/detect.go`) is handed the container's enc name (`unwrapForDecrypt` returns `container.EncName(hdr.Enc)` alongside the payload). When the container is present, the enc is authoritative: it must match the reader's `Name()`, otherwise the read fails; `enc=none` copies the payload, `enc=native`/`enc=command` invoke the matching decryptor. This closes both silent cells at once — a command ciphertext is no longer copied under `mode=none` (P1/H2), and an `enc=0` payload is no longer fed to the command decryptor (H5). Server-side `mode` drift is now refused explicitly rather than incidentally by the `x-amz-checksum-sha256` mismatch (`internal/s3api/get.go:56`) or by cryptcp failing.
 
-Objects without an `S3VCTR01` container (pre-envelope legacy) carry no `enc`; the reader logs a warning and falls back to the historical magic/type detection, so legacy objects stay readable. Since `layout=raw` is also containerless, it is restricted to `encryption.mode=none` (`Normalize`): its bare payloads are always plaintext, so the `mode=none` copy path is correct and no guard is needed.
+An object with no `S3VCTR01` container carries no `enc`; the reader falls back to magic/type detection, and how loudly it says so depends on its own `mode` — at `mode=none` this is the shape the reader itself writes, so it logs at debug; at `native`/`command` the object was written by a process that does not match and it warns.
 
-The residual case is limited to genuine pre-envelope objects: containerless command ciphertext read by a `mode=none` (or `native`) reader is still copied verbatim (only a warning is emitted), because without the container there is no `enc` to compare. `raw` + `native`/`command` can no longer produce this shape — it is refused at startup (`problems.md` P1-legacy). This is a documented backward-compatibility contract, not an open risk: with `raw` limited to `mode=none` and disjoint per-world stores, nothing produces or reads containerless ciphertext. See `docs/decrypt-detection.md` §3.
+The residual case is a containerless object read by a `mode=none` reader, where the payload could in principle be ciphertext: there is no `enc` to compare, so detection falls back to the payload magic. Both ciphertext shapes are now checked — the native `S3VLT01` magic and OpenSSL's `Salted__` envelope — and either one makes the read **fail** rather than copy garbage out with exit code 0. The 8-byte `Salted__` prefix is not proof of ciphertext, so a plaintext file that happens to start with it is refused too, with a message naming both readings. That closes P1-legacy/H2 for the containerless shape; see `docs/decrypt-detection.md` §3.
 
 ## Encryption
 
@@ -357,7 +364,7 @@ repeated:
 
 Per-chunk nonce = `nonce_prefix || uint32BE(index)` (12 bytes). Unknown `v`/`alg` fails closed.
 
-Download: `unwrapForDecrypt` peeks the `S3VCTR01` container and passes its `Enc` into `DecryptAuto`, which is authoritative — `none` copies, `native`/`command` decrypt with the matching encryptor, and a mismatch with the reader's `mode` is an error. Only for objects with no container does detection fall back to peeking native magic `S3VLT01\n` and the local encryptor type (legacy), with a warning. This describes one layer's payload only; which layer, and who put it there, is covered by [Layer ownership](#layer-ownership--every-hop-wraps-its-own-layer).
+Download: `unwrapForDecrypt` peeks the `S3VCTR01` container and passes its `Enc` into `DecryptAuto`, which is authoritative — `none` copies, `native`/`command` decrypt with the matching encryptor, and a mismatch with the reader's `mode` is an error. Only for objects with no container — the shape `encryption.mode=none` itself writes — does detection fall back to the payload magic and the local encryptor type, and there it refuses on either ciphertext magic rather than copying garbage. This describes one layer's payload only; which layer, and who put it there, is covered by [Layer ownership](#layer-ownership--every-hop-frames-its-own-layer).
 
 HTTP materialize uses the same `DecryptAuto` path into the disk cache.
 
@@ -404,7 +411,7 @@ When **enabled**, store **decrypted** files on disk:
 2. Client and gateway speak **only** the S3 protocol to each other.
 3. Client encryption is the **client's own layer**; a gateway `mode` on top of it is a **second** layer.
 
-Consequence worth stating plainly: because each side wraps on its own, an object in the storage holds two nested layers whenever a gateway is on its path (see [Layer ownership](#layer-ownership--every-hop-wraps-its-own-layer)). Symmetric `mode` across the two sides is what makes the exchange work, and that is a configuration invariant, not something the format enforces.
+Consequence worth stating plainly: because each side frames on its own, an object in the storage holds two nested layers whenever a gateway is on its path and the client encrypts (see [Layer ownership](#layer-ownership--every-hop-frames-its-own-layer)). Symmetric `mode` across the two sides is what makes the exchange work, and that is a configuration invariant, not something the format enforces.
 
 ### API
 

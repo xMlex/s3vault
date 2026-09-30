@@ -4,13 +4,15 @@ backend:
   type: s3  # s3 | local
   # local:
   #   dir: /srv/s3vault/objects  # object tree on this host; s3.* is then unused
-  #   layout: container          # default: S3VCTR01 || payload (S3 parity)
-  #   # layout: raw              # bare plaintext payload without the container;
-  #   #                          # only with encryption.mode=none
   # Env equivalents (override this file, no YAML needed at all):
   #   S3VAULT_BACKEND_TYPE=local
   #   S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
-  #   S3VAULT_BACKEND_LOCAL_LAYOUT=raw
+  # Форма объекта задаётся только encryption.mode, на любом бэкенде:
+  #   none    — голый payload, без контейнера S3VCTR01 (читается как обычный файл)
+  #   native  — S3VCTR01(enc=native)  || S3VLT01…
+  #   command — S3VCTR01(enc=command) || шифротекст
+  # Ключа backend.local.layout больше нет: он выражал то же свойство, но только
+  # для одного бэкенда, из-за чего у archive было два разных пути записи.
 s3:
   region: us-east-1
   bucket: my-bucket

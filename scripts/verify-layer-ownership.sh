@@ -106,7 +106,10 @@ start_server() {
 	return 1
 }
 
-# Сколько слоёв в объекте: 1 слой = 128 + 39 = 167, 2 слоя = 128+128+39 = 295.
+# Сколько слоёв в объекте. Слой кладёт каждый ШИФРУЮЩИЙ процесс на пути, плюс
+# шлюз: он хоп, а не лист, и рамкует даже при mode=none — иначе он снял бы внешний
+# контейнер клиента как свой. Поэтому none+none даёт 1 слой (шлюз), а
+# command+command — 2 (клиент и шлюз).
 layers() {
 	s3raw "$W/o.bin" || {
 		echo "нет объекта"
@@ -114,8 +117,6 @@ layers() {
 	}
 	local sz
 	sz=$(wc -c <"$W/o.bin")
-	local n
-	n=$((sz / 128))
 	printf '%s байт, %s слой(ёв)' "$sz" "$((sz > 200 ? 2 : 1))"
 	printf ', внешний=%s' "$(dd if="$W/o.bin" bs=1 skip=128 count=8 status=none 2>/dev/null |
 		xxd -p | tr -d '\n' | cut -c1-16)"
@@ -141,7 +142,7 @@ check() { # check <клиентский_режим> <файл> <rc>
 	fi
 }
 
-echo "плайнтекст = $PLAIN байт; 1 слой = 167 байт; 2 слоя = 295 байт"
+echo "plaintext = $PLAIN байт; слой = 128 + payload; none+none = 1 слой, command+command = 2"
 echo
 for smode in command none; do
 	echo "### сервер=$smode"

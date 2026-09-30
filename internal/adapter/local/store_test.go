@@ -3,6 +3,8 @@ package localstore_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,6 +35,146 @@ func newStore(t *testing.T) (*localstore.Store, string) {
 func put(t *testing.T, st *localstore.Store, key, body string) {
 	t.Helper()
 	require.NoError(t, st.Put(context.Background(), key, strings.NewReader(body), domain.PutMeta{}))
+}
+
+// contained wraps payload in an S3VCTR01 container, as an encrypting writer does.
+func contained(t *testing.T, payload []byte, mtime time.Time) []byte {
+	t.Helper()
+
+	sum := sha256.Sum256(payload)
+
+	hdr, err := container.Marshal(container.Header{
+		Version:       container.VersionV1,
+		PlaintextSize: int64(len(payload)),
+		SHA256:        sum[:],
+		Enc:           container.EncNone,
+		SourceMTime:   mtime,
+	})
+	require.NoError(t, err)
+
+	return append(hdr, payload...)
+}
+
+func sumHex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// The store keeps the bytes it is given, whatever shape they have: an incoming
+// container is not stripped, so the local backend holds the same bytes an S3
+// backend would.
+func TestPutKeepsContainerBytesVerbatim(t *testing.T) {
+	t.Parallel()
+	st, dir := newStore(t)
+	ctx := context.Background()
+	payload := []byte("wrapped payload\n")
+	body := contained(t, payload, time.Unix(1_700_000_000, 0).UTC())
+
+	require.NoError(t, st.Put(ctx, "logs/app.log", bytes.NewReader(body), domain.PutMeta{}))
+
+	onDisk, err := os.ReadFile(filepath.Join(dir, "logs", "app.log")) //nolint:gosec // test reads its own temp dir
+	require.NoError(t, err)
+	assert.Equal(t, body, onDisk, "object file must be the stored bytes, container included")
+
+	rc, getMeta, err := st.Get(ctx, "logs/app.log")
+	require.NoError(t, err)
+	got, err := io.ReadAll(rc)
+	require.NoError(t, rc.Close())
+	require.NoError(t, err)
+	assert.Equal(t, body, got)
+	assert.Empty(t, getMeta.SHA256,
+		"a container object reports no stored-bytes digest: identity comes from its header")
+}
+
+// A containerless object has no header to read a digest from, so Head and Get
+// derive it by hashing the stored file. Without that, content-skip and the
+// gateway's x-amz-checksum-sha256 would both be blind.
+func TestContainerlessObjectExposesDerivedDigest(t *testing.T) {
+	t.Parallel()
+	st, _ := newStore(t)
+	ctx := context.Background()
+	payload := []byte("dedup me")
+
+	put(t, st, "k.bin", string(payload))
+
+	meta, err := st.Head(ctx, "k.bin")
+	require.NoError(t, err)
+	assert.Equal(t, sumHex(payload), meta.SHA256)
+
+	rc, getMeta, err := st.Get(ctx, "k.bin")
+	require.NoError(t, err)
+	got, err := io.ReadAll(rc)
+	require.NoError(t, rc.Close())
+	require.NoError(t, err)
+	assert.Equal(t, payload, got)
+	assert.Equal(t, sumHex(payload), getMeta.SHA256)
+
+	// identity.ResolveRemote is what Decide consumes; it must see the digest.
+	remote, err := identity.ResolveRemote(ctx, st, "k.bin")
+	require.NoError(t, err)
+	assert.Equal(t, sumHex(payload), remote.SHA256)
+	assert.Equal(t, identity.ActionSkip, identity.Decide(sumHex(payload), int64(len(payload)), remote))
+}
+
+// A directory legitimately holds both shapes, because wrapping is each writer's
+// own encryption.mode. Identity must be right for each, in the same store.
+func TestMixedShapesResolveIdentityIndependently(t *testing.T) {
+	t.Parallel()
+	st, _ := newStore(t)
+	ctx := context.Background()
+	mtime := time.Unix(1_700_000_000, 0).UTC()
+
+	plain := []byte("bare payload")
+	wrapped := []byte("bare payload")
+
+	require.NoError(t, st.Put(ctx, "bare.bin", bytes.NewReader(plain), domain.PutMeta{}))
+	require.NoError(t, st.Put(ctx, "wrapped.bin",
+		bytes.NewReader(contained(t, wrapped, mtime)), domain.PutMeta{}))
+
+	bareMeta, err := identity.ResolveRemote(ctx, st, "bare.bin")
+	require.NoError(t, err)
+	assert.Equal(t, sumHex(plain), bareMeta.SHA256)
+	assert.Equal(t, int64(len(plain)), bareMeta.Size)
+
+	// For the container object the header is authoritative, so the size is the
+	// plaintext size from the header, not the stored byte count.
+	wrappedMeta, err := identity.ResolveRemote(ctx, st, "wrapped.bin")
+	require.NoError(t, err)
+	assert.Equal(t, sumHex(wrapped), wrappedMeta.SHA256)
+	assert.Equal(t, int64(len(wrapped)), wrappedMeta.ContentSize)
+	assert.Equal(t, int64(container.HeaderSize+len(wrapped)), wrappedMeta.Size)
+}
+
+// The derived digest is memoized by (path, size, mtime), so a rewrite
+// re-derives it while a pure re-read is served from memory.
+func TestContainerlessDigestInvalidatesOnRewrite(t *testing.T) {
+	t.Parallel()
+	st, _ := newStore(t)
+	ctx := context.Background()
+
+	put(t, st, "k.bin", "first")
+	first, err := st.Head(ctx, "k.bin")
+	require.NoError(t, err)
+	require.Equal(t, sumHex([]byte("first")), first.SHA256)
+
+	put(t, st, "k.bin", "second-longer")
+	second, err := st.Head(ctx, "k.bin")
+	require.NoError(t, err)
+	assert.NotEqual(t, first.SHA256, second.SHA256)
+	assert.Equal(t, sumHex([]byte("second-longer")), second.SHA256)
+}
+
+// A body shorter than a header cannot be a container, so it is hashed without a
+// magic probe.
+func TestContainerlessShortObjectExposesDerivedDigest(t *testing.T) {
+	t.Parallel()
+	st, _ := newStore(t)
+	ctx := context.Background()
+
+	put(t, st, "tiny", "x")
+	meta, err := st.Head(ctx, "tiny")
+	require.NoError(t, err)
+	assert.Equal(t, sumHex([]byte("x")), meta.SHA256)
 }
 
 func TestPutGetRoundtrip(t *testing.T) {
@@ -353,24 +495,7 @@ func TestStoreCapabilities(t *testing.T) {
 	st, err := localstore.New(config.LocalConfig{Dir: dir})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
-	assert.Equal(t, config.LocalLayoutContainer, st.Layout())
-	assert.False(t, st.StoresPlaintext())
 	assert.Equal(t, dir, st.Dir())
-
-	rawDir := t.TempDir()
-	raw, err := localstore.New(config.LocalConfig{Dir: rawDir, Layout: config.LocalLayoutRaw})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = raw.Close() })
-	assert.Equal(t, config.LocalLayoutRaw, raw.Layout())
-	assert.True(t, raw.StoresPlaintext())
-	assert.Equal(t, rawDir, raw.Dir())
-}
-
-func TestNewRejectsUnsupportedLayout(t *testing.T) {
-	t.Parallel()
-	_, err := localstore.New(config.LocalConfig{Dir: t.TempDir(), Layout: "bogus"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "not supported")
 }
 
 // A key that names a directory is not an object: reads report it as missing.
@@ -437,54 +562,44 @@ func (r *cancelAfterReader) Read(p []byte) (int, error) {
 
 func TestPutAbortsOnContextCancel(t *testing.T) {
 	t.Parallel()
-	for _, layout := range []string{config.LocalLayoutContainer, config.LocalLayoutRaw} {
-		t.Run(layout, func(t *testing.T) {
-			t.Parallel()
-			st, err := localstore.New(config.LocalConfig{Dir: t.TempDir(), Layout: layout})
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = st.Close() })
+	st, err := localstore.New(config.LocalConfig{Dir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-			err = st.Put(ctx, "k.bin",
-				&cancelAfterReader{cancel: cancel, after: container.HeaderSize},
-				domain.PutMeta{})
-			require.ErrorIs(t, err, context.Canceled)
-		})
-	}
+	err = st.Put(ctx, "k.bin",
+		&cancelAfterReader{cancel: cancel, after: container.HeaderSize},
+		domain.PutMeta{})
+	require.ErrorIs(t, err, context.Canceled)
 }
 
-// Put lands the object at its final path via temp + rename (both layouts), so
-// the rename is atomic w.r.t. readers. Directory fsync is deliberately not done.
+// Put lands the object at its final path via temp + rename, so the rename is
+// atomic w.r.t. readers. Directory fsync is deliberately not done.
 func TestPutLandsObjectAtFinalPath_RoundTrip(t *testing.T) {
 	t.Parallel()
 
-	for _, layout := range []string{config.LocalLayoutContainer, config.LocalLayoutRaw} {
-		t.Run(layout, func(t *testing.T) {
-			t.Parallel()
-			dir := filepath.Join(t.TempDir(), "objects")
-			st, err := localstore.New(config.LocalConfig{Dir: dir, Layout: layout})
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = st.Close() })
+	dir := filepath.Join(t.TempDir(), "objects")
+	st, err := localstore.New(config.LocalConfig{Dir: dir})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
 
-			ctx := context.Background()
-			require.NoError(t, st.Put(ctx, "deep/nested/obj.bin", strings.NewReader("durable"), domain.PutMeta{}))
+	ctx := context.Background()
+	require.NoError(t, st.Put(ctx, "deep/nested/obj.bin", strings.NewReader("durable"), domain.PutMeta{}))
 
-			_, err = os.Stat(filepath.Join(dir, "deep", "nested", "obj.bin"))
-			require.NoError(t, err, "rename must land the object at its final path")
+	_, err = os.Stat(filepath.Join(dir, "deep", "nested", "obj.bin"))
+	require.NoError(t, err, "rename must land the object at its final path")
 
-			body, meta, err := st.Get(ctx, "deep/nested/obj.bin")
-			require.NoError(t, err)
+	body, meta, err := st.Get(ctx, "deep/nested/obj.bin")
+	require.NoError(t, err)
 
-			defer func() { _ = body.Close() }()
+	defer func() { _ = body.Close() }()
 
-			got, err := io.ReadAll(body)
-			require.NoError(t, err)
-			assert.Equal(t, "durable", string(got))
-			assert.True(t, meta.Exists)
-		})
-	}
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	assert.Equal(t, "durable", string(got))
+	assert.True(t, meta.Exists)
 }
 
 // problems.md P6: the local backend deliberately does not persist metadata or
@@ -513,7 +628,9 @@ func TestPutIgnoresPutMeta_LocalStoresNoMetadata(t *testing.T) {
 	head, err := st.Head(ctx, "doc.txt")
 	require.NoError(t, err)
 	assert.Equal(t, int64(len(body)), head.Size)
-	assert.Empty(t, head.SHA256)
+	// SHA256 is derived by hashing the file, never persisted: the object is
+	// still the bare payload with no sidecar (see the on-disk assertions below).
+	assert.Equal(t, sumHex([]byte(body)), head.SHA256)
 	assert.Empty(t, head.Encrypted)
 
 	_, hasContentType := reflect.TypeFor[domain.ObjectMeta]().FieldByName("ContentType")
@@ -530,30 +647,41 @@ func TestPutIgnoresPutMeta_LocalStoresNoMetadata(t *testing.T) {
 // problems.md P7: content identity is SHA-256, not the synthetic size+mtime
 // ETag. A same-size overwrite whose mtime is restored (the exact ETag
 // collision) still yields a different digest, so revalidation cannot mistake
-// stale bytes for fresh ones.
+// stale bytes for fresh ones. Both object shapes are covered: a container
+// reports the digest from its header, a containerless object from hashing the
+// file, and neither may expose the ETag as content identity.
 func TestOverwriteSameSizeSameMTimeChangesSHA256(t *testing.T) {
 	t.Parallel()
 
-	for _, layout := range []string{config.LocalLayoutContainer, config.LocalLayoutRaw} {
-		t.Run(layout, func(t *testing.T) {
+	for _, shape := range []struct {
+		name      string
+		contained bool
+	}{
+		{name: "container", contained: true},
+		{name: "containerless", contained: false},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
 			t.Parallel()
 			dir := filepath.Join(t.TempDir(), "objects")
 			ctx := context.Background()
 			mtime := time.Unix(1_700_000_000, 0).UTC()
 
+			body := func(payload []byte) []byte {
+				if shape.contained {
+					return contained(t, payload, mtime)
+				}
+
+				return payload
+			}
+
 			write := func(payload []byte) {
 				t.Helper()
 
-				st, err := localstore.New(config.LocalConfig{Dir: dir, Layout: layout})
+				st, err := localstore.New(config.LocalConfig{Dir: dir})
 				require.NoError(t, err)
 				t.Cleanup(func() { _ = st.Close() })
 
-				body := payload
-				if layout == config.LocalLayoutContainer {
-					body = contained(t, payload, mtime)
-				}
-
-				require.NoError(t, st.Put(ctx, "k.bin", bytes.NewReader(body), domain.PutMeta{}))
+				require.NoError(t, st.Put(ctx, "k.bin", bytes.NewReader(body(payload)), domain.PutMeta{}))
 				first, err := identity.ResolveRemote(ctx, st, "k.bin")
 				require.NoError(t, err)
 				require.NotEmpty(t, first.SHA256, "backend must expose a content digest")
@@ -573,13 +701,14 @@ func TestOverwriteSameSizeSameMTimeChangesSHA256(t *testing.T) {
 			}
 
 			write([]byte("AAAA"))
-			// Fresh store so the raw-layout size+mtime memo (tested separately)
-			// cannot mask the digest; revalidation runs in a fresh process.
-			before, err := resSHA(ctx, dir, layout)
+			// Fresh store so the containerless size+mtime memo (tested
+			// separately) cannot mask the digest; revalidation runs in a fresh
+			// process.
+			before, err := resSHA(ctx, dir)
 			require.NoError(t, err)
 
-			overwriteSameIdentity(t, dir, layout, []byte("BBBB"), mtime)
-			after, err := resSHA(ctx, dir, layout)
+			overwriteSameIdentity(t, dir, body, []byte("BBBB"))
+			after, err := resSHA(ctx, dir)
 			require.NoError(t, err)
 
 			assert.NotEqual(t, before.SHA256, after.SHA256,
@@ -591,8 +720,8 @@ func TestOverwriteSameSizeSameMTimeChangesSHA256(t *testing.T) {
 }
 
 // resSHA resolves identity through a fresh store (empty SHA memo).
-func resSHA(ctx context.Context, dir, layout string) (domain.ObjectMeta, error) {
-	st, err := localstore.New(config.LocalConfig{Dir: dir, Layout: layout})
+func resSHA(ctx context.Context, dir string) (domain.ObjectMeta, error) {
+	st, err := localstore.New(config.LocalConfig{Dir: dir})
 	if err != nil {
 		return domain.ObjectMeta{}, err
 	}
@@ -603,23 +732,20 @@ func resSHA(ctx context.Context, dir, layout string) (domain.ObjectMeta, error) 
 
 // overwriteSameIdentity rewrites k.bin with a same-length body and restores the
 // original mtime, reproducing a same-size same-mtime overwrite.
-func overwriteSameIdentity(t *testing.T, dir, layout string, payload []byte, mtime time.Time) {
+func overwriteSameIdentity(t *testing.T, dir string, body func([]byte) []byte, payload []byte) {
 	t.Helper()
 
-	st, err := localstore.New(config.LocalConfig{Dir: dir, Layout: layout})
+	st, err := localstore.New(config.LocalConfig{Dir: dir})
 	require.NoError(t, err)
 
 	defer func() { _ = st.Close() }()
 
-	body := payload
-	if layout == config.LocalLayoutContainer {
-		body = contained(t, payload, mtime)
-	}
+	encoded := body(payload)
 
 	fi, err := os.Stat(filepath.Join(dir, "k.bin"))
 	require.NoError(t, err)
-	require.Equal(t, fi.Size(), int64(len(body)), "the overwrite must keep the same size")
-	require.NoError(t, st.Put(context.Background(), "k.bin", bytes.NewReader(body), domain.PutMeta{}))
+	require.Equal(t, fi.Size(), int64(len(encoded)), "the overwrite must keep the same size")
+	require.NoError(t, st.Put(context.Background(), "k.bin", bytes.NewReader(encoded), domain.PutMeta{}))
 	require.NoError(t, os.Chtimes(filepath.Join(dir, "k.bin"), fi.ModTime(), fi.ModTime()))
 }
 

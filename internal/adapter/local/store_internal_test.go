@@ -24,7 +24,7 @@ func TestSHAMemoEvictsLeastRecentlyUsed(t *testing.T) {
 
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "objects")
-	st, err := New(config.LocalConfig{Dir: dir, Layout: config.LocalLayoutRaw})
+	st, err := New(config.LocalConfig{Dir: dir})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 

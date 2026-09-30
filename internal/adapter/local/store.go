@@ -1,10 +1,11 @@
 // Package localstore keeps objects as files under a single local directory.
 //
-// Default layout (container) stores the same bytes as the S3 backend
-// (S3VCTR01 container plus payload). layout=raw stores the bare payload without
-// the S3VCTR01 container; because there is no enc marker it is only valid with
-// encryption.mode=none (enforced by config), so a raw object is plaintext.
-// Without a container header, content-hash dedup is unavailable.
+// Objects are stored byte for byte, so the same bytes reach the disk as an S3
+// backend would hold. Whether those bytes carry the S3VCTR01 container is the
+// writer's decision (encryption.mode), not the store's: a containerless object
+// arrives here as a bare payload and is kept as one. Because such an object has
+// no header to read a digest from, Head and Get derive the stored-bytes SHA-256
+// by hashing the file, memoized per (path, size, mtime).
 package localstore
 
 import (
@@ -24,6 +25,7 @@ import (
 	"syscall"
 
 	"github.com/xMlex/s3vault/internal/config"
+	"github.com/xMlex/s3vault/internal/container"
 	"github.com/xMlex/s3vault/internal/domain"
 	"github.com/xMlex/s3vault/internal/port"
 )
@@ -43,13 +45,12 @@ var tmpSeq atomic.Uint64
 
 // Store is a local-filesystem ObjectStore.
 type Store struct {
-	root   *os.Root
-	dir    string
-	layout string
-	// shaCache memoizes raw-layout stored-bytes SHA-256 per path. Only touched for
-	// layout=raw, where there is no container header to read a digest from.
-	// shaOrder/shaElems track access order so overflow evicts the least-recently-
-	// used entry deterministically (problems.md P5).
+	root *os.Root
+	dir  string
+	// shaCache memoizes the stored-bytes SHA-256 of containerless objects per
+	// path, which have no header to read a digest from. shaOrder/shaElems track
+	// access order so overflow evicts the least-recently-used entry
+	// deterministically (problems.md P5).
 	shaMu       sync.Mutex
 	shaCache    map[string]shaEntry
 	shaOrder    *list.List
@@ -71,15 +72,6 @@ func New(cfg config.LocalConfig) (*Store, error) {
 	if cfg.Dir == "" {
 		return nil, fmt.Errorf("local object dir is required")
 	}
-	layout := cfg.Layout
-	if layout == "" {
-		layout = config.LocalLayoutContainer
-	}
-	switch layout {
-	case config.LocalLayoutContainer, config.LocalLayoutRaw:
-	default:
-		return nil, fmt.Errorf("local layout %q is not supported", cfg.Layout)
-	}
 	if err := os.MkdirAll(cfg.Dir, dirMode); err != nil {
 		return nil, fmt.Errorf("mkdir local store: %w", err)
 	}
@@ -96,7 +88,6 @@ func New(cfg config.LocalConfig) (*Store, error) {
 	return &Store{
 		root:        root,
 		dir:         cfg.Dir,
-		layout:      layout,
 		shaCache:    make(map[string]shaEntry),
 		shaOrder:    list.New(),
 		shaElems:    make(map[string]*list.Element),
@@ -114,15 +105,6 @@ func (s *Store) Close() error {
 
 // Dir returns the object directory.
 func (s *Store) Dir() string { return s.dir }
-
-// Layout returns the on-disk layout (container or raw).
-func (s *Store) Layout() string { return s.layout }
-
-// StoresPlaintext reports whether objects are stored as bare payload without the
-// S3VCTR01 container (layout=raw). Such a store has no content hash from a
-// header, so callers must not hash files for skip decisions or build a container
-// header.
-func (s *Store) StoresPlaintext() bool { return s.layout == config.LocalLayoutRaw }
 
 func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error) {
 	rel, err := relPath(key)
@@ -143,18 +125,22 @@ func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error)
 		return domain.ObjectMeta{Key: key, Exists: false}, nil
 	}
 	meta := objectMeta(key, fi)
-	if s.layout == config.LocalLayoutRaw {
-		sum, err := s.sha256For(ctx, key, rel, fi)
-		if err != nil {
-			return domain.ObjectMeta{}, err
-		}
-		meta.SHA256 = sum
+
+	sum, err := s.digestFor(ctx, key, rel, fi, nil)
+	if err != nil {
+		return domain.ObjectMeta{}, err
 	}
+
+	meta.SHA256 = sum
 
 	return meta, nil
 }
 
-func (s *Store) Put(ctx context.Context, key string, r io.Reader, _ domain.PutMeta) error {
+// Put stores the object bytes unchanged. An incoming container is kept whole,
+// exactly as an S3 backend would. When the writer declared the object
+// containerless it also declared its digest, so record it: the store then knows
+// the object's identity and shape without guessing them from the body.
+func (s *Store) Put(ctx context.Context, key string, r io.Reader, meta domain.PutMeta) error {
 	rel, err := relPath(key)
 	if err != nil {
 		return err
@@ -167,13 +153,6 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, _ domain.PutMe
 			return fmt.Errorf("put %s: %w", key, err)
 		}
 	}
-	if s.layout == config.LocalLayoutRaw {
-		return s.putRaw(ctx, key, rel, r)
-	}
-	return s.putContainer(ctx, key, rel, r)
-}
-
-func (s *Store) putContainer(ctx context.Context, key, rel string, r io.Reader) error {
 	tmp, f, err := s.createTemp()
 	if err != nil {
 		return fmt.Errorf("put %s: %w", key, err)
@@ -198,6 +177,13 @@ func (s *Store) putContainer(ctx context.Context, key, rel string, r io.Reader) 
 		return fmt.Errorf("put %s: %w", key, err)
 	}
 	committed = true
+
+	if meta.PlaintextSHA256 != "" {
+		if fi, statErr := s.root.Stat(rel); statErr == nil {
+			s.rememberSHA(rel, fi, meta.PlaintextSHA256)
+		}
+	}
+
 	return nil
 }
 
@@ -207,28 +193,84 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadCloser, domain.Obje
 		return nil, domain.ObjectMeta{}, err
 	}
 	meta := objectMeta(key, fi)
-	if s.layout == config.LocalLayoutRaw {
-		rel, err := relPath(key)
-		if err != nil {
-			_ = f.Close()
-			return nil, domain.ObjectMeta{}, err
-		}
-		sum, err := s.sha256ForFile(ctx, key, rel, fi, f)
-		if err != nil {
-			_ = f.Close()
-			return nil, domain.ObjectMeta{}, err
-		}
-		meta.SHA256 = sum
+
+	rel, err := relPath(key)
+	if err != nil {
+		_ = f.Close()
+		return nil, domain.ObjectMeta{}, err
 	}
+
+	sum, err := s.digestFor(ctx, key, rel, fi, f)
+	if err != nil {
+		_ = f.Close()
+		return nil, domain.ObjectMeta{}, err
+	}
+
+	meta.SHA256 = sum
 
 	return f, meta, nil
 }
 
-// sha256For returns a raw-layout object's stored-bytes SHA-256, reading the file
-// on a cache miss. layout=raw has no container header, so this is the only way
-// to expose a digest; the digest is memoized by (path, size, mtime). A raw store
-// is plaintext-only (config enforces encryption.mode=none), so the stored bytes
-// are the plaintext.
+// digestFor returns the digest to expose for an object, or "" when the object
+// carries a container and identity must come from its header instead.
+//
+// A writer that stored the object in this process already declared the answer
+// in PutMeta, and Put recorded it, so the memo answers first and the body's
+// leading bytes are never consulted. The probe below only covers objects left by
+// an earlier process, where the declared digest is gone; there a body is treated
+// as a container only if it actually parses, so a plaintext file that happens to
+// start with the magic is still hashed rather than misread. f may be nil, in
+// which case the file is opened only when a digest is actually needed.
+func (s *Store) digestFor(ctx context.Context, key, rel string, fi fs.FileInfo, f *os.File) (string, error) {
+	if fi.Size() >= container.HeaderSize {
+		head, err := s.readHead(key, rel, f)
+		if err != nil {
+			return "", err
+		}
+
+		// IsMagic matched is not enough: a container must also parse.
+		if container.IsMagic(head) {
+			if _, parseErr := container.Parse(head); parseErr == nil {
+				return "", nil
+			}
+		}
+	}
+
+	if f != nil {
+		return s.sha256ForFile(ctx, key, rel, fi, f)
+	}
+
+	return s.sha256For(ctx, key, rel, fi)
+}
+
+// readHead returns the object's first HeaderSize bytes, shortened for a smaller
+// object. f may be nil, in which case the file is opened for the read.
+func (s *Store) readHead(key, rel string, f *os.File) ([]byte, error) {
+	if f == nil {
+		hf, err := s.root.Open(rel)
+		if err != nil {
+			return nil, fmt.Errorf("head %s: %w", key, err)
+		}
+		defer func() { _ = hf.Close() }()
+
+		f = hf
+	}
+
+	head := make([]byte, container.HeaderSize)
+
+	n, err := f.ReadAt(head, 0)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, fmt.Errorf("head %s: %w", key, err)
+	}
+
+	return head[:n], nil
+}
+
+// sha256For returns a containerless object's stored-bytes SHA-256, reading the
+// file on a cache miss. Such an object has no container header, so this is the
+// only way to expose a digest; the digest is memoized by (path, size, mtime).
+// A containerless object is written only with encryption.mode=none, so the
+// stored bytes are the plaintext.
 func (s *Store) sha256For(ctx context.Context, key, rel string, fi fs.FileInfo) (string, error) {
 	if sum, ok := s.cachedSHA(rel, fi); ok {
 		return sum, nil
@@ -300,8 +342,9 @@ func (s *Store) rememberSHA(rel string, fi fs.FileInfo, sum string) {
 // clamped, and a range starting past the last byte yields an empty body rather
 // than the 416 an S3 backend would raise.
 //
-// layout=raw ranges over the stored file (the bare plaintext payload); no
-// digest is exposed on this path.
+// The range covers the stored bytes, container prefix included, so a container
+// object can be identified from its first HeaderSize bytes. No digest is exposed
+// on this path.
 func (s *Store) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error) {
 	if start < 0 || end < start {
 		return nil, domain.ObjectMeta{}, fmt.Errorf("get range %s: invalid range %d-%d", key, start, end)
@@ -378,8 +421,8 @@ func objectMeta(key string, fi fs.FileInfo) domain.ObjectMeta {
 
 // etag is a synthetic validator: size and mtime both change when an object is
 // rewritten. Quoted like an S3 ETag so http.ServeContent accepts it. Content
-// identity still comes from the S3VCTR01 header (or, for raw, the stored-bytes
-// digest), never from this value.
+// identity still comes from the S3VCTR01 header (or, for a containerless
+// object, the stored-bytes digest), never from this value.
 func etag(fi fs.FileInfo) string {
 	return `"` + strconv.FormatInt(fi.Size(), 16) + "-" + strconv.FormatInt(fi.ModTime().UnixNano(), 16) + `"`
 }

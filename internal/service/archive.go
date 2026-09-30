@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"log/slog"
@@ -46,6 +47,7 @@ type Archive struct {
 	enc     port.Encryptor
 	logger  *slog.Logger
 	metrics *metrics.Collector
+	framing bool // see writesRaw: a hop always frames, even at encryption.mode=none
 }
 
 // NewArchive constructs the archive pipeline.
@@ -57,6 +59,16 @@ func NewArchive(scan port.Scanner, keys keying.Mapper, store port.ObjectStore, e
 		enc = nopEncryptor{}
 	}
 	return &Archive{scan: scan, keys: keys, store: store, enc: enc, logger: logger}
+}
+
+// WithFraming marks this Archive as a hop rather than a leaf writer, so it writes
+// the S3VCTR01 container even when encryption.mode=none. The gateway sets it: it
+// is a client of the storage in front of it, and the container is the only thing
+// that lets the next reader know a layer was removed. This is wiring fixed by the
+// command, not configuration — there is no key for it.
+func (a *Archive) WithFraming(framing bool) *Archive {
+	a.framing = framing
+	return a
 }
 
 // WithMetrics attaches a Prometheus collector. A nil collector is a no-op.
@@ -226,8 +238,7 @@ func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.F
 		return 0, identity.ActionUpload, nil
 	}
 
-	plaintext := a.storesPlaintext()
-	sum, remote, err := a.resolveRemote(ctx, opts, info, key, plaintext)
+	sum, remote, err := a.resolveRemote(ctx, opts, info, key)
 	if err != nil {
 		return 0, identity.ActionUnknown, err
 	}
@@ -241,7 +252,7 @@ func (a *Archive) handle(ctx context.Context, opts ArchiveOptions, info domain.F
 		return 0, action, nil
 	}
 
-	if err := a.upload(ctx, key, info, sum, plaintext); err != nil {
+	if err := a.upload(ctx, key, info, sum); err != nil {
 		return 0, identity.ActionUpload, err
 	}
 	if err := a.maybeDeleteLocal(opts, info, identity.ActionUpload); err != nil {
@@ -276,30 +287,28 @@ func actionName(a identity.Action) string {
 	}
 }
 
-// plaintextStore is an ObjectStore that persists bare payload without the
-// S3VCTR01 container (local layout=raw).
-type plaintextStore interface {
-	StoresPlaintext() bool
-}
-
-// storesPlaintext reports whether the backend drops the container header, so
-// the pipeline can skip hashing and the range peek.
-func (a *Archive) storesPlaintext() bool {
-	ps, ok := a.store.(plaintextStore)
-	return ok && ps.StoresPlaintext()
-}
+// writesRaw reports whether objects are written without the S3VCTR01 container.
+//
+// encryption.mode decides the payload, and with it the container: mode=none stores
+// the bare payload, because a container would carry no enc marker, no wrap and no
+// provider, and would exist only to hold the plaintext digest — which travels in
+// PutMeta instead (see domain.PutMeta). Every encrypting mode wraps, so a reader
+// can always tell ciphertext from plaintext by the header alone.
+//
+// framing overrides that for a process that is a hop rather than a leaf writer —
+// the gateway, which is a client of the storage in front of it. A hop must frame
+// even when it does not encrypt: the container is how the next reader knows a layer
+// was removed and what it contained, and the format has no marker of whose layer it
+// is. Without it, a mode=none gateway would strip the client's own layer as if it
+// were its own.
+func (a *Archive) writesRaw() bool { return !a.framing && encryptName(a.enc) == "none" }
 
 // resolveRemote returns the local plaintext SHA-256 and the remote identity.
-// For a plaintext store there is no remote content hash, so hashing and the
-// range peek are wasted I/O and Head alone drives the decision.
-func (a *Archive) resolveRemote(ctx context.Context, opts ArchiveOptions, info domain.FileInfo, key string, plaintext bool) (string, domain.ObjectMeta, error) {
-	if plaintext {
-		meta, err := a.store.Head(ctx, key)
-		if err != nil {
-			return "", domain.ObjectMeta{}, err
-		}
-		return "", meta, nil
-	}
+// The local file is always hashed: the digest drives Decide and travels with the
+// object as identity, so it is needed for containerless writes too. A
+// caller-supplied digest is validated here because both object shapes consume it
+// — a malformed one would silently disable content-skip instead of failing.
+func (a *Archive) resolveRemote(ctx context.Context, opts ArchiveOptions, info domain.FileInfo, key string) (string, domain.ObjectMeta, error) {
 	sum := opts.PlaintextSHA256
 	if sum == "" {
 		var err error
@@ -307,6 +316,8 @@ func (a *Archive) resolveRemote(ctx context.Context, opts ArchiveOptions, info d
 		if err != nil {
 			return "", domain.ObjectMeta{}, fmt.Errorf("checksum: %w", err)
 		}
+	} else if !isHexSHA256(sum) {
+		return "", domain.ObjectMeta{}, fmt.Errorf("plaintext sha256 %q: not a 64-character hex digest", sum)
 	}
 	meta, err := identity.ResolveRemote(ctx, a.store, key)
 	if err != nil {
@@ -315,10 +326,36 @@ func (a *Archive) resolveRemote(ctx context.Context, opts ArchiveOptions, info d
 	return sum, meta, nil
 }
 
-func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, sum string, plaintext bool) error {
+// isHexSHA256 reports whether s is a 64-character lowercase hex digest.
+func isHexSHA256(s string) bool {
+	if len(s) != 2*sha256.Size {
+		return false
+	}
+
+	for i := range len(s) {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, sum string) error {
 	started := time.Now()
+
 	var hdrBytes []byte
-	if !plaintext {
+
+	putMeta := domain.PutMeta{
+		ContentType:   mime.TypeByExtension(filepath.Ext(info.AbsPath)),
+		PlaintextSize: info.Size,
+	}
+	if a.writesRaw() {
+		// No container: identity moves to PutMeta so the store can expose the
+		// digest on HEAD and content-skip keeps working.
+		putMeta.PlaintextSHA256 = sum
+	} else {
 		var err error
 		hdrBytes, err = buildContainerHeader(sum, info.Size, info.ModTime,
 			encryptName(a.enc), encryptWrap(a.enc), encryptProvider(a.enc), cryptoProThumbprint(a.enc))
@@ -330,13 +367,11 @@ func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, 
 	pr, wait := a.encryptPipe(ctx, info.AbsPath)
 
 	body := pr
-	if !plaintext {
+	if len(hdrBytes) > 0 {
 		body = io.MultiReader(bytes.NewReader(hdrBytes), pr)
 	}
 
-	putErr := a.store.Put(ctx, key, body, domain.PutMeta{
-		ContentType: mime.TypeByExtension(filepath.Ext(info.AbsPath)),
-	})
+	putErr := a.store.Put(ctx, key, body, putMeta)
 	waitErr := wait()
 
 	if putErr != nil {
