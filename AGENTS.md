@@ -148,6 +148,8 @@ Version pinning is per job, not global: `tidy` must run on `1.26` or `stable` re
 
 - **`x-amz-checksum-sha256` describes the bytes in the body, so a `206` does not carry it.** The header's scope is the response, not the object: stamping the whole object's digest onto a ranged response is a false claim, and clients act on it — `aws s3 cp` downloads large objects in ranges and fails the whole transfer on mismatch. S3 answers a range with the digest *of that range*; computing one per range would mean reading it on every ranged read, so the header is omitted instead. This was a live bug that multipart merely made reachable (nothing over 5 MiB could get through the facade at all), which is why the fix needed its own test rather than inheriting coverage: `TestRangedGetOmitsWholeObjectChecksum`, plus the `206` assertion and a real `aws s3 cp` roundtrip in `phase_facade_multipart`. Details: `problems.md` §P2.
 
+- **`SDK ... WARN Skipped validation of multipart checksum` on the gateway is silenced on purpose, not overlooked.** `manager.Uploader` asks for CRC32 per part, so storage keeps a *composite* checksum (`<base64>-N`), which no client can recompute; the Go SDK skips validation and warns **once per GET of every object over the part size**. `s3store.getObject` sets `DisableLogOutputChecksumValidationSkipped`. Do not "fix" it by dropping the per-part CRC32: that would trade the stronger guarantee (the store rejects a mismatching part on write) for a quieter log. The assertion in `phase_facade_multipart` guards the silence.
+
 - **Reader mode is validated against the object header.** `DecryptAuto`
   (`internal/adapter/encrypt/detect.go`) branches on the `S3VCTR01` `Enc` field
   returned by `unwrapForDecrypt`, not on the local encryptor type. With a

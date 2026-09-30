@@ -158,7 +158,8 @@ func (s *Store) getObject(ctx context.Context, key, rangeHdr string) (io.ReadClo
 	if rangeHdr != "" {
 		in.Range = aws.String(rangeHdr)
 	}
-	out, err := s.client.GetObject(ctx, in)
+
+	out, err := s.client.GetObject(ctx, in, noCompositeChecksumWarning)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, domain.ObjectMeta{}, domain.ErrNotFound
@@ -176,6 +177,30 @@ func (s *Store) getObject(ctx context.Context, key, rangeHdr string) (io.ReadClo
 		fillObjectMeta(&meta, out.Metadata)
 	}
 	return out.Body, meta, nil
+}
+
+// noCompositeChecksumWarning silences "Skipped validation of multipart checksum"
+// on every read of an object that was written as multipart.
+//
+// The chain behind the warning: manager.Uploader asks for CRC32 per part, so the
+// store keeps a COMPOSITE checksum — on MinIO, x-amz-checksum-crc32: <base64>-3
+// with ChecksumType COMPOSITE — and a checksum-of-checksums cannot be recomputed
+// client-side. The SDK therefore skips verification and says so, once per GET, at
+// WARN.
+//
+// Nothing actionable is lost, and the guarantee that does exist is the stronger
+// one. Write-side integrity is untouched: the per-part CRC32 travels in the
+// request and the store rejects any part that does not match it. What the warning
+// denies is a *redundant* read-side re-check of a value no client can reproduce —
+// true of every multipart-written object, so the line is constant rather than
+// news, and identical on MinIO and on real S3 (AWS documents that clients cannot
+// verify checksums of multipart-uploaded objects). Left on, it costs one WARN per
+// read of every object over the part size, which is the shape of log an operator
+// stops reading.
+//
+// It is a warning, not a failure: the read returns the correct bytes either way.
+func noCompositeChecksumWarning(o *s3.Options) {
+	o.DisableLogOutputChecksumValidationSkipped = true
 }
 
 func fillObjectMeta(meta *domain.ObjectMeta, md map[string]string) {

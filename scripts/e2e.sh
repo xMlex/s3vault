@@ -950,6 +950,16 @@ phase_facade_multipart() {
 			"$VAULT_BIN" upload "$dflt/def.bin" --key bad.bin 2>&1 >/dev/null || true)" \
 		"s3.multipart_part_size"
 
+	# Лог шлюза не должен содержать предупреждения Go-SDK о непроверяемой
+	# чек-сумме multipart-объекта. Оно появлялось по одному WARN на каждое
+	# чтение объекта, записанного multipart (manager просит CRC32 на часть,
+	# хранилище хранит композит base64-N, клиент такой хеш не воспроизводит и
+	# пишет "Skipped validation of multipart checksum"). Читает фаза выше,
+	# поэтому лог уже непуст — проверять есть что.
+	assert_not_contains "шлюз не пишет 'Skipped validation of multipart checksum'" \
+		"$(cat "$VAULT_LOG" 2>/dev/null || true)" \
+		"Skipped validation of multipart checksum"
+
 	# Спул не протекает: ни частей, ни склеенного файла после Complete не остаётся.
 	# Каталог задан явно (start_vault выше), иначе проверялся бы дефолт в $HOME.
 	if [[ -d "$MP_SPOOL" ]]; then
