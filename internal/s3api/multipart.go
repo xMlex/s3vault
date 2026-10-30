@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -155,11 +156,13 @@ func newMPRegistry(cfg MultipartConfig, log *slog.Logger) (*mpRegistry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("multipart spool dir: %w", err)
 	}
-	// A session belongs to the process that created it, so anything already in
-	// the spool root belongs to a process that is gone. The local object store
-	// gives .s3vault-tmp the same treatment, and a failure here is fatal rather
-	// than logged: a spool dir we cannot trust is a spool dir we must not use.
-	if err := os.RemoveAll(dir); err != nil {
+	// A session belongs to the process that created it, so a session directory
+	// already in the spool root belongs to a process that is gone. Only those are
+	// removed: the root is an operator-chosen directory, and wiping all of it
+	// would delete whatever else lives there. config.Normalize refuses a root that
+	// overlaps the object store or the cache, but this keeps the blast radius to
+	// our own entries even for a hand-built config.
+	if err := removeStaleSessions(dir); err != nil {
 		return nil, fmt.Errorf("multipart spool dir %s: %w", dir, err)
 	}
 
@@ -170,6 +173,36 @@ func newMPRegistry(cfg MultipartConfig, log *slog.Logger) (*mpRegistry, error) {
 	return &mpRegistry{dir: dir, sessions: map[string]*session{}, log: log}, nil
 }
 
+// sessionDirPrefix names a session directory in the spool root. os.MkdirTemp
+// appends a random suffix, so the prefix is all a stale directory can be
+// recognised by.
+const sessionDirPrefix = "mput-"
+
+// removeStaleSessions deletes session directories left by a dead process and
+// nothing else.
+func removeStaleSessions(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // MkdirAll in the caller creates it
+		}
+
+		return err
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), sessionDirPrefix) {
+			continue
+		}
+
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // create registers a new session and returns it.
 func (reg *mpRegistry) create(accessKeyID, backendKey string) (*session, error) {
 	uploadID, err := newUploadID()
@@ -177,7 +210,7 @@ func (reg *mpRegistry) create(accessKeyID, backendKey string) (*session, error) 
 		return nil, err
 	}
 
-	dir, err := os.MkdirTemp(reg.dir, "mput-")
+	dir, err := os.MkdirTemp(reg.dir, sessionDirPrefix)
 	if err != nil {
 		return nil, fmt.Errorf("multipart session dir: %w", err)
 	}

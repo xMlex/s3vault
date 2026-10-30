@@ -32,7 +32,9 @@ func newTestRegistry(t *testing.T) *mpRegistry {
 func TestMPRegistryWipesStaleSpoolOnOpen(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "spool")
+	require.NoError(t, os.Mkdir(dir, 0o700))
+
 	leftover := filepath.Join(dir, "mput-from-a-previous-process")
 	require.NoError(t, os.MkdirAll(leftover, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(leftover, "part-00001"), []byte("orphaned"), 0o600))
@@ -49,6 +51,49 @@ func TestMPRegistryWipesStaleSpoolOnOpen(t *testing.T) {
 	info, err := os.Stat(dir)
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "the spool root is 0700")
+}
+
+// The spool root is created 0700 when it does not exist; an existing directory
+// keeps its mode, exactly as backend.local.dir does. Session directories and part
+// files stay 0700/0600 regardless.
+func TestMPRegistryCreatesSpoolRoot0700(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "new-spool")
+	_, err := newMPRegistry(MultipartConfig{Dir: dir}, nil)
+	require.NoError(t, err)
+
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
+}
+
+// The spool root is a directory the operator points at, so the startup wipe must
+// reach only session directories this facade creates. Removing the whole root
+// erased whatever else lived there: a spool inside backend.local.dir took the
+// objects with it, and nothing else in that directory had a say.
+func TestMPRegistryLeavesUnrelatedEntriesAlone(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "mput-from-a-previous-process")
+	require.NoError(t, os.MkdirAll(stale, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(stale, "part-00001"), []byte("orphaned"), 0o600))
+
+	notOurs := filepath.Join(dir, "not-a-session")
+	require.NoError(t, os.MkdirAll(notOurs, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(notOurs, "keep.txt"), []byte("keep"), 0o600))
+
+	notes := filepath.Join(dir, "notes.txt")
+	require.NoError(t, os.WriteFile(notes, []byte("operator data"), 0o600))
+
+	_, err := newMPRegistry(MultipartConfig{Dir: dir}, nil)
+	require.NoError(t, err)
+
+	require.NoDirExists(t, stale, "a session directory from a dead process is still garbage")
+	require.DirExists(t, notOurs, "a directory that is not a session must survive")
+	require.FileExists(t, filepath.Join(notOurs, "keep.txt"))
+	require.FileExists(t, notes)
 }
 
 func TestMPRegistryGetEnforcesOwnerAndKey(t *testing.T) {

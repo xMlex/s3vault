@@ -319,8 +319,15 @@ func entryUnchanged(stored, want port.EntryMeta) bool {
 	return false
 }
 
+// expired reports whether the sidecar's TTL has passed.
 func expired(sc sidecar, now time.Time) bool {
 	return !sc.ExpiresAt.IsZero() && !now.Before(sc.ExpiresAt)
+}
+
+// isShardName reports whether name is one of the two-hex directories cache entries
+// live in. Everything else in the root is not the cache's.
+func isShardName(name string) bool {
+	return len(name) == shardLen && isHex(name)
 }
 
 func (d *Disk) abs(rel string) string {
@@ -641,7 +648,7 @@ func (d *Disk) listEntries() ([]entry, int64, error) {
 	var out []entry
 	var total int64
 	for _, sh := range shards {
-		if !sh.IsDir() || len(sh.Name()) != shardLen || !isHex(sh.Name()) {
+		if !sh.IsDir() || !isShardName(sh.Name()) {
 			continue
 		}
 		sf, err := d.root.Open(sh.Name())
@@ -759,7 +766,10 @@ func (d *Disk) sweepLoop(ctx context.Context, interval time.Duration, log *slog.
 	}
 }
 
-// Clear deletes cached plaintext (keeps the root directory).
+// Clear deletes cached plaintext and keeps the root directory. It removes cache
+// shards only: anything else under the root (a neighbour directory, an operator's
+// file) is not the cache's to delete, and the multipart spool used to be exactly
+// such a neighbour.
 func (d *Disk) Clear() error {
 	dirf, err := d.root.Open(".")
 	if err != nil {
@@ -771,6 +781,9 @@ func (d *Disk) Clear() error {
 		return err
 	}
 	for _, n := range names {
+		if !n.IsDir() || !isShardName(n.Name()) {
+			continue
+		}
 		if err := d.root.RemoveAll(n.Name()); err != nil {
 			return err
 		}

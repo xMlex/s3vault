@@ -301,11 +301,19 @@ func (c *Config) Normalize() error {
 		}
 		c.Cache.Dir = filepath.Join(dir, "s3vault")
 	}
+	// Cleaned so the spool sibling below is derived from the real directory: with
+	// a trailing separator, filepath.Dir/Base would place it inside the cache.
+	c.Cache.Dir = filepath.Clean(c.Cache.Dir)
 	// The multipart spool lives beside the cache directory, not inside it: both
-	// hold plaintext on disk, but they are swept by different rules and the
-	// cache may be disabled while multipart must keep working.
+	// hold plaintext on disk, but they are swept by different rules, `cache clear`
+	// drops every cache shard under cache.dir, and the cache may be disabled while
+	// multipart must keep working.
 	if strings.TrimSpace(c.Server.MultipartDir) == "" {
-		c.Server.MultipartDir = filepath.Join(c.Cache.Dir, "multipart")
+		c.Server.MultipartDir = filepath.Join(filepath.Dir(c.Cache.Dir), filepath.Base(c.Cache.Dir)+"-multipart")
+	}
+
+	if err := c.checkMultipartDir(); err != nil {
+		return err
 	}
 	if _, err := period.Parse(c.Archive.OlderThan); err != nil {
 		return fmt.Errorf("archive.older_than: %w", err)
@@ -370,6 +378,57 @@ func (c *Config) normalizeBackend() error {
 		return fmt.Errorf("backend.type: unknown value %q", c.Backend.Type)
 	}
 	return nil
+}
+
+// checkMultipartDir refuses a spool root that overlaps the object store or the
+// plaintext cache. The spool is scanned at startup and the cache is cleared by
+// `cache clear`, so a shared tree turns either into deletion of somebody else's
+// data: at backend.local.dir it is the archived objects, inside cache.dir it is
+// the in-flight upload parts.
+func (c *Config) checkMultipartDir() error {
+	spool, err := filepath.Abs(c.Server.MultipartDir)
+	if err != nil {
+		return fmt.Errorf("server.multipart_dir: %w", err)
+	}
+
+	roots := []struct{ key, dir string }{{"cache.dir", c.Cache.Dir}}
+	if c.Backend.Type == BackendLocal {
+		roots = append(roots, struct{ key, dir string }{"backend.local.dir", c.Backend.Local.Dir})
+	}
+
+	for _, r := range roots {
+		dir, err := filepath.Abs(r.dir)
+		if err != nil {
+			return fmt.Errorf("%s: %w", r.key, err)
+		}
+
+		if pathsOverlap(spool, dir) {
+			return fmt.Errorf(
+				"server.multipart_dir %q must not overlap %s %q: "+
+					"the spool holds client plaintext and is cleaned on startup, so it must not share a tree with it",
+				spool, r.key, dir,
+			)
+		}
+	}
+
+	return nil
+}
+
+// pathsOverlap reports whether one path contains the other (equality included).
+// The comparison is lexical: symlinks are not resolved.
+func pathsOverlap(a, b string) bool {
+	return pathContains(a, b) || pathContains(b, a)
+}
+
+// pathContains reports whether child is parent or lies beneath it. Different
+// volumes (filepath.Rel erroring on Windows) do not overlap.
+func pathContains(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 // KeyPrefix is the object key prefix for any backend. It lives under s3.prefix

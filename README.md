@@ -807,7 +807,7 @@ aws --endpoint-url http://127.0.0.1:8080 s3 cp ./file s3://my-bucket/logs/file -
 
 | ключ | env | по умолчанию | что делает |
 | --- | --- | --- | --- |
-| `server.multipart_dir` | `S3VAULT_SERVER_MULTIPART_DIR` | `{cache.dir}/multipart` | каталог спула, `0700`; части `0600` |
+| `server.multipart_dir` | `S3VAULT_SERVER_MULTIPART_DIR` | `{cache.dir}-multipart` | каталог спула (соседний с кэшем, не внутри), `0700`; части `0600` |
 | `server.multipart_ttl` | `S3VAULT_SERVER_MULTIPART_TTL` | `24h` | сколько живёт сессия без новых `UploadPart` |
 | `server.multipart_sweep_interval` | `S3VAULT_SERVER_MULTIPART_SWEEP_INTERVAL` | `15m` | как часто сборщик чистит спул; `0` — выключить |
 | `server.multipart_max_sessions` | `S3VAULT_SERVER_MULTIPART_MAX_SESSIONS` | `64` | больше живых сессий — вытесняется самая давно тронутая |

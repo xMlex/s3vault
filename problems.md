@@ -10,12 +10,12 @@
 
 ## Сводка
 
-**Открыто: 13 пунктов** (D1 и D2 исправлены, D12 снят). Независимая проверка прогоном подтвердила 15 из 16; в каждой карточке — строка **Проверка:** с командой и наблюдаемым результатом.
+**Открыто: 12 пунктов** (D1, D2, D3 исправлены, D12 снят). Независимая проверка прогоном подтвердила 15 из 16; в каждой карточке — строка **Проверка:** с командой и наблюдаемым результатом.
 
 | Проверка | Пункты |
 | --- | --- |
-| ✅ подтверждено и исправлено | D1 (`local.Delete` сносил файл-объект-родитель), D2 (неудачный retry `UploadPart` уничтожал принятую часть) |
-| ✅ подтверждено прогоном (runtime) | D3, D4, D5, D6, D8, D9, D11 (частично), D13, D14 |
+| ✅ подтверждено и исправлено | D1 (`local.Delete` сносил файл-объект-родитель), D2 (неудачный retry `UploadPart` уничтожал принятую часть), D3 (спул стирал каталог целиком и жил внутри `cache.dir`) |
+| ✅ подтверждено прогоном (runtime) | D4, D5, D6, D8, D9, D11 (частично), D13, D14 |
 | ✅ подтверждено unit/сборкой | D7 (Windows-сборка, no-op lock), D10 (unit), D15 (unit) |
 | ✅ подтверждено как краевой контракт | D16 (в пределах своего префикса) |
 | ❌ опровергнуто / снято | D12 (наблюдаемый исход — stale sidecar, перекрыт D13/D14) |
@@ -73,10 +73,10 @@ PUT и удалял его, не записав (`docs/reliability-review.md` H2
 
 ### D3 — мультипарт-спул: `RemoveAll` при старте и дефолт внутри `cache.dir`
 
-**Проверка:** ✅ прогон — (1) `newMPRegistry` сносит содержимое каталога при открытии; (2) `Normalize(multipart_dir == backend.local.dir)` → `err=<nil>` (гварда нет); (3) дефолт `inside=true` (`rel="multipart"`); (4) `Disk.Clear` удаляет `multipart/`. End-to-end `s3vault server` не поднимался, но вызывается тот же код с тем же значением из конфига.
+**Проверка:** ✅ прогон — до правки: (1) `newMPRegistry` сносил содержимое каталога при открытии (`TestMPRegistryLeavesUnrelatedEntriesAlone`); (2) `Normalize(multipart_dir == backend.local.dir)` → `err=<nil>` (`TestMultipartDirMustNotOverlapStorageOrCache`); (3) дефолт был **внутри** `cache.dir` (`TestMultipartDirDefault`); (4) `Disk.Clear` удалял соседний `multipart/` (`TestDiskClearLeavesNeighbourDirectoriesAlone`). Все четыре теста падали на старом коде.
 
-**Статус:** 🟥 подтверждён.
-**Где:** `internal/s3api/multipart.go:162` (`os.RemoveAll(dir)`), вызов `s3api.New` ← `internal/cli/root.go:504`; дефолт `internal/config/config.go:307-309`.
+**Статус:** ✅ подтверждён и исправлен.
+**Где:** `internal/s3api/multipart.go:154` (`newMPRegistry`), `:183` (`removeStaleSessions`); дефолт и гвард — `internal/config/config.go:309` и `:384` (`checkMultipartDir`); `internal/adapter/cache/disk.go:773` (`Clear`).
 **Механика:** при старте `server` каталог спула рекурсивно стирается без проверки, что он «свой». Дефолт — `filepath.Join(cache.dir, "multipart")`, то есть **внутри** каталога кэша, хотя комментарий `config.go:304` и `docs/multipart.md` §7 утверждают «beside … not inside».
 **Как воспроизвести:**
 1. `server.multipart_dir` = `backend.local.dir` → старт `server` сносит все объекты локального бэкенда (ObjectStore уже открыт по тому же пути, `internal/cli/root.go:429`), после чего GET отдаёт `NoSuchKey`.
@@ -84,6 +84,12 @@ PUT и удалял его, не записав (`docs/reliability-review.md` H2
 3. `server.multipart_dir` = любой каталог с данными — стирается молча.
 **Направление:** создавать/стирать только уникальный подкаталог спула; в `Normalize` отвергать пересечение с `backend.local.dir` и `cache.dir`; сузить `Disk.Clear` до данных кэша (`ab/`), не трогая соседей.
 **Тест:** `multipart_dir == backend.local.dir` → ошибка старта.
+**Что сделано:**
+1. **Старт больше не стирает каталог.** `newMPRegistry` зовёт `removeStaleSessions`: удаляются только каталоги с префиксом `mput-` (имена сессий, их создаёт `os.MkdirTemp`), остальное содержимое корня не трогается. Корень создаётся `0700`, если его нет; существующий сохраняет свой режим — как `backend.local.dir`.
+2. **Дефолт вынесен из `cache.dir`.** `<cache.dir>-multipart` (соседний каталог), что наконец соответствует комментарию и документации; `cache clear` его больше не задевает.
+3. **Пересечения отвергаются на старте.** `config.Normalize` → `checkMultipartDir`: `server.multipart_dir` не может совпадать с `cache.dir` или `backend.local.dir` и не может лежать внутри них либо содержать их (проверка в обе стороны, лексическая). Ошибка называет оба ключа и оба пути.
+4. **`Disk.Clear` сужен до кэша.** Удаляются только шарды `<две hex-цифры>/` (`isShardName`, тот же предикат, что у `listEntries`), а не все дети корня.
+**Тесты:** `TestMultipartDirDefault` (дефолт — сосед, не внутри), `TestMultipartDirMustNotOverlapStorageOrCache` (8 случаев: равно/внутри/содержит для обоих корней + два безопасных), `TestMPRegistryWipesStaleSpoolOnOpen` (старая сессия удалена), `TestMPRegistryLeavesUnrelatedEntriesAlone` (чужие файлы и каталоги живы), `TestMPRegistryCreatesSpoolRoot0700`, `TestDiskClearLeavesNeighbourDirectoriesAlone` (кэш очищен, соседние части целы). Все падали на старом коде, кроме старого wipe-теста.
 
 ### D4 — `--delete-after-upload` / `--delete-if-exists` нельзя выключить
 

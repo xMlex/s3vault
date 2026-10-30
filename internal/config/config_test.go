@@ -96,7 +96,8 @@ func TestMultipartPartSizeFromEnv(t *testing.T) {
 // The multipart spool defaults beside the cache directory but is not inside it:
 // the cache carries its own invariants (TTL, sweeper, lockfile) and can be
 // switched off, while multipart has to work in every configuration. Reusing
-// cache.dir would have coupled a must-always-work feature to a default-false one.
+// cache.dir would have coupled a must-always-work feature to a default-false one
+// — and put the spool where `cache clear` deletes every child.
 func TestMultipartDirDefault(t *testing.T) {
 	t.Parallel()
 
@@ -108,7 +109,20 @@ func TestMultipartDirDefault(t *testing.T) {
 		v.Set("cache.dir", "/srv/s3vault/cache")
 		cfg, err := Load(v)
 		require.NoError(t, err)
-		assert.Equal(t, filepath.Join("/srv/s3vault/cache", "multipart"), cfg.Server.MultipartDir)
+		assert.Equal(t, "/srv/s3vault/cache-multipart", cfg.Server.MultipartDir)
+		assert.NotContains(t, cfg.Server.MultipartDir, cfg.Cache.Dir+string(filepath.Separator),
+			"the spool must not be inside the cache directory")
+	})
+
+	t.Run("trailing separator in cache.dir", func(t *testing.T) {
+		t.Parallel()
+
+		v := viper.New()
+		SetDefaults(v)
+		v.Set("cache.dir", "/srv/s3vault/cache/")
+		cfg, err := Load(v)
+		require.NoError(t, err)
+		assert.Equal(t, "/srv/s3vault/cache-multipart", cfg.Server.MultipartDir)
 	})
 
 	t.Run("overridable", func(t *testing.T) {
@@ -122,6 +136,61 @@ func TestMultipartDirDefault(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "/srv/s3vault/mp", cfg.Server.MultipartDir)
 	})
+}
+
+// The spool root is wiped at startup and every session directory is deleted when
+// it is opened, so pointing it at a tree that holds something else is destructive:
+// at backend.local.dir it would delete objects, inside cache.dir `cache clear`
+// deletes the spool (or the reverse). Overlap in either direction is refused at
+// startup rather than discovered after data is gone.
+func TestMultipartDirMustNotOverlapStorageOrCache(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	objects := filepath.Join(base, "objects")
+	cache := filepath.Join(base, "cache")
+	spool := filepath.Join(base, "spool")
+
+	tests := []struct {
+		name    string
+		local   string
+		cache   string
+		spool   string
+		wantErr string
+	}{
+		{name: "unrelated directories", local: objects, cache: cache, spool: spool},
+		{name: "sibling sharing a name prefix", local: objects, cache: cache, spool: cache + "-multipart"},
+		{name: "spool equals backend.local.dir", local: objects, cache: cache, spool: objects, wantErr: "backend.local.dir"},
+		{name: "spool inside backend.local.dir", local: objects, cache: cache, spool: filepath.Join(objects, "spool"), wantErr: "backend.local.dir"},
+		{name: "backend.local.dir inside spool", local: filepath.Join(spool, "objects"), cache: cache, spool: spool, wantErr: "backend.local.dir"},
+		{name: "spool equals cache.dir", local: objects, cache: cache, spool: cache, wantErr: "cache.dir"},
+		{name: "spool inside cache.dir", local: objects, cache: cache, spool: filepath.Join(cache, "multipart"), wantErr: "cache.dir"},
+		{name: "cache.dir inside spool", local: objects, cache: filepath.Join(spool, "cache"), spool: spool, wantErr: "cache.dir"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			v := viper.New()
+			SetDefaults(v)
+			v.Set("backend.type", BackendLocal)
+			v.Set("backend.local.dir", tt.local)
+			v.Set("cache.dir", tt.cache)
+			v.Set("server.multipart_dir", tt.spool)
+
+			_, err := Load(v)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "server.multipart_dir")
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
 }
 
 // The spool keys are advertised in .env.example, so they must actually bind —

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -345,6 +346,43 @@ func TestDiskRejectsBadID(t *testing.T) {
 	d := newTestDisk(t, Options{})
 	_, _, err := d.Get(context.Background(), port.CacheID("../etc/passwd"))
 	require.Error(t, err)
+}
+
+// Clear drops cached plaintext, not everything that happens to live under the
+// root. It used to RemoveAll every child, so a neighbour directory — the
+// multipart spool when it defaulted to {cache.dir}/multipart — was deleted along
+// with the cache, taking in-flight upload parts with it.
+func TestDiskClearLeavesNeighbourDirectoriesAlone(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
+	id := ID("b", "k", "fp")
+
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+		_, err := io.WriteString(w, "cached")
+		return err
+	})
+	require.NoError(t, err)
+
+	dataRel, _, _, _, err := d.rel(id)
+	require.NoError(t, err)
+
+	neighbour := path.Join("multipart", "mput-1234")
+	require.NoError(t, os.MkdirAll(filepath.Join(d.dir, "multipart", "mput-1234"), 0o700))
+	part := filepath.Join(d.dir, neighbour, "part-00001")
+	require.NoError(t, os.WriteFile(part, []byte("client plaintext"), 0o600))
+
+	require.NoError(t, d.Clear())
+
+	_, err = d.root.Stat(dataRel)
+	assert.True(t, os.IsNotExist(err), "the cached entry must be gone")
+	_, err = os.Stat(part)
+	require.NoError(t, err, "a neighbour directory is not the cache's to delete")
+
+	usage, err := d.Usage()
+	require.NoError(t, err)
+	assert.Zero(t, usage.Entries)
+	assert.Zero(t, usage.Bytes)
 }
 
 func newTestDisk(t *testing.T, opt Options) *Disk {
