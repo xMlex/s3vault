@@ -1,14 +1,28 @@
 # Известные проблемы
 
-Бэклог дефектов, найденных при сверке `architecture.md` с кодом. **Открытых пунктов нет.**
+Бэклог дефектов, найденных при сверке `architecture.md` с кодом и сплошным аудитом путей записи/удаления/чтения. Пункты D1–D16 прошли **независимую проверку прогоном** — смотри строку **Проверка:** в каждой карточке. Итог: 15 из 16 подтверждены, D12 снят (не воспроизводится в заявленной форме).
 
 Статусы: `🔍` — не подтверждён, требует проверки; `✅` — подтверждён и исправлен (или задокументирован как контракт); `🚧` — подтверждён, но поведение намеренно заморожено до решения; `➖` — снят по решению оператора (не чиним / оставляем как есть).
+
+Статусы открытых пунктов этого разбора (D1–D16): `🟥` — подтверждён (код и/или прогон), открыт (потеря/порча данных); `🟠` — подтверждён механизм, но остаётся сценарий, который детерминированно не воспроизведён; `🔍` — не подтверждён / снят; ✅/❌ в строке **Проверка:** — подтверждён/опровергнут прогоном.
 
 Ничего из перечисленного **не** является дефектом формата `S3VCTR01`: контейнер, послойность владения и дедуп проверены побайтово и корректны.
 
 ## Сводка
 
-Открытых проблем нет.
+**Открыто: 14 пунктов** (D1 исправлен, D12 снят). Независимая проверка прогоном подтвердила 15 из 16; в каждой карточке — строка **Проверка:** с командой и наблюдаемым результатом.
+
+| Проверка | Пункты |
+| --- | --- |
+| ✅ подтверждено и исправлено | D1 (`local.Delete` сносил файл-объект-родитель) |
+| ✅ подтверждено прогоном (runtime) | D2, D3, D4, D5, D6, D8, D9, D11 (частично), D13, D14 |
+| ✅ подтверждено unit/сборкой | D7 (Windows-сборка, no-op lock), D10 (unit), D15 (unit) |
+| ✅ подтверждено как краевой контракт | D16 (в пределах своего префикса) |
+| ❌ опровергнуто / снято | D12 (наблюдаемый исход — stale sidecar, перекрыт D13/D14) |
+
+Отдельно: в D11 подвариант «вытеснение по TTL прямо в середине записи» **опровергнут** (`touch()` пинит сессию); подтверждён только вариант `max_sessions`. Строки **Проверка:** содержат точные команды и вывод.
+
+Найдены сплошным аудитом путей, где данные удаляются, перезаписываются или записываются молча: `local.Delete`, мультипарт-спул фасада, инвалидация/сборка дискового кэша, пост-обработка `archive`/`download`, конфиг-флаги удаления. Каждый пункт проверен отдельным агентом в изоляции; временные тесты после проверки удалены, дерево оставлено чистым.
 
 Закрыт **P2** — фасад отдавал `x-amz-checksum-sha256` всего объекта и в
 ranged-ответе `206`, из-за чего `aws s3 cp` ронял передачу крупных объектов.
@@ -22,6 +36,172 @@ PUT и удалял его, не записав (`docs/reliability-review.md` H2
 `config.removedKeys`, поэтому старый конфиг валит запуск с внятным сообщением, а не
 меняет поведение молча. Если защита от перезаписи понадобится, она возвращается как
 флаг команды `archive`, а не как ключ конфига.
+
+---
+
+## Потеря / порча данных (`🟥` открыто, `✅` исправлено)
+
+Все пункты ниже — пути, где данные могут быть удалены или записаны искажённо **без ошибки на выходе**. Порядок — по достижимости из штатного конфига.
+
+### D1 — `local`: `DELETE a/b` сносит существующий объект `a`
+
+**Проверка:** ✅ прогон — `go test -run TestDeleteMissingChildKeepsParentObject ./internal/adapter/local/`: до правки `Put("a")` → `Delete("a/b")` возвращал `nil`, а `Head("a")` — `Exists=false`; после правки объект `a` читается побайтово. Сквозной прогон через S3-фасад (временный тест, удалён): `PUT /vault/a` → `DELETE /vault/a/b` (204) → `HEAD /vault/a` давал `404`, после правки — `200`.
+
+**Статус:** ✅ подтверждён и исправлен.
+**Где:** `internal/adapter/local/delete.go:23` → `pruneDirs` (`internal/adapter/local/delete.go:29-52`); `internal/adapter/local/store.go:430-434`.
+**Механика:** `Delete` вызывает `root.Remove(rel)` и глотает `ENOTDIR` как «не найдено» (`isNotFound`). Затем безусловно `pruneDirs(filepath.Dir(rel))`, а `pruneDirs` в цикле делает `root.Remove` над каждым компонентом пути, **не проверяя, каталог это или файл-объект**. Для `rel = "a/b"`, где `a` — обычный файл-объект, `Remove("a")` его удаляет. Ошибок нет, ответ `204`.
+**Как воспроизвести:** `PUT /b/a`; затем `DELETE /b/a/b` (объекта `a/b` нет — по S3 это идемпотентный no-op). Объект `a` исчез.
+**Достижимость:** S3-фасад (`internal/s3api/delete.go:17`) зовёт `store.Delete` напрямую, без проверки существования.
+**Почему не поймано:** `internal/adapter/local/store_test.go:257` (`TestParentIsFile`) делает ровно `put("a"); Delete("a/b")` и проверяет только `NoError`, не проверяя, что `a` выжил.
+**Направление:** в `pruneDirs` сначала `root.Stat(dir)` и выходить, если это не каталог; либо не трогать компоненты, которым соответствует существующий объект. Не переносить `isNotFound`-семантику на удаление.
+**Тест:** после `Delete("a/b")` объект `a` читается побайтово.
+**Что сделано:** `pruneDirs` теперь сначала `(root).Lstat` каждый компонент и удаляет только каталог: файл-объект, символическая ссылка или иная запись останавливают обход. Отсутствующий компонент по-прежнему пропускается вверх, поэтому опустевшие каталоги чистятся как раньше (`TestDeleteIsIdempotentAndPrunesDirs`). `Lstat`, а не `Stat`, чтобы не следовать по ссылке и не принять её за каталог. Регрессия закреплена постоянным тестом `TestDeleteMissingChildKeepsParentObject` (`internal/adapter/local/store_test.go`), который падал на старом коде и проходит на новом; `go test -race ./...` и `go vet ./...` зелёные.
+
+### D2 — фасад: повторная загрузка части неатомарна и уничтожает уже принятую часть
+
+**Проверка:** ✅ прогон — `go test -run TestZZVerifyD2 ./internal/s3api/`: после неудачного retry `Stat(part-00001)` → ENOENT; `ListParts` всё ещё отдаёт часть 1; `assembleParts` падает в `InternalError`, не `InvalidPart`.
+
+**Статус:** 🟥 подтверждён.
+**Где:** `internal/s3api/multipart.go:484` (`O_TRUNC`), `:492-512` (все ветки ошибки → `discard`), `:519-538` (`recordPart`), `:773-776` + `:833` (сборка).
+**Механика:** `spoolPart` открывает файл части `O_TRUNC` — предыдущая версия уничтожается **до** записи новой. Если новая запись падает (`spoolTo` error, превышение `maxPartSize`, ошибка `Sync`/`recordPart`), файл удаляется через `discard`, а запись `s.parts[number]` остаётся старой. Часть становится «фантомом»: `ListParts` её показывает, `CompleteMultipartUpload` падает в `InternalError` (`assembleParts` → `os.Open(p.path)` → ENOENT), а не `InvalidPart`.
+**Как воспроизвести:** создать upload; успешно `UploadPart(1)`; повторить `UploadPart(1)` с телом, обрывающимся в середине (сетевой обрыв, отмена, ошибка chunk-подписи). Первый запрос — 500; старые байты части 1 потеряны.
+**Отличие от S3:** в S3 повторная загрузка номера атомарна — старая часть переживает неудачную новую.
+**Направление:** писать в `path + ".new"`, `Sync`, затем `rename` в `path` и только потом `recordPart`; на ошибке удалять `.new`, не трогая существующую часть.
+**Тест:** после неудачного retry существующая часть читается и `Complete` её собирает.
+
+### D3 — мультипарт-спул: `RemoveAll` при старте и дефолт внутри `cache.dir`
+
+**Проверка:** ✅ прогон — (1) `newMPRegistry` сносит содержимое каталога при открытии; (2) `Normalize(multipart_dir == backend.local.dir)` → `err=<nil>` (гварда нет); (3) дефолт `inside=true` (`rel="multipart"`); (4) `Disk.Clear` удаляет `multipart/`. End-to-end `s3vault server` не поднимался, но вызывается тот же код с тем же значением из конфига.
+
+**Статус:** 🟥 подтверждён.
+**Где:** `internal/s3api/multipart.go:162` (`os.RemoveAll(dir)`), вызов `s3api.New` ← `internal/cli/root.go:504`; дефолт `internal/config/config.go:307-309`.
+**Механика:** при старте `server` каталог спула рекурсивно стирается без проверки, что он «свой». Дефолт — `filepath.Join(cache.dir, "multipart")`, то есть **внутри** каталога кэша, хотя комментарий `config.go:304` и `docs/multipart.md` §7 утверждают «beside … not inside».
+**Как воспроизвести:**
+1. `server.multipart_dir` = `backend.local.dir` → старт `server` сносит все объекты локального бэкенда (ObjectStore уже открыт по тому же пути, `internal/cli/root.go:429`), после чего GET отдаёт `NoSuchKey`.
+2. Дефолт + `s3vault cache clear`: `Disk.Clear` (`internal/adapter/cache/disk.go:762-783`) удаляет всех детей корня кэша, включая `multipart/` → части активных сессий пропадают.
+3. `server.multipart_dir` = любой каталог с данными — стирается молча.
+**Направление:** создавать/стирать только уникальный подкаталог спула; в `Normalize` отвергать пересечение с `backend.local.dir` и `cache.dir`; сузить `Disk.Clear` до данных кэша (`ab/`), не трогая соседей.
+**Тест:** `multipart_dir == backend.local.dir` → ошибка старта.
+
+### D4 — `--delete-after-upload` / `--delete-if-exists` нельзя выключить
+
+**Проверка:** ✅ прогон — `go test -run TestD4_ ./internal/cli/`: config `true` + `--delete-after-upload=false` → файл **удалён**, `runErr=<nil>`; env-ветка (`S3VAULT_ARCHIVE_DELETE_AFTER_UPLOAD=true`) — так же. Контроль (config=false + флаг=false) файл сохраняет. То же в `upload` (`internal/cli/root.go:343-344`).
+
+**Статус:** 🟥 подтверждён.
+**Где:** `internal/cli/root.go:245-246` (`flag || config`), флаги `:267-268` не привязаны к Viper.
+**Механика:** `archive.delete_after_upload: true` (или env) не переопределяется `--delete-after-upload=false`: получается `false || true == true`. Заявленный приоритет «flags > env > file» (`architecture.md:189`) для destructive-флагов не выполняется.
+**Как воспроизвести:** `archive.delete_after_upload: true` в YAML; `s3vault archive /data --delete-after-upload=false` → локальные файлы удаляются.
+**Направление:** `cmd.Flags().Changed("delete-after-upload")`, чтобы флаг перебивал конфиг в обе стороны, либо привязка к Viper. То же для `--delete-if-exists`.
+**Тест:** config `true` + флаг `false` → файлы на месте.
+
+### D5 — скачивание не проверяет целостность: усечённый объект затирает хороший `dest`
+
+**Проверка:** ✅ прогон — `go test -run TestD5 ./internal/service/`: native-объект, усечённый ровно по границе чанка, `Download` вернул `nil` и перезаписал `dest` половиной файла (`expected 32`, записано 16). `PlaintextSize` на чтении нигде не сверяется (`grep` пуст).
+
+**Статус:** 🟥 подтверждён (механизм; соответствует открытому H3 в `docs/reliability-review.md`, в `problems.md` не было).
+**Где:** `internal/service/fetch.go:160-178` (`DecryptAuto` → сразу `Sync`/`Close`/`Rename`), `internal/adapter/encrypt/native.go:195-199`, `internal/adapter/encrypt/detect.go`.
+**Механика:** `unwrapForDecrypt` берёт из заголовка `S3VCTR01` только `Enc`/`Thumbprint`; `PlaintextSize`/`SHA256` после расшифровки не сверяются. Для `native` цикл чанков трактует EOF как нормальный конец (`native.go:195-198`) — усечение ровно по границе чанка неотличимо от конца. Для `none`/`command` аутентификации нет вовсе. `os.Rename(tmp, dest)` безусловно перезаписывает существующий `dest`, rc=0.
+**Как воспроизвести:** `mode=native`, plaintext = ровно 2 чанка; обрезать объект, удалив последний чанк; `s3vault download k good` → в `good` половина файла, rc=0. Крайний случай — пустой файл из непустого объекта.
+**Направление:** после расшифровки сверять `cw.n == hdr.PlaintextSize` и (при наличии) SHA-256; при расхождении не делать `rename`. В `Native.Decrypt` отличать EOF на границе чанка от неполной длины.
+**Тест:** усечение по границе чанка → ошибка, `dest` не изменён.
+
+### D6 — кэш: `removeEntry` удаляет `.lock`/`.tmp` незавершённого `Populate` → два писателя в один `.tmp`
+
+**Проверка:** ✅ прогон (детерминированный, блокирующий fill) — `go test -run TestZZD6 ./internal/adapter/cache/`: во время `Populate` A `Remove` снёс `.lock` и `.tmp` (`missing=true`); второй `Populate` открыл тот же `.tmp` и достиг fill одновременно; итог — `dataRel` = `"BBBB"`, sidecar `sha256="A"`.
+
+**Статус:** 🟥 подтверждён (механизм).
+**Где:** `internal/adapter/cache/disk.go:359-366` (`removeEntry` сносит `dataRel+".lock"` и `dataRel+".tmp"`), `:499-511` (`Populate` держит lock), `:522-554` (общий `.tmp` + `Rename` по пути).
+**Механика:** `Lookup`/`Remove`/`evict`/`SweepExpired` зовут `removeEntry`, который безусловно удаляет lock- и tmp-файлы идущего `Populate`. `Remove` доступен снаружи через инвалидацию фасада (`internal/s3api/handler.go:233-243`). Первый писатель продолжает писать в unlink-нутый fd; второй запрос создаёт новый lock (тот же путь), `flock` проходит, открывает тот же `.tmp` через `O_TRUNC`. Первый завершает `Rename(tmpRel → dataRel)` **над файлом второго** → в `dataRel` смешанные байты, sidecar — от первого.
+**Как воспроизвести:** `cache.enabled=true`, `soft_ttl>0`; параллельно GET большого K (промах, идёт `Populate`) и PUT/DELETE K (инвалидация). Тот же эффект — `SweepExpired`/`evict` при id в индексе.
+**Направление:** `removeEntry` не трогать `.lock`/`.tmp`, пока держится lock; либо `Populate` пишет в уникальный `.tmp` и делает `Rename` под актуальным lock (сверка владельца lock после `flock`).
+**Тест:** конкурентные `Populate` + `Remove` → в кэше целый объект одной версии.
+
+### D7 — кэш: на не-unix межпроцессный lock — no-op, а Windows в релизе
+
+**Проверка:** ✅ статически/сборкой — `GOOS=windows go build ./...` собирается и берёт `lock_other.go` (пустые `lockExclusive`/`unlockExclusive`); `GOOS=windows go list` подтверждает файл в сборке; `.goreleaser.yml:20-23` содержит `windows`.
+
+**Статус:** 🟥 подтверждён.
+**Где:** `internal/adapter/cache/lock_other.go:7-9` (пустые заглушки, `//go:build !unix`); `.goreleaser.yml:23,28,35` собирает `windows`.
+**Механика:** на Windows два процесса (или два «flight» одного ключа) не сериализуются, пишут один `dataRel+".tmp"` и `Rename` поверх → та же порча, что в D6, но без гонки. `architecture.md:527` заявляет «cross-process cache lock».
+**Направление:** реализовать блокировку на Windows (`LockFileEx`) либо задокументировать, что кэш не поддерживается вне unix, и предупреждать/падать на старте.
+
+---
+
+## Прочие находки — проверено прогоном (`🟠`; D12 снят)
+
+### D8 — `archive` не сверяет записанные байты со снимком `info.Size`/SHA-256
+
+**Проверка:** ✅ прогон — `go test -run TestD8 ./internal/service/`: `UploadFile` с `FileInfo.Size=4096` и объявленным SHA (реальный файл — 5 байт) вернул `err=<nil>`, `Uploaded:1`, а в заголовок ушли ложные `size=4096`/sha. Пост-сверки `expected == written` нет (`archive.go:377-383`).
+
+**Где:** `internal/service/archive.go:311-388` (hash отдельным чтением `:315`; заголовок из `info.Size`+`sum` `:356-365`; тело читается позже `:367-374`), `:255-260` (`--delete-after-upload`); `internal/adapter/encrypt/command.go:109-112`.
+**Механика:** три независимых снимка файла (stat сканера, хеш, поток). Если файл меняется между хешированием и `os.Open` (ротация/дозапись лога) или `encryption.command` возвращает `exit 0`, не вычитав весь stdin, заголовок несёт старые `PlaintextSize`/`SHA256`, а тело короче. `store.Put` дочитывает до EOF → `nil` → источник удаляется. Позже `Decide` по «врущему» заголовку даёт `Skip`, и с `--delete-if-exists` удаляется единственная хорошая копия.
+**Нужно:** детерминированный триггер (параллельный писатель либо «нечестный» encrypt-command) и пост-записевая сверка `expected == written`.
+
+### D9 — legacy-ветка: `native`-читатель копирует `Salted__`-шифротекст как plaintext
+
+**Проверка:** ✅ прогон — `go test -run TestD9_ ./internal/adapter/encrypt/`: `DecryptAuto(&Native{}, "", …)` на payload `Salted__…` вернул `err=<nil>` и скопировал шифротекст как plaintext; `mode=none` тот же payload отвергает. Существующий `TestDecryptAutoLegacy` использует `fakeEncryptor`, а не реальный `*Native`, и магию `Salted__` не покрывает.
+
+**Где:** `internal/adapter/encrypt/detect.go:59-81`: `Passthrough` проверяет обе магии (`:64,:72`), ветка любого другого типа (в т.ч. `*Native`) — только `S3VLT01` (`:77`), остальное уходит в `io.Copy` (`:80`).
+**Механика:** containerless-объект с payload `Salted__` под читателем `mode=native` (без `S3VCTR01`) отдаётся как открытый текст, rc=0. Достижимо для объекта от прежнего/чужого писателя. `architecture.md:336-338` обещает отказ для обеих магий — верно только для `mode=none`.
+
+### D10 — namespace кэша не включает `s3.endpoint`/аккаунт
+
+**Проверка:** ✅ unit — `go test -run TestZZD10 ./internal/config/`: `endpoint=https://s3.amazonaws.com` и `endpoint=https://minio.internal:9000` при одном bucket дают одинаковый `CacheNamespace()` (и, значит, одинаковые `cache.ID`).
+
+**Где:** `internal/config/config.go:380-385` (`s3 → c.S3.Bucket`), `internal/adapter/encrypt/fingerprint.go:13-31`.
+**Механика:** смена `s3.endpoint`/аккаунта при том же `bucket` и `cache.dir` → старый plaintext отдаётся в окне `soft_ttl` (при совпавших ETag/sha — дольше). Окно ограничено ревалидацией.
+
+### D11 — sweeper/`max_sessions` вытесняет живую сессию; `get` отдаёт указатель без блокировки
+
+**Проверка:** ✅ прогон (частично) — `go test -run TestZZVerifyD11 ./internal/s3api/`: при `max_sessions=2` и трёх неистёкших сессиях вытесняется живая (LRU без проверки TTL) вместе с каталогом; TOCTOU `get`→sweep→`spoolPart` даёт `200` на удалённые байты (ловится stress-прогоном, `iter: …answered 200 but the LRU session was evicted`). Подвариант «вытеснение по TTL прямо в середине записи» **опровергнут**: `touch()` (`multipart.go:474`) пинит сессию, что подтверждает существующий `TestInFlightUploadPartPinsTheSession`. Реальная проблема — только `max_sessions`/TOCTOU.
+
+**Где:** `internal/s3api/multipart.go:230-244`, `:254-262`, `:304-316`; `touch` — только в начале `spoolPart` (`:474`, `:552-557`).
+**Механика:** LRU-вытеснение при `len(live) > maxSessions` сносит каталог сессии, которая ещё используется (между частями). TOCTOU: `get` вернул сессию, sweeper удалил каталог, затем `spoolPart` пишет и `recordPart` регистрирует часть → `200` на удалённые байты, `Complete` → `NoSuchUpload`.
+
+### D12 — ❌ снят: инвалидация кэша vs `Populate`
+
+**Проверка:** ❌ не подтверждён прогоном. Заявленный исход «`Populate` дописывает V1 после инвалидации» детерминированно не воспроизводится: `removeEntry` удаляет `dataRel+".tmp"`, поэтому успевший `Populate` падает на `Chmod(tmpRel)` (`disk.go:548`) — инвалидация не проигрывает, а ломает populate; если `Remove` успевает раньше, populate читает уже новый объект (тело `"v2"`). Устаревшей оказывается только sidecar-identity — это D13/D14, а не отдача V1. Отдельного дефекта здесь нет.
+
+**Где:** `internal/adapter/cache/disk.go:211-220` (`Remove` без per-id lock), `:470-479`, `:499-511`; вызывающие — `internal/s3api/put.go:63-79`, `internal/s3api/multipart.go:721-725`.
+**Механика:** PUT пишет V2 и зовёт `Remove`; если `Remove` успевает до `Rename` в `Populate`, последний дописывает V1 уже после инвалидации — read-after-write отдаёт V1 в пределах `soft_ttl`.
+
+### D13 — stale-хит: тело из фонового SWR, заголовки/чек-сумма из старого meta
+
+**Проверка:** ✅ прогон — `go test -run TestZZD13 ./internal/service/`: stale-хит вернул `ETag`/`SHA256` v1, фоновый SWR перезаписал тело на v2, отданные байты не совпали с объявленной чек-суммой.
+
+**Где:** `internal/service/fetch.go:189-208` (возврат `p` + `scheduleRevalidate`), `internal/s3api/get.go:41,54,64-66`.
+**Механика:** stale-хит v1 возвращает путь; фон репопулирует v2 в тот же `dataRel`; `os.Open` отдаёт тело v2, а `ETag`/`x-amz-checksum-sha256` — от v1. Ломает проверку чек-суммы у клиента.
+
+### D14 — `MarkValidated` TOCTOU затирает свежую identity устаревшей
+
+**Проверка:** ✅ прогон (детерминированный interleave) — `go test -run TestZZD14 ./internal/service/`: A прошёл `Lookup(v1)` и был остановлен в `ResolveRemote`; инжектирован `Populate(v2)`; после release A вызвал `MarkValidated(v1)` и перезаписал sidecar v2 → sidecar `sha256="v1"` при теле v2.
+
+**Где:** `internal/adapter/cache/disk.go:223-259`; вызовы — `internal/service/fetch.go:303,380`.
+**Механика:** reader A прошёл проверку на v1, конкурентный `Populate` записал v2, затем A пишет sidecar v1 поверх → sidecar v1 при теле v2.
+
+### D15 — `ResolveRemote` глотает `ErrNotFound` от range-GET
+
+**Проверка:** ✅ unit — `go test -run TestD15 ./internal/identity/`: `Head` `Exists=true` + `GetRange` → `ErrNotFound` → `ResolveRemote` вернул stale-identity, `Decide` дал `ActionSkip`. Поведение уже зафиксировано контрактным тестом `internal/identity/resolve_test.go:100` (`TestResolveRemoteRangeNotFoundKeepsHead`) — правка потребует пересмотра этого контракта, а не только кода.
+
+**Где:** `internal/identity/resolve.go:32-38`, `internal/identity/decide.go:21-31`, `internal/service/archive.go:247-253`.
+**Механика:** объект удалён между `Head` и `GetRange`; `GetRange → ErrNotFound` возвращает meta с `Exists=true` и старой identity. `Decide → Skip`; с `--delete-if-exists` источник удаляется, хотя на бэкенде объекта уже нет.
+
+### D16 — `keying.FromRequestPath` схлопывает `..`
+
+**Проверка:** ✅ прогон — `go test -run TestZZVerifyD16 ./internal/keying/`: `FromRequestPath("a/../b") == "b"`, `"a/../b"` с префиксом → `"p/b"`, `"a/./b" == "a/b"`; выход за префикс невозможен (`../b` и `a/../../b` → `invalid path`). Подтверждён как краевой контракт нормализации ключа, **не** кросс-префиксная потеря данных.
+
+**Где:** `internal/keying/mapper.go:57-66` (`path.Clean`).
+**Механика:** `PUT/DELETE /bucket/a/../b` адресует объект `b` (в пределах своего префикса) — можно затереть/удалить «чужой» ключ. Выхода за префикс нет.
+
+---
+
+## Прочее (не потеря данных, для полноты)
+
+- `internal/s3api/list.go:64` передаёт клиентский `start-after` напрямую в `store.List`, а `internal/adapter/local/list.go:43` сравнивает с полным backend-ключом (с префиксом) → при непустом `s3.prefix` фильтр отсекает всё или игнорируется. Не проверялось прогоном (только чтение кода).
+- `internal/service/fetch.go:146`: `cw.n` вычисляется лексически до `DecryptAuto` → метрика скачивания в stdout всегда 0. Не проверялось прогоном (только чтение кода).
+- `internal/adapter/encrypt/native.go:320-330`: `loadKEK` принимает пустой/любой файл (берёт `sha256(b)`), т.е. пустой ключ даёт предсказуемый KEK. **✅ прогон:** пустой и 1-байтовый keyfile приняты, KEK = `sha256(содержимого)`, ошибки нет. Confidentiality, не потеря.
+- `internal/adapter/local/store.go:83`: `New` безусловно `RemoveAll(".s3vault-tmp")` — второй `archive` по тому же каталогу сносит in-flight temp первого. **✅ прогон (механизм):** temp второго процесса исчез. Тихая потеря исключена — первый писатель получит ошибку на `Rename`/записи.
+- `internal/cli/root.go:125-152`: недоступный/нечитаемый авто-найденный конфиг заменяется дефолтами. **✅ прогон:** `s3vault.yaml` с `encryption.mode: native` и `chmod 0000` → `mode` стал `none`. Оговорка: сигнал **не** молчаливый — печатается `warning: ignoring unreadable config file …` в `os.Stderr` (не в логгер).
 
 ---
 

@@ -272,6 +272,30 @@ func TestParentIsFile(t *testing.T) {
 	require.NoError(t, st.Delete(ctx, "a/b"))
 }
 
+// A delete of a key that cannot exist because its parent is a file object must
+// leave that object alone: S3 keys are flat, so "a" and "a/b" are independent,
+// and deleting an absent key is an idempotent no-op. This is D1 in problems.md:
+// pruning walked up past the key without checking what it was removing.
+func TestDeleteMissingChildKeepsParentObject(t *testing.T) {
+	t.Parallel()
+	st, _ := newStore(t)
+	ctx := context.Background()
+
+	put(t, st, "a", "file")
+
+	require.NoError(t, st.Delete(ctx, "a/b"))
+
+	body, meta, err := st.Get(ctx, "a")
+	require.NoError(t, err, "DELETE a/b removed the unrelated object a")
+
+	defer func() { _ = body.Close() }()
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	assert.True(t, meta.Exists)
+	assert.Equal(t, "file", string(got))
+}
+
 func TestGetRange(t *testing.T) {
 	t.Parallel()
 	st, _ := newStore(t)
