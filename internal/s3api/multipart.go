@@ -458,12 +458,19 @@ func (a *API) handleUploadPart(w http.ResponseWriter, r *http.Request, vr *awsig
 	a.metric(op, "ok")
 }
 
-// spoolPart streams one part into the session directory and records its size and
-// MD5. Limits are enforced around the write, not after it: a part that pushes
-// the session past its byte budget is removed again rather than left for the
+// spoolPart streams one part into the session directory and publishes it.
+// Limits are enforced around the write, not after it: a part that pushes the
+// session past its byte budget is removed again rather than left for the
 // sweeper, so an over-quota client cannot fill the disk by ignoring the error.
+//
+// The body goes to a fresh temp file, never to the part's own path: a re-upload
+// of a number replaces the old part by rename only once the replacement is
+// complete and has passed its checks. S3 drops the old part when the new one
+// succeeds, not when it starts, so a retry that fails half-way (dropped
+// connection, cancelled request, signature error) must leave the accepted bytes
+// and their record exactly as they were.
 func (a *API) spoolPart(s *session, number int, body io.Reader) (string, error) {
-	// Stamped before the body is consumed, not only by recordPart at the end. A
+	// Stamped before the body is consumed, not only by publishPart at the end. A
 	// session carries the stamp of its CreateMultipartUpload (or of its last
 	// finished part) for the whole of a slow write, so a sweeper running in
 	// between would treat a live upload as idle: it drops the session and
@@ -477,46 +484,63 @@ func (a *API) spoolPart(s *session, number int, body io.Reader) (string, error) 
 	// formatted as %05d, so it cannot escape session.dir. gosec's taint analysis
 	// cannot see either fact, hence the directives.
 	path := s.partPath(number)
-	discard := func() {
-		_ = os.Remove(path) //nolint:gosec // G703: path is session.partPath(number), see above
-	}
-	//nolint:gosec // G304: same as above
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+
+	// A unique name rather than path+".new": two concurrent UploadPart calls for
+	// the same number would otherwise truncate each other's spool and publish a
+	// mixture. CreateTemp creates it 0600 in the session directory.
+	tmp, err := os.CreateTemp(s.dir, fmt.Sprintf("part-%05d-new-*", number))
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = f.Close() }()
+
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		// A no-op once the file has been renamed into place.
+		_ = os.Remove(tmpPath) //nolint:gosec // tmpPath is the file os.CreateTemp just made in session.dir
+	}()
 
 	h := md5.New() //nolint:gosec // S3 defines the part ETag as the MD5 of the part
 
-	n, err := spoolTo(f, body, h)
+	n, err := spoolTo(tmp, body, h)
 	if err != nil {
-		discard()
 		return "", err
 	}
 
 	if n > maxPartSize {
-		discard()
 		return "", fmt.Errorf("part %d is %d bytes, over the %d byte S3 part limit", number, n, int64(maxPartSize))
 	}
 
-	if err := f.Sync(); err != nil {
-		discard()
+	if err := tmp.Sync(); err != nil {
+		return "", err
+	}
+
+	// Closed before the rename so the publish works on platforms that cannot
+	// rename a file that is still open (Windows), and so a deferred flush error
+	// cannot be lost.
+	if err := tmp.Close(); err != nil {
 		return "", err
 	}
 
 	etag := `"` + hex.EncodeToString(h.Sum(nil)) + `"`
-	if err := a.recordPart(s, number, path, n, etag); err != nil {
-		discard()
+	if err := a.publishPart(s, number, tmpPath, path, n, etag); err != nil {
 		return "", err
 	}
 
 	return etag, nil
 }
 
-// recordPart publishes a part in the session map, enforcing the per-session
-// part count and byte budget.
-func (a *API) recordPart(s *session, number int, path string, size int64, etag string) error {
+// publishPart makes a fully written temp file the part for number: it checks the
+// session's limits, renames the file into place and records size and ETag, all
+// under the session lock.
+//
+// The order is the contract. The limits are checked before the rename, so a part
+// refused by the budget leaves the previous one untouched; and the rename is
+// atomic, so a reader (Complete's assembly, which runs outside this lock) sees
+// either the old bytes or the new ones, never a mixture. Two concurrent retries
+// of the same number therefore cannot interleave bytes, and the last published
+// one is the one that is recorded.
+func (a *API) publishPart(s *session, number int, srcPath, dstPath string, size int64, etag string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -530,7 +554,12 @@ func (a *API) recordPart(s *session, number int, path string, size int64, etag s
 		return fmt.Errorf("multipart session would hold %d bytes, over its %d byte spool limit", total, a.mpMaxBytes)
 	}
 
-	s.parts[number] = part{path: path, size: size, etag: etag}
+	//nolint:gosec // G703: dstPath is session.partPath(number), validated by the caller
+	if err := os.Rename(srcPath, dstPath); err != nil {
+		return err
+	}
+
+	s.parts[number] = part{path: dstPath, size: size, etag: etag}
 	s.bytes = total
 	s.touchedAt = time.Now()
 
@@ -547,7 +576,7 @@ func sizeOf(s *session, number int) int64 {
 }
 
 // touch stamps the session as active. It is called at the *start* of a part write
-// as well as from recordPart at the end, so the sweeper's notion of idle cannot
+// as well as from publishPart at the end, so the sweeper's notion of idle cannot
 // fall inside a write in progress.
 func (s *session) touch() {
 	s.mu.Lock()

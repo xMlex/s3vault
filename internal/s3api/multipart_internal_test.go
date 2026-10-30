@@ -4,6 +4,7 @@ import (
 	"crypto/md5" //nolint:gosec // test fixture mirroring S3's part ETag definition
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -245,8 +246,93 @@ func TestAssemblePartsRemovesOutputOnRejection(t *testing.T) {
 	assert.Len(t, entries, 1, "only the part itself should remain, no assembled- file")
 }
 
+// A retry of a part that fails half-way must leave the part it was replacing
+// intact. S3 replaces a number atomically: the previously accepted bytes survive
+// a re-upload that never completes. spoolPart used to open partPath with
+// O_TRUNC, so the old part was destroyed before the replacement's first byte
+// arrived, and the error path then removed the file altogether while s.parts
+// still pointed at it — ListParts advertised a part that Complete could only
+// fail on.
+func TestFailedUploadPartKeepsPreviouslyAcceptedPart(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	api := &API{mp: reg}
+
+	s, err := reg.create("AKIA", "k")
+	require.NoError(t, err)
+
+	const good = "0123456789"
+
+	etag, err := api.spoolPart(s, 1, strings.NewReader(good))
+	require.NoError(t, err)
+
+	// The retry dies after its first chunk, as a dropped connection does.
+	_, err = api.spoolPart(s, 1, io.MultiReader(
+		strings.NewReader("bad"),
+		readerFunc(func([]byte) (int, error) { return 0, errConnectionReset }),
+	))
+	require.Error(t, err)
+
+	// The accepted part is still on disk, byte for byte, and still the record
+	// Complete will get.
+	p, ok := s.parts[1]
+	require.True(t, ok, "an accepted part must stay in the session")
+	assert.Equal(t, etag, p.etag)
+	assert.Equal(t, int64(len(good)), p.size)
+
+	body, err := os.ReadFile(s.partPath(1))
+	require.NoError(t, err)
+	assert.Equal(t, good, string(body))
+
+	// Nothing half-written is left beside it.
+	entries, err := os.ReadDir(s.dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "a failed retry must leave no temp file, the old part only")
+	assert.Equal(t, "part-00001", entries[0].Name())
+
+	_, size, sum, err := assembleParts(s.dir, []part{p})
+	require.NoError(t, err, "Complete must still be able to assemble the accepted part")
+	assert.Equal(t, int64(len(good)), size)
+	assert.Equal(t, sha256hex(good), sum)
+}
+
+// The same guarantee holds when the retry is rejected by the spool budget
+// rather than by the body: the limits are checked before the replacement is
+// published, so a refused part cannot have already overwritten the old one.
+func TestPartRejectedByBudgetKeepsPreviouslyAcceptedPart(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	api := &API{mp: reg, mpMaxBytes: 10}
+
+	s, err := reg.create("AKIA", "k")
+	require.NoError(t, err)
+
+	const good = "0123456789"
+
+	etag, err := api.spoolPart(s, 1, strings.NewReader(good))
+	require.NoError(t, err)
+
+	_, err = api.spoolPart(s, 1, strings.NewReader(good+"more"))
+	require.Error(t, err, "the session budget must reject the larger replacement")
+
+	p, ok := s.parts[1]
+	require.True(t, ok)
+	assert.Equal(t, etag, p.etag)
+	assert.Equal(t, int64(len(good)), p.size)
+
+	body, err := os.ReadFile(s.partPath(1))
+	require.NoError(t, err)
+	assert.Equal(t, good, string(body))
+
+	assert.Equal(t, int64(len(good)), s.bytes, "a rejected part must not change the session's byte total")
+}
+
+var errConnectionReset = errors.New("connection reset by peer")
+
 // A part upload that is still streaming pins its session. touchedAt is bumped on
-// recordPart, which runs after the body has been consumed — so from the moment a
+// publishPart, which runs after the body has been consumed — so from the moment a
 // part starts arriving until it lands, the session still carries the stamp of
 // whatever happened before. A client that opens a session, waits out the TTL and
 // then streams a slow part is swept mid-write: the sweeper drops it and RemoveAlls
