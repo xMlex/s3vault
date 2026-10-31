@@ -49,7 +49,8 @@ func (a *API) handleHeadBucket(w http.ResponseWriter, r *http.Request, bucket st
 	a.metric("head_bucket", "ok")
 }
 
-func (a *API) handleList(w http.ResponseWriter, r *http.Request, bucket string) {
+//nolint:gocyclo,funlen // each branch is a distinct S3 list error; a table would hide the response codes.
+func (a *API) handleList(w http.ResponseWriter, r *http.Request, sc *scope, bucket string) {
 	if !a.bucketAsPrefix && !strings.EqualFold(bucket, a.bucket) {
 		a.metric("list", "not_found")
 		s3err.WriteError(w, r, s3err.NoSuchBucket, "")
@@ -57,11 +58,35 @@ func (a *API) handleList(w http.ResponseWriter, r *http.Request, bucket string) 
 	}
 	q := r.URL.Query()
 	clientPrefix := q.Get("prefix")
+
+	backendPrefix, err := sc.listPrefix(bucket, clientPrefix)
+	if err != nil {
+		a.metric("list", "error")
+		s3err.WriteError(w, r, s3err.AccessDenied, "")
+
+		return
+	}
+
+	startAfter, err := sc.startAfter(bucket, q.Get("start-after"))
+	if err != nil {
+		a.metric("list", "error")
+		s3err.WriteError(w, r, s3err.AccessDenied, "")
+
+		return
+	}
+
+	continuation, err := sc.decodeToken(q.Get("continuation-token"))
+	if err != nil {
+		a.metric("list", "error")
+		s3err.WriteError(w, r, s3err.InvalidRequest, err.Error())
+
+		return
+	}
 	opts := domain.ListOptions{
-		Prefix:            a.listPrefix(bucket, clientPrefix),
+		Prefix:            backendPrefix,
 		Delimiter:         q.Get("delimiter"),
-		ContinuationToken: q.Get("continuation-token"),
-		StartAfter:        q.Get("start-after"),
+		ContinuationToken: continuation,
+		StartAfter:        startAfter,
 	}
 	if mk := q.Get("max-keys"); mk != "" {
 		n, err := strconv.ParseInt(mk, 10, 32)
@@ -72,7 +97,19 @@ func (a *API) handleList(w http.ResponseWriter, r *http.Request, bucket string) 
 		}
 		opts.MaxKeys = int32(n)
 	}
-	page, err := a.store.List(r.Context(), opts)
+	store, err := sc.storeFor(r.Context())
+	if err != nil {
+		a.metric("list", "error")
+		a.log.ErrorContext(r.Context(), "s3 list target",
+			slog.String("op", "s3.list"),
+			slog.String("err", err.Error()),
+		)
+		s3err.WriteError(w, r, s3err.InternalError, "")
+
+		return
+	}
+
+	page, err := store.List(r.Context(), opts)
 	if err != nil {
 		a.metric("list", "error")
 		a.log.ErrorContext(r.Context(), "s3 list",
@@ -112,16 +149,25 @@ func (a *API) handleList(w http.ResponseWriter, r *http.Request, bucket string) 
 		MaxKeys:               opts.MaxKeys,
 		IsTruncated:           page.IsTruncated,
 		KeyCount:              page.KeyCount,
-		ContinuationToken:     opts.ContinuationToken,
-		NextContinuationToken: page.NextContinuationToken,
-		StartAfter:            opts.StartAfter,
+		ContinuationToken:     q.Get("continuation-token"),
+		NextContinuationToken: sc.encodeToken(page.NextContinuationToken),
+		StartAfter:            q.Get("start-after"),
 	}
 	if out.MaxKeys == 0 {
 		out.MaxKeys = 1000
 	}
 	for _, obj := range page.Contents {
+		key, ok := sc.stripKey(bucket, obj.Key)
+		if !ok {
+			a.log.WarnContext(r.Context(), "s3 list key outside scope",
+				slog.String("op", "s3.list"),
+				slog.String("key", obj.Key),
+			)
+
+			continue
+		}
 		item := contentXML{
-			Key:  a.stripClientKey(bucket, obj.Key),
+			Key:  key,
 			Size: obj.Size,
 			ETag: obj.ETag,
 		}
@@ -131,9 +177,17 @@ func (a *API) handleList(w http.ResponseWriter, r *http.Request, bucket string) 
 		out.Contents = append(out.Contents, item)
 	}
 	for _, p := range page.CommonPrefixes {
-		out.CommonPrefixes = append(out.CommonPrefixes, prefixXML{
-			Prefix: a.stripClientKey(bucket, p),
-		})
+		prefix, ok := sc.stripKey(bucket, p)
+		if !ok {
+			a.log.WarnContext(r.Context(), "s3 list prefix outside scope",
+				slog.String("op", "s3.list"),
+				slog.String("prefix", p),
+			)
+
+			continue
+		}
+
+		out.CommonPrefixes = append(out.CommonPrefixes, prefixXML{Prefix: prefix})
 	}
 	a.writeXML(w, r, "list", out)
 }

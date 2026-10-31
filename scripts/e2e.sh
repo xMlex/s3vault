@@ -7,11 +7,12 @@
 #   scripts/e2e.sh down       # снести стенд вместе с данными
 #   scripts/e2e.sh clean      # снести стенд и удалить рабочий каталог
 #   scripts/e2e.sh local      # локальный бэкенд, MinIO не нужен
-#   scripts/e2e.sh go|cli|encrypt|server|facade|local|resilience
+#   scripts/e2e.sh go|cli|encrypt|server|facade|postgres|postgres_target|local|resilience
 #
 # Переопределяется через окружение:
 #   S3VAULT_E2E_MINIO_API=9000 S3VAULT_E2E_HTTP_PORT=18080 \
 #   S3VAULT_E2E_S3_PORT=18333 S3VAULT_E2E_METRICS_PORT=19090 \
+#   S3VAULT_E2E_PG_PORT=15432 S3VAULT_E2E_PG_DSN=postgres://... \
 #   S3VAULT_E2E_WORK=/tmp/s3vault-e2e
 set -euo pipefail
 
@@ -30,10 +31,18 @@ MINIO_API_PORT="${S3VAULT_E2E_MINIO_API:-9000}"
 S3_ACCESS="${S3VAULT_E2E_S3_ACCESS_KEY:-s3vault}"
 S3_SECRET="${S3VAULT_E2E_S3_SECRET_KEY:-s3vaulttest}"
 S3_BUCKET="${S3VAULT_E2E_S3_BUCKET:-s3vault}"
+ALT_BUCKET="${S3VAULT_E2E_S3_ALT_BUCKET:-s3vault-alt}"
 
 HTTP_PORT="${S3VAULT_E2E_HTTP_PORT:-18080}"
 S3_PORT="${S3VAULT_E2E_S3_PORT:-18333}"
 METRICS_PORT="${S3VAULT_E2E_METRICS_PORT:-19090}"
+
+PG_PORT="${S3VAULT_E2E_PG_PORT:-15432}"
+PG_USER="${S3VAULT_E2E_PG_USER:-s3vault}"
+PG_PASSWORD="${S3VAULT_E2E_PG_PASSWORD:-s3vaulttest}"
+PG_DB="${S3VAULT_E2E_PG_DB:-s3vault}"
+PG_DSN="${S3VAULT_E2E_PG_DSN:-postgres://${PG_USER}:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/${PG_DB}?sslmode=disable}"
+PG_MASTER="${S3VAULT_E2E_PG_MASTER_KEY:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}"
 
 MINIO_URL="http://127.0.0.1:${MINIO_API_PORT}"
 HTTP_URL="http://127.0.0.1:${HTTP_PORT}"
@@ -202,6 +211,13 @@ s3_put_raw() { aws --endpoint-url "$MINIO_URL" s3api put-object --bucket "$S3_BU
 
 s3_head_raw() { aws --endpoint-url "$MINIO_URL" s3api head-object --bucket "$S3_BUCKET" --key "$1" >/dev/null 2>&1; }
 
+# Прямой доступ к произвольному бакету — для проверки конечного S3 пользователя.
+s3_bucket_head_raw() { aws --endpoint-url "$MINIO_URL" s3api head-object --bucket "$1" --key "$2" >/dev/null 2>&1; }
+
+s3_bucket_get_raw() { aws --endpoint-url "$MINIO_URL" s3api get-object --bucket "$1" --key "$2" "$3" >/dev/null; }
+
+s3_bucket_put_raw() { aws --endpoint-url "$MINIO_URL" s3api put-object --bucket "$1" --key "$2" --body "$3" >/dev/null; }
+
 sha256_hex() { sha256sum "$1" | cut -d' ' -f1; }
 
 # --- управляемый TCP-прокси до MinIO: им имитируем отказ S3 ---
@@ -252,6 +268,71 @@ start_vault() {
 	# nowait обязан вернуть 0: иначе `start_vault nowait || return` в фазе
 	# отказа уронит фазу на ложном «провале».
 	return 0
+}
+
+# pg_vault запускает CLI-команды против той же PostgreSQL, что и стенд.
+pg_vault() {
+	env "${S3_ENV[@]}" \
+		S3VAULT_S3_PREFIX= \
+		S3VAULT_SERVER_AUTH_BACKEND=postgres \
+		S3VAULT_SERVER_AUTH_DSN="$PG_DSN" \
+		S3VAULT_SERVER_AUTH_MASTER_KEY="$PG_MASTER" \
+		S3VAULT_SERVER_S3_ACCESS_KEY= \
+		S3VAULT_SERVER_S3_SECRET_KEY= \
+		"$VAULT_BIN" "$@"
+}
+
+# start_vault_pg поднимает шлюз на локальном backend с identity из PostgreSQL.
+# Статические ключи намеренно пусты: postgres-режим их отвергает.
+start_vault_pg() {
+	: >"$VAULT_LOG"
+	env "${S3_ENV[@]}" \
+		S3VAULT_S3_PREFIX= \
+		S3VAULT_BACKEND_TYPE=local \
+		S3VAULT_BACKEND_LOCAL_DIR="$WORK/pg-objects" \
+		S3VAULT_CACHE_DIR="$WORK/pg-cache" \
+		S3VAULT_SERVER_MULTIPART_DIR="$WORK/pg-mp" \
+		S3VAULT_SERVER_SPOOL_DIR="$WORK/pg-spool" \
+		S3VAULT_SERVER_AUTH_BACKEND=postgres \
+		S3VAULT_SERVER_AUTH_DSN="$PG_DSN" \
+		S3VAULT_SERVER_AUTH_MASTER_KEY="$PG_MASTER" \
+		S3VAULT_SERVER_S3_ACCESS_KEY= \
+		S3VAULT_SERVER_S3_SECRET_KEY= \
+		S3VAULT_SERVER_S3_BUCKET="$S3_BUCKET" \
+		S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=false \
+		S3VAULT_LOG_LEVEL="${S3VAULT_LOG_LEVEL:-info}" \
+		"$VAULT_BIN" server \
+		--listen "127.0.0.1:${HTTP_PORT}" \
+		--s3-listen "127.0.0.1:${S3_PORT}" \
+		--metrics-listen "127.0.0.1:${METRICS_PORT}" \
+		>>"$VAULT_LOG" 2>&1 &
+	VAULT_PID=$!
+	wait_for "s3vault server (postgres) /health" curl -fsS "$HTTP_URL/health"
+}
+
+# start_vault_pg_s3 поднимает шлюз с identity из PostgreSQL и глобальным S3-
+# хранилищем MinIO. Нужен фазе конечного S3: цель пользователя — тоже S3, а
+# глобальный backend остаётся для пользователей без цели и для /ready.
+start_vault_pg_s3() {
+	: >"$VAULT_LOG"
+	env "${S3_ENV[@]}" \
+		S3VAULT_SERVER_MULTIPART_DIR="$WORK/pg-target-mp" \
+		S3VAULT_SERVER_SPOOL_DIR="$WORK/pg-target-spool" \
+		S3VAULT_SERVER_AUTH_BACKEND=postgres \
+		S3VAULT_SERVER_AUTH_DSN="$PG_DSN" \
+		S3VAULT_SERVER_AUTH_MASTER_KEY="$PG_MASTER" \
+		S3VAULT_SERVER_S3_ACCESS_KEY= \
+		S3VAULT_SERVER_S3_SECRET_KEY= \
+		S3VAULT_SERVER_S3_BUCKET="$S3_BUCKET" \
+		S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=false \
+		S3VAULT_LOG_LEVEL="${S3VAULT_LOG_LEVEL:-info}" \
+		"$VAULT_BIN" server \
+		--listen "127.0.0.1:${HTTP_PORT}" \
+		--s3-listen "127.0.0.1:${S3_PORT}" \
+		--metrics-listen "127.0.0.1:${METRICS_PORT}" \
+		>>"$VAULT_LOG" 2>&1 &
+	VAULT_PID=$!
+	wait_for "s3vault server (postgres + S3) /health" curl -fsS "$HTTP_URL/health"
 }
 
 # Останавливает сервер и возвращает код его выхода (0 = graceful shutdown).
@@ -315,9 +396,34 @@ start_minio() {
 	"${COMPOSE[@]}" run --rm minio-init
 }
 
+pg_ready() {
+	if [[ "${S3VAULT_E2E_NO_COMPOSE:-0}" == "1" ]]; then
+		pg_isready -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER"
+	else
+		"${COMPOSE[@]}" exec -T postgres pg_isready -U "$PG_USER" -d "$PG_DB"
+	fi
+}
+
+start_postgres() {
+	if [[ "${S3VAULT_E2E_NO_COMPOSE:-0}" != "1" ]]; then
+		"${COMPOSE[@]}" up -d postgres
+	fi
+	wait_for "postgres $PG_DSN" pg_ready
+}
+
+# Одноразовый compose-стенд: сносим public schema, чтобы прогон не зависел от
+# старого тома/схемы предыдущей ветки. Внешнюю БД (NO_COMPOSE=1) не трогаем.
+reset_postgres_schema() {
+	[[ "${S3VAULT_E2E_NO_COMPOSE:-0}" == "1" ]] && return 0
+
+	"${COMPOSE[@]}" exec -T postgres psql -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 \
+		-c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;' >/dev/null
+}
+
 phase_up() {
 	build_vault
 	start_minio
+	start_postgres
 }
 
 phase_down() { "${COMPOSE[@]}" down -v --remove-orphans; }
@@ -975,6 +1081,283 @@ phase_facade_multipart() {
 	fi
 }
 
+# ------------------------------------------------------------- postgres ---
+
+phase_postgres() {
+	log "PostgreSQL users: transparent prefix, isolation, rotate/disable, 503 on DB down"
+	start_postgres || return
+	stop_vault >/dev/null 2>&1 || true
+	reset_postgres_schema || return
+
+	rm -rf "$WORK/pg-objects" "$WORK/pg-cache" "$WORK/pg-mp" "$WORK/pg-spool"
+	mkdir -p "$WORK/pg-objects"
+
+	local suffix="$RUN_ID"
+	local a_prefix="tenant-a-$suffix"
+	local b_prefix="tenant-b-$suffix"
+	local a_out b_out a_ak a_sk b_ak b_sk
+
+	a_out=$(pg_vault user add --name "alice-$suffix" --prefix "$a_prefix") || {
+		fail "user add alice"
+		return
+	}
+	a_ak=$(printf '%s\n' "$a_out" | sed -n 's/^access_key_id=//p')
+	a_sk=$(printf '%s\n' "$a_out" | sed -n 's/^secret_key=//p')
+	assert_ne "user add выдал access key" "$a_ak" ""
+	assert_ne "user add выдал secret" "$a_sk" ""
+
+	b_out=$(pg_vault user add --name "bob-$suffix" --prefix "$b_prefix") || {
+		fail "user add bob"
+		return
+	}
+	b_ak=$(printf '%s\n' "$b_out" | sed -n 's/^access_key_id=//p')
+	b_sk=$(printf '%s\n' "$b_out" | sed -n 's/^secret_key=//p')
+
+	local overlap_rc=0
+	pg_vault user add --name "overlap-$suffix" --prefix "$a_prefix/sub" >/dev/null 2>&1 || overlap_rc=$?
+	assert_ne "пересекающийся префикс отвергнут" "$overlap_rc" "0"
+
+	start_vault_pg || return
+	assert_eq "/ready (Postgres доступен)" "$(curl -fsS "$HTTP_URL/ready")" "ok"
+
+	local obj="$WORK/pg-a.txt"
+	printf 'postgres alice\n' >"$obj"
+	assert_eq "PutObject под пользователем БД -> 200" \
+		"$(sigv4 "$a_ak" "$a_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$obj" "$S3API_URL/$S3_BUCKET/dir/file.txt")" "200"
+	assert_ok "объект лёг под прозрачным префиксом" \
+		test -f "$WORK/pg-objects/$a_prefix/dir/file.txt"
+	assert_eq "GetObject отдаёт plaintext" \
+		"$(sigv4 "$a_ak" "$a_sk" "$S3API_URL/$S3_BUCKET/dir/file.txt")" "postgres alice"
+
+	local list
+	list=$(sigv4 "$a_ak" "$a_sk" "$S3API_URL/$S3_BUCKET?list-type=2")
+	assert_contains "ListObjectsV2 показывает ключ без префикса" "$list" "<Key>dir/file.txt</Key>"
+	assert_not_contains "ListObjectsV2 не показывает backend-префикс" "$list" "$a_prefix"
+
+	printf 'postgres bob\n' >"$WORK/pg-b.txt"
+	assert_eq "PutObject второго пользователя -> 200" \
+		"$(sigv4 "$b_ak" "$b_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-b.txt" "$S3API_URL/$S3_BUCKET/dir/file.txt")" "200"
+	assert_ok "второй пользователь лёг отдельно" test -f "$WORK/pg-objects/$b_prefix/dir/file.txt"
+	assert_eq "alice читает только своё" \
+		"$(sigv4 "$a_ak" "$a_sk" "$S3API_URL/$S3_BUCKET/dir/file.txt")" "postgres alice"
+	assert_eq "bob читает только своё" \
+		"$(sigv4 "$b_ak" "$b_sk" "$S3API_URL/$S3_BUCKET/dir/file.txt")" "postgres bob"
+
+	pg_vault user disable --access-key "$a_ak" >/dev/null
+	assert_eq "disable действует со следующего запроса: 403" \
+		"$(sigv4 "$a_ak" "$a_sk" -o /dev/null -w '%{http_code}' "$S3API_URL/$S3_BUCKET/dir/file.txt")" "403"
+
+	pg_vault user enable --access-key "$a_ak" >/dev/null
+	local rotated
+	rotated=$(pg_vault user rotate --access-key "$a_ak")
+	a_sk=$(printf '%s\n' "$rotated" | sed -n 's/^secret_key=//p')
+	assert_eq "после rotate новый секрет работает" \
+		"$(sigv4 "$a_ak" "$a_sk" "$S3API_URL/$S3_BUCKET/dir/file.txt")" "postgres alice"
+
+	if [[ "${S3VAULT_E2E_NO_COMPOSE:-0}" != "1" ]]; then
+		"${COMPOSE[@]}" stop postgres >/dev/null
+		assert_eq "БД упала: /ready 503" \
+			"$(curl -s -o /dev/null -w '%{http_code}' "$HTTP_URL/ready")" "503"
+		assert_eq "БД упала: S3 503, а не 403" \
+			"$(sigv4 "$a_ak" "$a_sk" -o /dev/null -w '%{http_code}' "$S3API_URL/$S3_BUCKET/dir/file.txt")" "503"
+		"${COMPOSE[@]}" up -d postgres >/dev/null
+		wait_for "postgres после рестарта" pg_ready || return
+		wait_for "ready после рестарта" curl -fsS "$HTTP_URL/ready" || return
+		assert_eq "БД вернулась: /ready 200" \
+			"$(curl -fsS "$HTTP_URL/ready")" "ok"
+	fi
+
+	stop_vault || true
+}
+
+# --------------------------------------------------- postgres target S3 ---
+
+phase_postgres_target() {
+	log "Конечный S3 пользователя: полная замена, target.prefix/user.prefix, смена и сброс цели"
+	start_postgres || return
+	stop_vault >/dev/null 2>&1 || true
+	reset_postgres_schema || return
+
+	rm -rf "$WORK/pg-target-mp" "$WORK/pg-target-spool"
+	aws --endpoint-url "$MINIO_URL" s3api create-bucket --bucket "$ALT_BUCKET" >/dev/null 2>&1 || true
+
+	local suffix="$RUN_ID"
+	local d_prefix="tenant-target-$suffix"
+	local f_prefix="tenant-shared-$suffix"
+	local e_prefix="tenant-global-$suffix"
+	local t_prefix="target-$suffix"
+	local t2_prefix="target2-$suffix"
+	local t_name="target-$suffix"
+	local d_out d_ak d_sk f_out f_ak f_sk e_out e_ak e_sk
+
+	local p1="$WORK/target1.json"
+	cat >"$p1" <<JSON
+{
+  "endpoint": "$MINIO_URL",
+  "region": "$REGION",
+  "bucket": "$ALT_BUCKET",
+  "prefix": "$t_prefix",
+  "path_style": true,
+  "access_key": "$S3_ACCESS",
+  "secret_key": "$S3_SECRET"
+}
+JSON
+
+	assert_ok "target add принимается" \
+		pg_vault target add --name "$t_name" --profile "$p1"
+
+	d_out=$(pg_vault user add --name "target-$suffix" --prefix "$d_prefix" --s3-target "$t_name") || {
+		fail "user add с --s3-target"
+		return
+	}
+	d_ak=$(printf '%s\n' "$d_out" | sed -n 's/^access_key_id=//p')
+	d_sk=$(printf '%s\n' "$d_out" | sed -n 's/^secret_key=//p')
+	assert_contains "user add печатает цель" "$d_out" "s3=$MINIO_URL/$ALT_BUCKET"
+
+	# Тот же target у второго пользователя: отдельная строка и секрет,
+	# общий store в пуле.
+	f_out=$(pg_vault user add --name "shared-$suffix" --prefix "$f_prefix" --s3-target "$t_name") || {
+		fail "user add с тем же target"
+		return
+	}
+	f_ak=$(printf '%s\n' "$f_out" | sed -n 's/^access_key_id=//p')
+	f_sk=$(printf '%s\n' "$f_out" | sed -n 's/^secret_key=//p')
+
+	e_out=$(pg_vault user add --name "global-$suffix" --prefix "$e_prefix") || {
+		fail "user add без цели"
+		return
+	}
+	e_ak=$(printf '%s\n' "$e_out" | sed -n 's/^access_key_id=//p')
+	e_sk=$(printf '%s\n' "$e_out" | sed -n 's/^secret_key=//p')
+
+	start_vault_pg_s3 || return
+
+	printf 'target payload\n' >"$WORK/pg-target.txt"
+	assert_eq "PutObject под пользователем с целью -> 200" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-target.txt" "$S3API_URL/$S3_BUCKET/dir/target.txt")" "200"
+	assert_ok "объект лежит в целевом bucket под target.prefix/user.prefix" \
+		s3_bucket_head_raw "$ALT_BUCKET" "$t_prefix/$d_prefix/dir/target.txt"
+	assert_fails "объекта нет в глобальном bucket" \
+		s3_head_raw "$PREFIX/$d_prefix/dir/target.txt"
+	assert_eq "GetObject из цели отдаёт plaintext" \
+		"$(sigv4 "$d_ak" "$d_sk" "$S3API_URL/$S3_BUCKET/dir/target.txt")" "target payload"
+
+	assert_eq "второй пользователь с той же целью -> 200" \
+		"$(sigv4 "$f_ak" "$f_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-target.txt" "$S3API_URL/$S3_BUCKET/dir/shared.txt")" "200"
+	assert_ok "общий профиль цели сохраняет свой user.prefix" \
+		s3_bucket_head_raw "$ALT_BUCKET" "$t_prefix/$f_prefix/dir/shared.txt"
+
+	local list
+	list=$(sigv4 "$d_ak" "$d_sk" "$S3API_URL/$S3_BUCKET?list-type=2")
+	assert_contains "List показывает ключ без target-префикса" "$list" "<Key>dir/target.txt</Key>"
+	assert_not_contains "List не показывает target.prefix" "$list" "$t_prefix"
+
+	printf 'global payload\n' >"$WORK/pg-global.txt"
+	assert_eq "PutObject пользователя без цели -> 200" \
+		"$(sigv4 "$e_ak" "$e_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-global.txt" "$S3API_URL/$S3_BUCKET/dir/global.txt")" "200"
+	assert_ok "пользователь без цели пишет в глобальный bucket" \
+		s3_head_raw "$PREFIX/$e_prefix/dir/global.txt"
+
+	local p2="$WORK/target2.json"
+	cat >"$p2" <<JSON
+{
+  "endpoint": "$MINIO_URL",
+  "region": "$REGION",
+  "bucket": "$ALT_BUCKET",
+  "prefix": "$t2_prefix",
+  "path_style": true,
+  "access_key": "$S3_ACCESS",
+  "secret_key": "$S3_SECRET"
+}
+JSON
+
+	assert_ok "target update принимается" \
+		pg_vault target update --name "$t_name" --profile "$p2" --force
+	assert_eq "старый ключ после смены цели не виден: 404" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' "$S3API_URL/$S3_BUCKET/dir/target.txt")" "404"
+	assert_ok "объект остался в старом месте (миграции нет)" \
+		s3_bucket_head_raw "$ALT_BUCKET" "$t_prefix/$d_prefix/dir/target.txt"
+
+	assert_eq "новый Put уходит в новую цель -> 200" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-target.txt" "$S3API_URL/$S3_BUCKET/dir/new.txt")" "200"
+	assert_ok "новый объект лежит под новым target.prefix" \
+		s3_bucket_head_raw "$ALT_BUCKET" "$t2_prefix/$d_prefix/dir/new.txt"
+
+	assert_ok "user update --clear-s3-target принимается" \
+		pg_vault user update --access-key "$d_ak" --clear-s3-target --force
+	assert_eq "после сброса цели Put идёт в глобальный bucket -> 200" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-target.txt" "$S3API_URL/$S3_BUCKET/dir/cleared.txt")" "200"
+	assert_ok "объект после сброса лежит в глобальном bucket" \
+		s3_head_raw "$PREFIX/$d_prefix/dir/cleared.txt"
+
+	assert_ok "user update --s3-target возвращает цель" \
+		pg_vault user update --access-key "$d_ak" --s3-target "$t_name" --force
+
+	# Неверные креды цели — это 5xx хранилища, а не 403 подписи клиента.
+	local bad="$WORK/target-bad.json"
+	cat >"$bad" <<JSON
+{
+  "endpoint": "$MINIO_URL",
+  "region": "$REGION",
+  "bucket": "$ALT_BUCKET",
+  "prefix": "$t2_prefix",
+  "path_style": true,
+  "access_key": "$S3_ACCESS",
+  "secret_key": "wrong-target-secret"
+}
+JSON
+	pg_vault target update --name "$t_name" --profile "$bad" --force >/dev/null || {
+		fail "target update с неверными кредами"
+		return
+	}
+	assert_eq "отказ целевого S3 -> 5xx, а не 403" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-target.txt" "$S3API_URL/$S3_BUCKET/dir/bad.txt")" "500"
+	assert_not_contains "лог не содержит секрет цели" "$(cat "$VAULT_LOG")" "wrong-target-secret"
+
+	# Multipart привязан к отпечатку цели: смена цели посреди загрузки даёт
+	# NoSuchUpload, а Abort по-прежнему работает.
+	local created uid
+	created=$(sigv4 "$d_ak" "$d_sk" -X POST "$S3API_URL/$S3_BUCKET/dir/mp.bin?uploads")
+	uid=$(printf '%s' "$created" | sed -n 's:.*<UploadId>\([^<]*\)</UploadId>.*:\1:p')
+	assert_ne "CreateMultipartUpload выдал UploadId" "$uid" ""
+
+	assert_eq "UploadPart в сессию с целью -> 200" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' -X PUT \
+			--data-binary "@$WORK/pg-target.txt" \
+			"$S3API_URL/$S3_BUCKET/dir/mp.bin?partNumber=1&uploadId=$uid")" "200"
+
+	local p3="$WORK/target3.json"
+	cat >"$p3" <<JSON
+{
+  "endpoint": "$MINIO_URL",
+  "region": "$REGION",
+  "bucket": "$ALT_BUCKET",
+  "prefix": "$t_prefix-3",
+  "path_style": true,
+  "access_key": "$S3_ACCESS",
+  "secret_key": "$S3_SECRET"
+}
+JSON
+	pg_vault target update --name "$t_name" --profile "$p3" --force >/dev/null
+
+	assert_eq "Complete после смены цели -> 404 NoSuchUpload" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' -X POST \
+			"$S3API_URL/$S3_BUCKET/dir/mp.bin?uploadId=$uid")" "404"
+	assert_eq "Abort после смены цели -> 204" \
+		"$(sigv4 "$d_ak" "$d_sk" -o /dev/null -w '%{http_code}' -X DELETE \
+			"$S3API_URL/$S3_BUCKET/dir/mp.bin?uploadId=$uid")" "204"
+
+	stop_vault || true
+}
+
 # ---------------------------------------------------------------- local ---
 
 phase_local() {
@@ -1219,7 +1602,7 @@ phase_resilience() {
 # Фазам, которым не нужен MinIO, не ждём его и не требуем Docker.
 phase_needs_s3() {
 	case "$1" in
-	local) return 1 ;;
+	local | postgres) return 1 ;;
 	*) return 0 ;;
 	esac
 }
@@ -1237,10 +1620,10 @@ main() {
 
 	local phases
 	case "$cmd" in
-	all) phases=(go cli encrypt server facade local resilience) ;;
-	go | cli | encrypt | server | facade | local | resilience) phases=("$cmd") ;;
+	all) phases=(go cli encrypt server facade postgres postgres_target local resilience) ;;
+	go | cli | encrypt | server | facade | postgres | postgres_target | local | resilience) phases=("$cmd") ;;
 	*)
-		printf 'usage: %s [all|up|down|clean|build|go|cli|encrypt|server|facade|local|resilience]\n' "$0" >&2
+		printf 'usage: %s [all|up|down|clean|build|go|cli|encrypt|server|facade|postgres|postgres_target|local|resilience]\n' "$0" >&2
 		return 2
 		;;
 	esac

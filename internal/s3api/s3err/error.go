@@ -30,8 +30,13 @@ const (
 	InvalidPart      Code = "InvalidPart"
 	InvalidPartOrder Code = "InvalidPartOrder"
 	EntityTooSmall   Code = "EntityTooSmall"
+	EntityTooLarge   Code = "EntityTooLarge"
 	MalformedXML     Code = "MalformedXML"
 	InvalidRequest   Code = "InvalidRequest"
+	// ServiceUnavailable marks a temporary identity-backend failure (for
+	// example, PostgreSQL is unreachable). It must not be collapsed into
+	// AccessDenied: clients retry 503, they do not retry 403.
+	ServiceUnavailable Code = "ServiceUnavailable"
 )
 
 // Error is the S3 XML error document.
@@ -57,8 +62,10 @@ var messages = map[Code]string{
 	InvalidPart:           "One or more of the specified parts could not be found. The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
 	InvalidPartOrder:      "The list of parts was not in ascending order. Parts must be ordered by part number.",
 	EntityTooSmall:        "Your proposed upload is smaller than the minimum allowed object size.",
+	EntityTooLarge:        "Your proposed upload exceeds the maximum allowed object size.",
 	MalformedXML:          "The XML you provided was not well-formed or did not validate against our published schema.",
 	InvalidRequest:        "The request is not valid.",
+	ServiceUnavailable:    "The service is temporarily unavailable. Please retry.",
 }
 
 var status = map[Code]int{
@@ -75,8 +82,10 @@ var status = map[Code]int{
 	InvalidPart:           http.StatusBadRequest,
 	InvalidPartOrder:      http.StatusBadRequest,
 	EntityTooSmall:        http.StatusBadRequest,
+	EntityTooLarge:        http.StatusRequestEntityTooLarge,
 	MalformedXML:          http.StatusBadRequest,
 	InvalidRequest:        http.StatusBadRequest,
+	ServiceUnavailable:    http.StatusServiceUnavailable,
 }
 
 // WriteError writes an S3 XML error response.

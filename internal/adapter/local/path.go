@@ -6,12 +6,18 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/domain"
 )
 
 // tmpDir holds partially written objects; it is never listed and never
 // reachable through an object key.
-const tmpDir = ".s3vault-tmp"
+const (
+	TmpDirName   = config.LocalTmpDirName
+	IndexDirName = config.LocalIndexDirName
+)
+
+const tmpDir = TmpDirName
 
 // relPath maps an object key to a path relative to the store root.
 //
@@ -28,6 +34,9 @@ func relPath(key string) (string, error) {
 		return "", fmt.Errorf("%w: object key %q", domain.ErrInvalidPath, key)
 	}
 	if key == tmpDir || strings.HasPrefix(key, tmpDir+"/") {
+		return "", fmt.Errorf("%w: object key %q is reserved", domain.ErrInvalidPath, key)
+	}
+	if key == IndexDirName || strings.HasPrefix(key, IndexDirName+"/") {
 		return "", fmt.Errorf("%w: object key %q is reserved", domain.ErrInvalidPath, key)
 	}
 	rel := filepath.FromSlash(key)

@@ -22,4 +22,5 @@ func (Passthrough) Decrypt(_ context.Context, dst io.Writer, src io.Reader) erro
 	return err
 }
 
-func (Passthrough) Name() string { return "none" }
+// Name is the object-format name written into S3VCTR01.
+func (Passthrough) Name() string { return NameNone }

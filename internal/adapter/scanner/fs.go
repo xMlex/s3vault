@@ -12,6 +12,8 @@ import (
 
 	"github.com/xMlex/s3vault/internal/domain"
 	"github.com/xMlex/s3vault/internal/port"
+
+	localstore "github.com/xMlex/s3vault/internal/adapter/local"
 )
 
 // Options control how the filesystem is walked.
@@ -99,6 +101,9 @@ func (s *FS) Scan(ctx context.Context, root string, olderThan time.Duration) ite
 				return nil
 			}
 			if d.IsDir() {
+				if d.Name() == localstore.IndexDirName || d.Name() == localstore.TmpDirName {
+					return fs.SkipDir
+				}
 				return nil
 			}
 

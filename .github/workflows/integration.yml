@@ -32,6 +32,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: s3vault
+          POSTGRES_PASSWORD: s3vaulttest
+          POSTGRES_DB: s3vault
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U s3vault -d s3vault"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       S3VAULT_S3_ENDPOINT: http://127.0.0.1:9000
       S3VAULT_S3_BUCKET: s3vault-ci
@@ -41,6 +54,7 @@ jobs:
       S3VAULT_S3_SECRET_KEY: s3vaulttest
       S3VAULT_S3_PREFIX: it/
       S3VAULT_LOG_LEVEL: error
+      S3VAULT_TEST_POSTGRES_DSN: postgres://s3vault:s3vaulttest@127.0.0.1:5432/s3vault?sslmode=disable
     steps:
     - uses: actions/checkout@v7
 
@@ -77,3 +91,7 @@ jobs:
       # -count=1 обязателен: закэшированный результат скрывает плавающие
       # взаимодействия с сервисом. Без S3VAULT_* тесты просто t.Skip.
       run: go test -tags=integration -race -count=1 -v ./internal/integration/
+
+    - name: PostgreSQL auth integration
+      # Схема, секреты, prefix-инварианты и запросы фасада против живой БД.
+      run: go test -tags=integration -race -count=1 -p 1 -v ./internal/adapter/s3auth/postgres ./internal/s3api

@@ -107,7 +107,10 @@ func TestFetchMaterializeSoftTTLSkipsHead(t *testing.T) {
 	require.NoError(t, err)
 	headsAfterMiss := store.heads.Load()
 	getsAfterMiss := store.gets.Load()
-	assert.Equal(t, int64(1), headsAfterMiss)
+	// A cold miss reads the object once. Its identity comes from the S3VCTR01
+	// header of that same stream, so there is no HEAD (and no 128-byte Range)
+	// before it.
+	assert.Equal(t, int64(0), headsAfterMiss)
 	assert.Equal(t, int64(1), getsAfterMiss)
 
 	_, err = f.Materialize(context.Background(), "k")

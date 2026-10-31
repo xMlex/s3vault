@@ -22,6 +22,7 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 			return fmt.Errorf("delete %s: %w", key, err)
 		}
 	}
+	s.forgetDigest(key, rel)
 	s.pruneDirs(filepath.Dir(rel))
 	return nil
 }

@@ -3,6 +3,7 @@ package s3store
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,10 +25,12 @@ import (
 // part size is a client-side choice, so the only honest way to test the knob is to
 // put bytes through the real uploader and watch how it cut them.
 type fakeS3 struct {
-	mu       sync.Mutex
-	puts     []int64 // single PutObject body lengths
-	parts    []int64 // UploadPart body lengths, in the order the parts were sent
-	complete int     // CompleteMultipartUpload calls
+	mu            sync.Mutex
+	puts          []int64 // single PutObject body lengths
+	parts         []int64 // UploadPart body lengths, in the order the parts were sent
+	complete      int     // CompleteMultipartUpload calls
+	putHeaders    []http.Header
+	createHeaders []http.Header
 }
 
 // record applies fn under the lock and returns the part count afterwards, so a
@@ -48,6 +51,23 @@ func (f *fakeS3) snapshot() (puts, parts []int64, complete int) {
 	defer f.mu.Unlock()
 
 	return append([]int64(nil), f.puts...), append([]int64(nil), f.parts...), f.complete
+}
+
+func (f *fakeS3) writeHeaders() (put, create []http.Header) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	put = make([]http.Header, len(f.putHeaders))
+	for i, h := range f.putHeaders {
+		put[i] = h.Clone()
+	}
+
+	create = make([]http.Header, len(f.createHeaders))
+	for i, h := range f.createHeaders {
+		create[i] = h.Clone()
+	}
+
+	return put, create
 }
 
 const (
@@ -91,6 +111,7 @@ func (f *fakeS3) start(t *testing.T) *httptest.Server {
 		case r.Method == http.MethodPost && query.Has("uploads"):
 			w.Header().Set("Content-Type", "application/xml")
 			drain(t, w, r)
+			f.record(func() { f.createHeaders = append(f.createHeaders, r.Header.Clone()) })
 			_, _ = io.WriteString(w, initiateXML)
 
 		case r.Method == http.MethodPut && query.Get("uploadId") != "":
@@ -107,7 +128,10 @@ func (f *fakeS3) start(t *testing.T) *httptest.Server {
 		case r.Method == http.MethodPut:
 			n := drain(t, w, r)
 
-			f.record(func() { f.puts = append(f.puts, n) })
+			f.record(func() {
+				f.puts = append(f.puts, n)
+				f.putHeaders = append(f.putHeaders, r.Header.Clone())
+			})
 			w.Header().Set("ETag", `"single"`)
 
 		default:
@@ -124,7 +148,13 @@ func (f *fakeS3) start(t *testing.T) *httptest.Server {
 func newFakeStore(t *testing.T, srv *httptest.Server, partSize int64) *Store {
 	t.Helper()
 
-	store, err := New(context.Background(), config.S3Config{ //nolint:gosec // fake creds for a local httptest server
+	return newFakeStoreWithOptions(t, srv, partSize, Options{})
+}
+
+func newFakeStoreWithOptions(t *testing.T, srv *httptest.Server, partSize int64, opts Options) *Store {
+	t.Helper()
+
+	store, err := NewWithOptions(context.Background(), config.S3Config{ //nolint:gosec // fake creds for a local httptest server
 		Endpoint:          srv.URL,
 		Region:            "us-east-1",
 		Bucket:            fakeBucket,
@@ -132,7 +162,7 @@ func newFakeStore(t *testing.T, srv *httptest.Server, partSize int64) *Store {
 		SecretKey:         "fakefakefakefakefakefakefakefakefakefake",
 		PathStyle:         true,
 		MultipartPartSize: partSize,
-	})
+	}, opts)
 	require.NoError(t, err)
 
 	return store
@@ -280,8 +310,163 @@ func TestNewDefaultsZeroPartSize(t *testing.T) {
 
 	_, zeroParts, zeroComplete := put(t, 0)
 	_, wantParts, wantComplete := put(t, config.DefaultMultipartPartSize)
+	// Parts are uploaded concurrently; the recorded order is not the wire order.
+	slices.Sort(zeroParts)
+	slices.Sort(wantParts)
 
 	assert.Equal(t, wantParts, zeroParts)
 	assert.Equal(t, wantComplete, zeroComplete)
 	assert.NotEmpty(t, zeroParts, "11 MiB against the 5 MiB default is three parts, not one request")
+}
+
+// A destination's SSE-KMS and storage-class settings are sent only when the
+// target sets them. "Not set" must leave the headers off entirely so the
+// destination keeps its own defaults; sending an empty or STANDARD value would
+// be a different request.
+func newStoreForServer(t *testing.T, endpoint string) *Store {
+	t.Helper()
+
+	store, err := New(context.Background(), config.S3Config{
+		Endpoint:  endpoint,
+		Region:    "us-east-1",
+		Bucket:    fakeBucket,
+		AccessKey: "AKIAFAKE",
+		SecretKey: "fakefakefakefakefakefakefakefakefakefake",
+		PathStyle: true,
+	})
+	require.NoError(t, err)
+
+	return store
+}
+
+// A 206 response carries the returned range in Content-Length and the complete
+// object size in Content-Range. ObjectMeta.Size is the object size, matching the
+// local store, because callers use it to size a ranged reader.
+func TestGetRangeReportsFullObjectSize(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+
+			return
+		}
+
+		w.Header().Set("Content-Range", "bytes 0-9/100")
+		w.Header().Set("Content-Length", "10")
+		w.Header().Set("ETag", `"etag"`)
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 10))
+	}))
+	t.Cleanup(srv.Close)
+
+	store := newStoreForServer(t, srv.URL)
+
+	body, meta, err := store.GetRange(context.Background(), "k", 0, 9)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = body.Close() })
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	assert.Len(t, got, 10)
+	assert.Equal(t, int64(100), meta.Size)
+}
+
+// S3 answers any range on an empty object with 416. That is not a missing
+// object: the local store returns an empty body for the same request, and the
+// facade's HEAD/GET paths must see an empty object, not a 500.
+func TestGetRangeEmptyObject(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("ETag", `"empty"`)
+			w.WriteHeader(http.StatusOK)
+
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		_, _ = io.WriteString(w,
+			`<Error><Code>InvalidRange</Code><Message>range</Message><RequestId>r</RequestId><HostId>h</HostId></Error>`)
+	}))
+	t.Cleanup(srv.Close)
+
+	store := newStoreForServer(t, srv.URL)
+
+	body, meta, err := store.GetRange(context.Background(), "empty", 0, 127)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = body.Close() })
+
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	assert.True(t, meta.Exists)
+	assert.Zero(t, meta.Size)
+}
+
+func TestPutWriteOptions(t *testing.T) {
+	t.Parallel()
+
+	opts := Options{
+		ServerSideEncryption: "aws:kms",
+		SSEKMSKeyID:          "alias/vault",
+		SSEKMSContext:        map[string]string{"tenant": "alice"},
+		BucketKeyEnabled:     true,
+		StorageClass:         "STANDARD_IA",
+	}
+
+	headersOf := func(t *testing.T, opts Options) (put, create http.Header) {
+		t.Helper()
+
+		fake := &fakeS3{}
+		srv := fake.start(t)
+		store := newFakeStoreWithOptions(t, srv, config.DefaultMultipartPartSize, opts)
+
+		// Small body: one PutObject.
+		require.NoError(t, store.Put(context.Background(), "small.txt",
+			bytes.NewReader([]byte("small")), domain.PutMeta{}))
+
+		// 6 MiB against the 5 MiB part size: CreateMultipartUpload carries the
+		// same write options as a single PUT.
+		body := bytes.Repeat([]byte("z"), 6<<20)
+		require.NoError(t, store.Put(context.Background(), "large.bin",
+			bytes.NewReader(body), domain.PutMeta{}))
+
+		puts, creates := fake.writeHeaders()
+		require.Len(t, puts, 1)
+		require.Len(t, creates, 1)
+
+		return puts[0], creates[0]
+	}
+
+	t.Run("absent sends no headers", func(t *testing.T) {
+		t.Parallel()
+
+		put, create := headersOf(t, Options{})
+		for _, h := range []http.Header{put, create} {
+			assert.Empty(t, h.Get("X-Amz-Server-Side-Encryption"))
+			assert.Empty(t, h.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"))
+			assert.Empty(t, h.Get("X-Amz-Server-Side-Encryption-Context"))
+			assert.Empty(t, h.Get("X-Amz-Server-Side-Encryption-Bucket-Key-Enabled"))
+			assert.Empty(t, h.Get("X-Amz-Storage-Class"))
+		}
+	})
+
+	t.Run("sse-kms and storage class on PUT and multipart create", func(t *testing.T) {
+		t.Parallel()
+
+		put, create := headersOf(t, opts)
+
+		for _, h := range []http.Header{put, create} {
+			assert.Equal(t, "aws:kms", h.Get("X-Amz-Server-Side-Encryption"))
+			assert.Equal(t, "alias/vault", h.Get("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id"))
+			assert.Equal(t, base64.StdEncoding.EncodeToString([]byte(`{"tenant":"alice"}`)),
+				h.Get("X-Amz-Server-Side-Encryption-Context"))
+			assert.Equal(t, "true", h.Get("X-Amz-Server-Side-Encryption-Bucket-Key-Enabled"))
+			assert.Equal(t, "STANDARD_IA", h.Get("X-Amz-Storage-Class"))
+		}
+	})
 }

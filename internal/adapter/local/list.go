@@ -108,7 +108,7 @@ func (s *Store) walk(ctx context.Context, prefix string) ([]domain.ListObject, e
 			if p == "." {
 				return nil
 			}
-			if p == tmpDir || !dirCanMatch(p, prefix) {
+			if p == tmpDir || p == IndexDirName || !dirCanMatch(p, prefix) {
 				return fs.SkipDir
 			}
 			return nil

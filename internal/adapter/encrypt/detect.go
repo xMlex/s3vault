@@ -36,7 +36,7 @@ func DecryptAuto(ctx context.Context, enc port.Encryptor, objEnc string, dst io.
 		return fmt.Errorf("object requires encryption.mode=%s, but reader is configured for %s", objEnc, reader)
 	}
 
-	if objEnc == "none" {
+	if objEnc == NameNone {
 		_, err := io.Copy(dst, src)
 		return err
 	}
@@ -79,6 +79,49 @@ func decryptLegacy(ctx context.Context, enc port.Encryptor, dst io.Writer, src i
 	}
 	_, err = io.Copy(dst, src)
 	return err
+}
+
+// LegacyPlaintext reports whether a containerless payload is plaintext for this
+// reader, i.e. whether DecryptAuto would copy it instead of decrypting or
+// rejecting it. It is what lets a ranged read pass through a bytes-for-bytes
+// object without first materializing a temp file, and it answers false for the
+// shapes DecryptAuto refuses (a ciphertext magic with no container).
+func LegacyPlaintext(enc port.Encryptor, prefix []byte) bool {
+	if _, ok := enc.(*Command); ok {
+		// Every containerless object goes through the external decryptor, which
+		// reads a stream and has no random access.
+		return false
+	}
+
+	if _, plain := enc.(Passthrough); plain {
+		if len(prefix) >= len(magicV1) && string(prefix[:len(magicV1)]) == magicV1 {
+			return false
+		}
+
+		if len(prefix) >= len(opensslMagic) && string(prefix[:len(opensslMagic)]) == opensslMagic {
+			return false
+		}
+
+		return true
+	}
+	// A native reader copies a containerless payload unless it carries the native
+	// magic; with the magic it must decrypt the whole stream.
+	return len(prefix) < len(magicV1) || string(prefix[:len(magicV1)]) != magicV1
+}
+
+// LegacyKind classifies a containerless prefix by the magic it starts with.
+// The returned names are the same object-format names as Name: "native",
+// "command" and "none" (plaintext).
+func LegacyKind(prefix []byte) string {
+	if len(prefix) >= len(magicV1) && string(prefix[:len(magicV1)]) == magicV1 {
+		return NameNative
+	}
+
+	if len(prefix) >= len(opensslMagic) && string(prefix[:len(opensslMagic)]) == opensslMagic {
+		return NameCommand
+	}
+
+	return NameNone
 }
 
 func encryptorName(enc port.Encryptor) string {

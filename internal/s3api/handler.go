@@ -1,24 +1,33 @@
 package s3api
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/amwolff/awsig"
 
-	"github.com/xMlex/s3vault/internal/adapter/cache"
+	"github.com/xMlex/s3vault/internal/adapter/encrypt"
+	"github.com/xMlex/s3vault/internal/adapter/s3target"
+	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/keying"
 	"github.com/xMlex/s3vault/internal/metrics"
 	"github.com/xMlex/s3vault/internal/port"
 	"github.com/xMlex/s3vault/internal/s3api/s3err"
+	sessions "github.com/xMlex/s3vault/internal/s3api/session"
 	"github.com/xMlex/s3vault/internal/service"
 )
+
+// DefaultSpoolTTL is how old an orphaned spool file must be before the sweeper
+// removes it. A request-scoped file normally lives for seconds; the TTL only
+// bounds what a crash can leave behind.
+const DefaultSpoolTTL = time.Hour
 
 // Config constructs the path-style S3 API facade.
 type Config struct {
@@ -27,13 +36,18 @@ type Config struct {
 	Bucket         string // virtual bucket name
 	Fetch          *service.Fetch
 	Archive        *service.Archive
+	Profiles       *encrypt.Resolver // required for database-backed principals
 	Keys           keying.Mapper
 	Store          port.ObjectStore
-	Cache          port.PlaintextCache // optional; invalidate on write and delete
-	BucketBackend  string              // backend s3.bucket for cache.ID
-	BucketAsPrefix bool                // treat client bucket as key prefix under backend
+	Targets        s3target.TargetResolver // nil when every principal uses Store
+	Cache          port.PlaintextCache     // optional; invalidate on write and delete
+	BucketBackend  string                  // backend s3.bucket for cache.ID
+	BucketAsPrefix bool                    // treat client bucket as key prefix under backend
 	EncFP          string
 	Multipart      MultipartConfig // spool root, TTL, limits for multipart uploads
+	SpoolDir       string          // request-scoped plaintext (PUT bodies, cacheless GETs)
+	SpoolTTL       time.Duration   // age at which an orphaned spool file is removed
+	PutMaxBytes    int64           // bound on one PutObject/UploadPart body
 	Logger         *slog.Logger
 	Metrics        *metrics.Collector // optional
 }
@@ -50,16 +64,22 @@ type API struct {
 	bucket         string
 	fetch          *service.Fetch
 	archive        *service.Archive
+	profiles       *encrypt.Resolver
 	keys           keying.Mapper
 	store          port.ObjectStore
+	targets        s3target.TargetResolver
 	cache          port.PlaintextCache
 	bucketBackend  string
 	bucketAsPrefix bool
 	encFP          string
-	mp             *mpRegistry
+	auth           AuthLayer
+	mpSess         *sessions.Registry
 	mpTTL          time.Duration
 	mpMaxSessions  int
 	mpMaxBytes     int64
+	spoolDir       string
+	spoolTTL       time.Duration
+	maxBody        int64
 	log            *slog.Logger
 	metrics        *metrics.Collector
 	v4             *awsig.V4[port.Principal]
@@ -96,17 +116,38 @@ func New(cfg Config) (*API, error) {
 		bucket:         cfg.Bucket,
 		fetch:          cfg.Fetch,
 		archive:        cfg.Archive,
+		profiles:       cfg.Profiles,
 		keys:           cfg.Keys,
 		store:          cfg.Store,
+		targets:        cfg.Targets,
 		cache:          cfg.Cache,
 		bucketBackend:  cfg.BucketBackend,
 		bucketAsPrefix: cfg.BucketAsPrefix,
+		auth:           newAuthLayer(cfg.Identity),
 		encFP:          cfg.EncFP,
+		spoolDir:       cfg.SpoolDir,
+		spoolTTL:       cfg.SpoolTTL,
+		maxBody:        cfg.PutMaxBytes,
 		log:            log,
 		metrics:        cfg.Metrics,
 	}
 	if a.bucketBackend == "" {
 		a.bucketBackend = cfg.Bucket
+	}
+
+	if a.spoolTTL <= 0 {
+		a.spoolTTL = DefaultSpoolTTL
+	}
+
+	if a.maxBody <= 0 {
+		a.maxBody = config.MaxMultipartPartSize
+	}
+	// Created here rather than left to the first request: a missing spool root
+	// would turn every PutObject into an InternalError at the worst moment.
+	if a.spoolDir != "" {
+		if err := os.MkdirAll(a.spoolDir, 0o700); err != nil {
+			return nil, fmt.Errorf("mkdir spool %s: %w", a.spoolDir, err)
+		}
 	}
 
 	// A zero-valued MultipartConfig gets the package defaults rather than an
@@ -125,12 +166,12 @@ func New(cfg Config) (*API, error) {
 		mpCfg.MaxSessions = DefaultMultipartMaxSessions
 	}
 
-	mp, err := newMPRegistry(mpCfg, log)
+	mpSess, err := sessions.New(mpCfg, log)
 	if err != nil {
 		return nil, err
 	}
 
-	a.mp = mp
+	a.mpSess = mpSess
 	a.mpTTL = mpCfg.TTL
 	a.mpMaxSessions = mpCfg.MaxSessions
 	a.mpMaxBytes = mpCfg.MaxBytes
@@ -168,14 +209,22 @@ func (a *API) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A body-bearing operation is bounded before it is read: without this one
+	// client can fill the spool, and the S3 single-PUT ceiling is a protocol
+	// limit the request cannot pass anyway. aws-chunked framing sits on top of
+	// the decoded payload, hence the small allowance; the exact size is checked
+	// again after the body is consumed.
+	if op == port.S3OpPut || op == port.S3OpUploadPart {
+		r.Body = http.MaxBytesReader(w, r.Body, a.maxBody+maxBodyOverhead(a.maxBody))
+	}
+
 	vr, err := a.v4.Verify(r)
 	if err != nil {
 		a.writeAuthError(w, r, op, err)
 		return
 	}
 	prin := vr.AuthData()
-
-	if err := a.id.Allow(r.Context(), prin, op, bucket, key); err != nil {
+	if err := a.auth.Allow(r.Context(), prin, op, bucket, key); err != nil {
 		a.metric(opMetric(op), "denied")
 		a.log.WarnContext(r.Context(), "s3 access denied",
 			slog.String("op", "s3."+opMetric(op)),
@@ -186,31 +235,33 @@ func (a *API) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sc := a.newScope(prin)
+
 	switch op {
 	case port.S3OpListBuckets:
 		a.handleListBuckets(w, r, prin)
 	case port.S3OpHeadBucket:
 		a.handleHeadBucket(w, r, bucket)
 	case port.S3OpList:
-		a.handleList(w, r, bucket)
+		a.handleList(w, r, sc, bucket)
 	case port.S3OpGet:
-		a.handleGet(w, r, bucket, key, false)
+		a.handleGet(w, r, sc, bucket, key, false)
 	case port.S3OpHead:
-		a.handleGet(w, r, bucket, key, true)
+		a.handleGet(w, r, sc, bucket, key, true)
 	case port.S3OpPut:
-		a.handlePut(w, r, vr, bucket, key)
+		a.handlePut(w, r, vr, sc, bucket, key)
 	case port.S3OpDelete:
-		a.handleDelete(w, r, bucket, key)
+		a.handleDelete(w, r, sc, bucket, key)
 	case port.S3OpCreateMultipartUpload:
-		a.handleCreateMultipartUpload(w, r, bucket, key, prin)
+		a.handleCreateMultipartUpload(w, r, sc, bucket, key, prin)
 	case port.S3OpUploadPart:
-		a.handleUploadPart(w, r, vr, bucket, key, prin)
+		a.handleUploadPart(w, r, vr, sc, bucket, key, prin)
 	case port.S3OpCompleteMultipartUpload:
-		a.handleCompleteMultipartUpload(w, r, vr, bucket, key, prin)
+		a.handleCompleteMultipartUpload(w, r, vr, sc, bucket, key, prin)
 	case port.S3OpAbortMultipartUpload:
-		a.handleAbortMultipartUpload(w, r, bucket, key, prin)
+		a.handleAbortMultipartUpload(w, r, sc, bucket, key, prin)
 	case port.S3OpListParts:
-		a.handleListParts(w, r, bucket, key, prin)
+		a.handleListParts(w, r, sc, bucket, key, prin)
 	default:
 		a.metric("unknown", "method_not_allowed")
 		s3err.WriteError(w, r, s3err.MethodNotAllowed, "")
@@ -221,26 +272,17 @@ func (a *API) metric(op, result string) {
 	a.metrics.S3(op, result)
 }
 
-// invalidateCache drops the plaintext cache entry for backendKey so the next
-// read cannot serve the version from before the write. It is called after every
-// mutation the facade performs itself (PutObject, DeleteObject): the cache
-// revalidates on its own schedule, but with soft_ttl > 0 a fresh entry is
-// served without any revalidation, so without this a read straight after a
-// successful write returns the previous content.
-//
-// Best-effort by design: a failed Remove only leaves the entry to the usual
-// soft-TTL revalidation, so it must never fail the write that already succeeded.
-func (a *API) invalidateCache(ctx context.Context, backendKey, op string) {
-	if a.cache == nil {
-		return
-	}
-	id := cache.ID(a.bucketBackend, backendKey, a.encFP)
-	if err := a.cache.Remove(ctx, id); err != nil {
-		a.log.WarnContext(ctx, "s3 cache invalidate",
-			slog.String("op", op),
-			slog.String("err", err.Error()),
-		)
-	}
+// maxBodyOverhead is the slack allowed on top of server.put_max_bytes for the
+// per-chunk framing of an aws-chunked request body (~100 bytes per 64 KiB chunk).
+func maxBodyOverhead(maxPayload int64) int64 {
+	return maxPayload/100 + 1<<20
+}
+
+// bodyTooLarge reports whether err is the body limit talking, either the exact
+// post-read check or http.MaxBytesReader stopping the read.
+func bodyTooLarge(err error) bool {
+	var maxErr *http.MaxBytesError
+	return errors.Is(err, errBodyTooLarge) || errors.As(err, &maxErr)
 }
 
 func opMetric(op port.S3Op) string {
@@ -416,62 +458,4 @@ func (a *API) clientPath(bucket, clientKey string) string {
 		return bucket
 	}
 	return path.Join(bucket, clientKey)
-}
-
-func (a *API) backendKey(bucket, clientKey string) (string, error) {
-	return a.keys.FromRequestPath(a.clientPath(bucket, clientKey))
-}
-
-func (a *API) listPrefix(bucket, clientPrefix string) string {
-	rel := strings.TrimLeft(clientPrefix, "/")
-	if a.bucketAsPrefix {
-		rel = a.clientPath(bucket, clientPrefix)
-	}
-	server := strings.Trim(strings.ReplaceAll(a.keys.Prefix, "\\", "/"), "/")
-	if server == "" {
-		if a.bucketAsPrefix && strings.TrimLeft(clientPrefix, "/") == "" && rel != "" {
-			return rel + "/"
-		}
-		return rel
-	}
-	if rel == "" {
-		return server + "/"
-	}
-	joined := path.Join(server, rel)
-	if a.bucketAsPrefix && strings.TrimLeft(clientPrefix, "/") == "" {
-		return joined + "/"
-	}
-	return joined
-}
-
-func (a *API) stripServerPrefix(key string) string {
-	server := strings.Trim(strings.ReplaceAll(a.keys.Prefix, "\\", "/"), "/")
-	if server == "" {
-		return key
-	}
-	prefix := server + "/"
-	if strings.HasPrefix(key, prefix) {
-		return strings.TrimPrefix(key, prefix)
-	}
-	if key == server {
-		return ""
-	}
-	return key
-}
-
-// stripClientKey removes server prefix and, when BucketAsPrefix, the bucket segment
-// so ListObjects keys match what the client sent inside that bucket.
-func (a *API) stripClientKey(bucket, key string) string {
-	key = a.stripServerPrefix(key)
-	if !a.bucketAsPrefix || bucket == "" {
-		return key
-	}
-	prefix := bucket + "/"
-	if strings.HasPrefix(key, prefix) {
-		return strings.TrimPrefix(key, prefix)
-	}
-	if key == bucket {
-		return ""
-	}
-	return key
 }

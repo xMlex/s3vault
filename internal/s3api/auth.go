@@ -1,3 +1,4 @@
+// Package s3api serves the gateway's SigV4 S3 facade.
 package s3api
 
 import (
@@ -39,13 +40,37 @@ func (a *API) writeAuthError(w http.ResponseWriter, r *http.Request, op port.S3O
 
 func mapAuthError(err error) (s3err.Code, string) {
 	switch {
+	case errors.Is(err, port.ErrAuthUnavailable):
+		return s3err.ServiceUnavailable, "unavailable"
+	case errors.Is(err, port.ErrAuthInternal):
+		return s3err.InternalError, "internal"
 	case errors.Is(err, awsig.ErrInvalidAccessKeyID):
 		return s3err.InvalidAccessKeyId, "invalid_key"
 	case errors.Is(err, awsig.ErrSignatureDoesNotMatch), errors.Is(err, awsig.ErrInvalidSignature):
 		return s3err.SignatureDoesNotMatch, "bad_signature"
-	case errors.Is(err, awsig.ErrAccessDenied):
+	case errors.Is(err, awsig.ErrAccessDenied), errors.Is(err, port.ErrAccessDenied):
 		return s3err.AccessDenied, "denied"
 	default:
 		return s3err.AccessDenied, "denied"
 	}
+}
+
+// AuthLayer separates authorization policy from the S3 protocol handler.
+// It is an interface (not a concrete struct only) so handler tests can
+// substitute it and future adapters (e.g. Postgres) can be injected without
+// changing handler wiring.
+type AuthLayer interface {
+	Allow(ctx context.Context, pr port.Principal, op port.S3Op, bucket, key string) error
+}
+
+type authLayer struct {
+	id port.S3Identity
+}
+
+func newAuthLayer(id port.S3Identity) AuthLayer {
+	return &authLayer{id: id}
+}
+
+func (a *authLayer) Allow(ctx context.Context, pr port.Principal, op port.S3Op, bucket, key string) error {
+	return a.id.Allow(ctx, pr, op, bucket, key)
 }

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,10 +19,14 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/xMlex/s3vault/internal/adapter/cache"
+	"github.com/xMlex/s3vault/internal/adapter/digest"
 	"github.com/xMlex/s3vault/internal/adapter/encrypt"
 	localstore "github.com/xMlex/s3vault/internal/adapter/local"
 	s3store "github.com/xMlex/s3vault/internal/adapter/s3"
 	"github.com/xMlex/s3vault/internal/adapter/s3auth"
+	postgresauth "github.com/xMlex/s3vault/internal/adapter/s3auth/postgres"
+	"github.com/xMlex/s3vault/internal/adapter/s3auth/secretbox"
+	"github.com/xMlex/s3vault/internal/adapter/s3target"
 	"github.com/xMlex/s3vault/internal/adapter/scanner"
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/domain"
@@ -100,6 +105,9 @@ func NewRootCommand(opt Options) *cobra.Command {
 	root.AddCommand(newDownloadCmd(state))
 	root.AddCommand(newServerCmd(state))
 	root.AddCommand(newCacheCmd(state))
+	root.AddCommand(newUserCmd(state))
+	root.AddCommand(newTargetCmd(state))
+	root.AddCommand(newProfileCmd(state))
 	root.AddCommand(newVersionCmd(opt.Version))
 	return root
 }
@@ -261,7 +269,7 @@ func newArchiveCmd(state *runState) *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "scan and print keys without uploading")
 	cmd.Flags().IntVar(&workers, "workers", 0, "parallel workers (default from config)")
 	cmd.Flags().BoolVar(&failFast, "fail-fast", false, "stop on the first file error")
-	cmd.Flags().StringVar(&output, "output", "text", "summary format: text|json")
+	cmd.Flags().StringVar(&output, "output", outputText, "summary format: text|json")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "object key prefix joined with paths under <dir> (e.g. fs.auto-sopd)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket (backend.type=s3 only)")
 	cmd.Flags().BoolVar(&deleteAfter, "delete-after-upload", false, "delete local file after a successful upload")
@@ -272,7 +280,7 @@ func newArchiveCmd(state *runState) *cobra.Command {
 
 func printStats(w io.Writer, format string, st domain.ArchiveStats) error {
 	switch format {
-	case "json":
+	case outputJSON:
 		enc := json.NewEncoder(w)
 		return enc.Encode(st)
 	default:
@@ -358,7 +366,7 @@ func newUploadCmd(state *runState) *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "print the object key without uploading")
 	cmd.Flags().BoolVar(&deleteAfter, "delete-after-upload", false, "delete local file after a successful upload")
 	cmd.Flags().BoolVar(&deleteIfExist, "delete-if-exists", false, "delete local file when remote already has identical content (skip)")
-	cmd.Flags().StringVar(&output, "output", "text", "summary format: text|json")
+	cmd.Flags().StringVar(&output, "output", outputText, "summary format: text|json")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "prometheus bind address for the duration of the run")
 	return cmd
 }
@@ -422,6 +430,11 @@ func newServerCmd(state *runState) *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			profiles, err := encrypt.NewResolver(cfg.Encryption)
+			if err != nil {
+				return err
+			}
 			ctx := cmd.Context()
 			if ctx == nil {
 				ctx = context.Background()
@@ -431,6 +444,30 @@ func newServerCmd(state *runState) *cobra.Command {
 				return err
 			}
 			defer closeStore()
+
+			// The digest index belongs to the server alone. It lives under the
+			// target directory and caches sha256+mtime for containerless objects;
+			// archive/upload/download keep hashing directly.
+			if ls, ok := store.(*localstore.Store); ok {
+				// Even without a usable index, a client disconnect must not abort a
+				// hash the next HEAD needs; the server lifetime is the right scope.
+				ls.WithHashContext(ctx)
+				idx, idxErr := digest.Open(digest.Options{
+					Dir:    filepath.Join(cfg.Backend.Local.Dir, localstore.IndexDirName),
+					Shards: cfg.Backend.Local.IndexShards,
+					Logger: state.logger,
+				})
+				if idxErr != nil {
+					state.logger.Warn("digest index disabled", "op", "index", "err", idxErr)
+				} else {
+					ls.WithDigestIndex(idx)
+					warm := idx.NeedsWarm()
+					idx.Start(ctx, cfg.Backend.Local.Dir, digest.WarmWorkers)
+					defer func() { _ = idx.Close() }()
+					state.logger.Info("digest index enabled",
+						"op", "index", "dir", idx.Dir(), "shards", idx.Shards(), "warm", warm)
+				}
+			}
 
 			reg := prometheus.NewRegistry()
 			if err := metrics.RegisterRuntime(reg); err != nil {
@@ -442,7 +479,8 @@ func newServerCmd(state *runState) *cobra.Command {
 			}
 
 			encFP := encrypt.Fingerprint(cfg.Encryption)
-			fetch := service.NewFetch(store, enc).WithMetrics(met).WithLogger(state.logger)
+			fetch := service.NewFetch(store, enc).WithMetrics(met).WithLogger(state.logger).
+				WithSpoolDir(cfg.Server.SpoolDir)
 			var disk port.PlaintextCache
 			if cfg.Cache.Enabled {
 				d, err := cache.New(cache.Options{
@@ -478,59 +516,18 @@ func newServerCmd(state *runState) *cobra.Command {
 			arch := service.NewArchive(scan, keys, store, enc, state.logger).WithMetrics(met).
 				WithFraming(true)
 
-			var s3Handler http.Handler
+			var (
+				s3Handler  http.Handler
+				readyCheck func(context.Context) error
+			)
 			if cfg.Server.S3APIEnabled() {
-				virtBucket := cfg.Server.S3Bucket
-				if virtBucket == "" {
-					// A local backend has no bucket of its own.
-					virtBucket = cfg.S3.Bucket
-				}
-				if virtBucket == "" {
-					virtBucket = defaultVirtualBucket
-				}
-				region := cfg.Server.S3Region
-				if region == "" {
-					region = cfg.S3.Region
-				}
-				idBucket := virtBucket
-				if cfg.Server.S3BucketAsPrefix {
-					idBucket = "" // Allow any client bucket; name becomes key prefix
-				}
-				id := &s3auth.Static{
-					AccessKey: cfg.Server.S3AccessKey,
-					SecretKey: cfg.Server.S3SecretKey,
-					Bucket:    idBucket,
-				}
-				api, err := s3api.New(s3api.Config{
-					Identity:       id,
-					Region:         region,
-					Bucket:         virtBucket,
-					Fetch:          fetch,
-					Archive:        arch,
-					Keys:           keys,
-					Store:          store,
-					Cache:          disk,
-					BucketBackend:  cfg.CacheNamespace(),
-					BucketAsPrefix: cfg.Server.S3BucketAsPrefix,
-					EncFP:          encFP,
-					Multipart: s3api.MultipartConfig{
-						Dir:           cfg.Server.MultipartDir,
-						TTL:           cfg.Server.MultipartTTL,
-						SweepInterval: cfg.Server.MultipartSweepInterval,
-						MaxSessions:   cfg.Server.MultipartMaxSessions,
-						MaxBytes:      cfg.Server.MultipartMaxBytes,
-					},
-					Logger:  state.logger,
-					Metrics: met,
-				})
+				var closeGateway func()
+
+				s3Handler, readyCheck, closeGateway, err = newS3Gateway(ctx, cfg, state.logger, met, store, fetch, arch, profiles, keys, disk, encFP)
 				if err != nil {
 					return err
 				}
-				// Multipart parts are spooled to disk and only reclaimed by this
-				// loop; without it an interrupted upload would stay there for
-				// good, since no other timer in the process owns that directory.
-				api.StartSweeper(ctx, cfg.Server.MultipartSweepInterval)
-				s3Handler = api.Handler()
+				defer closeGateway()
 			}
 
 			srv, err := httpserver.New(httpserver.Config{
@@ -541,6 +538,7 @@ func newServerCmd(state *runState) *cobra.Command {
 				Store:         store,
 				Metrics:       met,
 				S3Handler:     s3Handler,
+				ReadyCheck:    readyCheck,
 			})
 			if err != nil {
 				return err
@@ -612,6 +610,170 @@ func openCache(cfg config.Config) (*cache.Disk, error) {
 		TTL:      cfg.Cache.TTL,
 		MaxBytes: cfg.Cache.MaxBytes,
 	})
+}
+
+// newS3Gateway builds the identity, optional shared-target pool and the S3
+// facade handler. The returned close function releases the pool and the
+// database connections and must be called after the HTTP server stops.
+func newS3Gateway(ctx context.Context, cfg config.Config, log *slog.Logger, met *metrics.Collector,
+	store port.ObjectStore, fetch *service.Fetch, arch *service.Archive, profiles *encrypt.Resolver,
+	keys keying.Mapper, disk port.PlaintextCache, encFP string,
+) (http.Handler, func(context.Context) error, func(), error) {
+	virtBucket := cfg.Server.S3Bucket
+	if virtBucket == "" {
+		// A local backend has no bucket of its own.
+		virtBucket = cfg.S3.Bucket
+	}
+	if virtBucket == "" {
+		virtBucket = defaultVirtualBucket
+	}
+
+	region := cfg.Server.S3Region
+	if region == "" {
+		region = cfg.S3.Region
+	}
+
+	var (
+		identity   port.S3Identity
+		targets    s3target.TargetResolver
+		readyCheck func(context.Context) error
+		closers    []func()
+	)
+
+	switch cfg.Server.Auth.Backend {
+	case config.AuthBackendPostgres:
+		authID, pool, err := openPostgresAuth(ctx, cfg, log, profiles, virtBucket)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+		identity = authID
+		targets = pool
+		readyCheck = authID.Ping
+		closers = append(closers, authID.Close, pool.Close)
+	default:
+		idBucket := virtBucket
+		if cfg.Server.S3BucketAsPrefix {
+			idBucket = "" // Allow any client bucket; name becomes key prefix
+		}
+
+		identity = &s3auth.Static{
+			AccessKey: cfg.Server.S3AccessKey,
+			SecretKey: cfg.Server.S3SecretKey,
+			Bucket:    idBucket,
+		}
+	}
+
+	api, err := s3api.New(s3api.Config{
+		Identity:       identity,
+		Region:         region,
+		Bucket:         virtBucket,
+		Fetch:          fetch,
+		Archive:        arch,
+		Profiles:       profiles,
+		Keys:           keys,
+		Store:          store,
+		Targets:        targets,
+		Cache:          disk,
+		BucketBackend:  cfg.CacheNamespace(),
+		BucketAsPrefix: cfg.Server.S3BucketAsPrefix,
+		EncFP:          encFP,
+		Multipart: s3api.MultipartConfig{
+			Dir:           cfg.Server.MultipartDir,
+			TTL:           cfg.Server.MultipartTTL,
+			SweepInterval: cfg.Server.MultipartSweepInterval,
+			MaxSessions:   cfg.Server.MultipartMaxSessions,
+			MaxBytes:      cfg.Server.MultipartMaxBytes,
+		},
+		SpoolDir:    cfg.Server.SpoolDir,
+		SpoolTTL:    cfg.Server.SpoolTTL,
+		PutMaxBytes: cfg.Server.PutMaxBytes,
+		Logger:      log,
+		Metrics:     met,
+	})
+	if err != nil {
+		closeAll(closers)
+
+		return nil, nil, nil, err
+	}
+
+	// Multipart parts are spooled to disk and only reclaimed by this loop;
+	// without it an interrupted upload would stay there for good, since no
+	// other timer in the process owns that directory.
+	api.StartSweeper(ctx, cfg.Server.MultipartSweepInterval)
+
+	return api.Handler(), readyCheck, func() { closeAll(closers) }, nil
+}
+
+func closeAll(closers []func()) {
+	for _, closeFn := range slices.Backward(closers) {
+		closeFn()
+	}
+}
+
+// openPostgresAuth builds the PostgreSQL identity and the bounded target-store
+// pool used by the S3 facade. The pool opens no connections at startup: the
+// first store appears on the first request of a user with a target.
+func openPostgresAuth(ctx context.Context, cfg config.Config, log *slog.Logger, profiles *encrypt.Resolver, bucket string) (*postgresauth.Identity, *s3target.Pool, error) {
+	masterKey, err := authMasterKey()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	authID, err := postgresauth.Open(ctx, postgresauth.Config{
+		DSN:          cfg.Server.Auth.DSN,
+		MaxConns:     cfg.Server.Auth.MaxConns,
+		QueryTimeout: cfg.Server.Auth.QueryTimeout,
+		MasterKey:    masterKey,
+		Bucket:       bucket,
+		Logger:       log,
+		ValidateEncryption: func(raw json.RawMessage) error {
+			_, err := profiles.ResolveRaw(raw)
+
+			return err
+		},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	pool := s3target.NewPool(s3target.PoolConfig{
+		Builder: func(ctx context.Context, t port.S3Target) (port.ObjectStore, error) {
+			opts := s3store.Options{StorageClass: t.StorageClass}
+			if t.SSEKMS != nil {
+				opts.ServerSideEncryption = "aws:kms"
+				opts.SSEKMSKeyID = t.SSEKMS.KeyID
+				opts.SSEKMSContext = t.SSEKMS.Context
+				opts.BucketKeyEnabled = t.SSEKMS.BucketKey
+			}
+
+			return s3store.NewWithOptions(ctx, config.S3Config{
+				Endpoint:          t.Endpoint,
+				Region:            t.Region,
+				Bucket:            t.Bucket,
+				AccessKey:         t.AccessKey,
+				SecretKey:         t.SecretKey,
+				SessionTok:        t.SessionToken,
+				PathStyle:         t.PathStyle,
+				MultipartPartSize: cfg.S3.MultipartPartSize,
+			}, opts)
+		},
+		Max:           cfg.Server.Auth.TargetPoolMax,
+		Idle:          cfg.Server.Auth.TargetPoolIdle,
+		SweepInterval: s3target.DefaultSweepInterval,
+		Logger:        log,
+	})
+
+	return authID, pool, nil
+}
+
+func authMasterKey() ([]byte, error) {
+	key, err := secretbox.ParseKey(os.Getenv(postgresauth.MasterKeyEnv))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", postgresauth.MasterKeyEnv, err)
+	}
+
+	return key, nil
 }
 
 func newVersionCmd(version string) *cobra.Command {

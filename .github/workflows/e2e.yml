@@ -35,6 +35,19 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: s3vault
+          POSTGRES_PASSWORD: s3vaulttest
+          POSTGRES_DB: s3vault
+        ports:
+          - '5432:5432'
+        options: >-
+          --health-cmd "pg_isready -U s3vault -d s3vault"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
     - uses: actions/checkout@v7
 
@@ -49,8 +62,9 @@ jobs:
       # docker compose stop — в CI compose вообще не поднимается.
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends socat
+        sudo apt-get install -y --no-install-recommends socat postgresql-client
         socat -V | head -1
+        pg_isready --version
 
     - name: Ensure aws cli
       # scripts/e2e.sh ходит в MinIO напрямую через awscli (s3api get-object и
@@ -79,6 +93,10 @@ jobs:
       run: ./scripts/e2e.sh all
       env:
         S3VAULT_E2E_NO_COMPOSE: '1'
+        S3VAULT_E2E_PG_PORT: '5432'
+        S3VAULT_E2E_PG_USER: s3vault
+        S3VAULT_E2E_PG_PASSWORD: s3vaulttest
+        S3VAULT_E2E_PG_DB: s3vault
 
     - name: Run decrypt-detection verify
       # Стенды детектора шифрования (docs/decrypt-detection.md): ветвление

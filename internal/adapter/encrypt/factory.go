@@ -10,11 +10,11 @@ import (
 // New selects an Encryptor implementation from config.
 func New(cfg config.EncryptionConfig) (port.Encryptor, error) {
 	switch cfg.Mode {
-	case "", "none":
+	case "", NameNone:
 		return Passthrough{}, nil
-	case "native":
+	case NameNative:
 		return NewNative(cfg.Native)
-	case "command":
+	case NameCommand:
 		return NewCommand(cfg.Command)
 	default:
 		return nil, fmt.Errorf("unknown encryption mode %q", cfg.Mode)

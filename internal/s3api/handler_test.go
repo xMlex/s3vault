@@ -40,6 +40,12 @@ type memStore struct {
 	mu   sync.Mutex
 	meta map[string]domain.ObjectMeta
 	body map[string][]byte
+
+	// Access counters used by the performance tests: how many bodies were
+	// downloaded and how many range bytes were asked for.
+	gets       int
+	ranges     int
+	rangeBytes int64
 }
 
 func newMemStore() *memStore {
@@ -96,6 +102,8 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, meta domain.P
 func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, domain.ObjectMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.gets++
 	b, ok := m.body[key]
 	if !ok {
 		return nil, domain.ObjectMeta{}, domain.ErrNotFound
@@ -113,6 +121,10 @@ func (m *memStore) GetRange(_ context.Context, key string, start, end int64) (io
 	if start < 0 || end < start {
 		return nil, domain.ObjectMeta{}, fmt.Errorf("invalid range")
 	}
+
+	m.ranges++
+
+	m.rangeBytes += end - start + 1
 	if start >= int64(len(b)) {
 		return io.NopCloser(bytes.NewReader(nil)), m.meta[key], nil
 	}

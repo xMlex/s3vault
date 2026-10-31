@@ -35,6 +35,26 @@ services:
       retries: 30
       start_period: 3s
 
+  # PostgreSQL для фазы пользователей gateway. Пароль — только для стенда.
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${S3VAULT_E2E_PG_USER:-s3vault}
+      POSTGRES_PASSWORD: ${S3VAULT_E2E_PG_PASSWORD:-s3vaulttest}
+      POSTGRES_DB: ${S3VAULT_E2E_PG_DB:-s3vault}
+    ports:
+      - "${S3VAULT_E2E_PG_PORT:-15432}:5432"
+    volumes:
+      # postgres:18+ keeps PGDATA under a versioned subdirectory; mounting the
+      # parent is what the image requires (the old /data mount refuses to start).
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+
   # Создаёт бакет и выходит. s3store.New только проверяет, что имя бакета
   # непустое, и ни разу не вызывает CreateBucket — бакет обязан существовать.
   minio-init:
@@ -59,3 +79,4 @@ services:
 
 volumes:
   minio-data:
+  postgres-data:

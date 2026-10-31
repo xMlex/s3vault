@@ -4,6 +4,8 @@ backend:
   type: s3  # s3 | local
   # local:
   #   dir: /srv/s3vault/objects  # object tree on this host; s3.* is then unused
+  #   # Digest index inside dir (.s3vault-index/). Default 8 shards.
+  #   # S3VAULT_BACKEND_LOCAL_INDEX_SHARDS=8
   # Env equivalents (override this file, no YAML needed at all):
   #   S3VAULT_BACKEND_TYPE=local
   #   S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
@@ -46,7 +48,7 @@ encryption:
   #   public_key_path: /etc/s3vault/public.pem
   #   private_key_path: /etc/s3vault/private.pem   # wrap: rsa-oaep
   #   key_file: /etc/s3vault/kek.bin              # wrap: keyfile; 32 raw bytes or SHA-256 of the file
-  #   chunk_size: 65536
+  #   chunk_size: 65536                          # 4 KiB..8 MiB; пишется в заголовок каждого объекта
   # CryptoPro CSP (ГОСТ): provider + SHA-1 thumbprint → S3VCTR01 header;
   # download uses header (CRYPTOPRO_THUMBPRINT) so old objects stay decryptable after key rotation.
   # PIN — only CRYPTOPRO_PIN in the process environment, not in this file.
@@ -69,10 +71,24 @@ server:
   metrics_listen: "127.0.0.1:9090"
   # The gateway serves clients only over the S3 API; server.token / HTTP /files
   # were removed. A non-loopback or loopback server both require the S3 keys.
-  # S3 API (SigV4 plaintext facade). Both keys required (the only data frontend).
+  # S3 API (SigV4 plaintext facade). One identity source is required: both static
+  # keys below, or auth.backend=postgres with a DSN (then keep the keys empty).
   # s3_listen: ""  # empty = multiplex on listen (reserved: /health /ready)
   # s3_listen: "127.0.0.1:8333"  # or separate port; needs the key pair below
   # s3_access_key / s3_secret_key: prefer S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY
+  # Auth backend. static = one pair below; postgres = users table, and then the
+  # static pair must stay empty. Prefer env S3VAULT_SERVER_AUTH_DSN and
+  # S3VAULT_SERVER_AUTH_MASTER_KEY (base64 32 bytes; not a YAML key).
+  # auth:
+  #   backend: static              # static | postgres
+  #   dsn: ""                      # postgres://user@host:5432/db?sslmode=disable
+  #   max_conns: 8
+  #   query_timeout: 2s
+  #   # Пул ObjectStore для пользовательских s3_target (только postgres).
+  #   # Цель задаётся в БД через `s3vault target add/update --profile`, не здесь;
+  #   # файл цели может содержать sse_kms и storage_class.
+  #   target_pool_max: 64          # максимум store'ов; 0 = default, <0 — ошибка
+  #   target_pool_idle: 15m        # простой до вытеснения; 0 = default, <0 — ошибка
   # s3_region: us-east-1
   # s3_bucket: my-bucket  # virtual bucket name; default = s3.bucket
   # s3_bucket_as_prefix: false  # true = client bucket name becomes key prefix under s3.bucket
@@ -91,6 +107,13 @@ server:
   # multipart_sweep_interval: 15m      # как часто сборщик чистит спул; 0 = выключить
   # multipart_max_sessions: 64         # больше живых сессий — вытесняется самая старая
   # multipart_max_bytes: 0             # лимит байт на одну сессию; 0 = без ограничения
+  # Request-спул фасада: тело PutObject на время хэширования и plaintext для
+  # чтений, которые нельзя отдать диапазоном (mode=command). Не внутри cache.dir;
+  # сборщик удаляет только свои префиксы по возрасту.
+  # По умолчанию: <cache.dir>-spool (соседний каталог, не внутри).
+  # spool_dir: /var/cache/s3vault-spool
+  # spool_ttl: 1h                      # возраст осиротевшего файла спула
+  # put_max_bytes: 5368709120          # 5 ГиБ — потолок одного S3 PUT; превышение → 413
 # Клиент без CryptoPro/S3: указывает s3.endpoint на S3-фасад шлюза и использует
 # его server.s3_access_key/server.s3_secret_key как S3-креды, path_style: true.
 # Тогда archive/upload/download ходят только через шлюз. Ключи remote.url и
