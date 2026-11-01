@@ -898,14 +898,14 @@ go test -tags=integration -count=1 -v ./internal/integration/
 
 ## E2E-стенд
 
-`make e2e` поднимает MinIO из `compose.e2e.yaml` (бакет создаётся через `minio-init`, сам код `CreateBucket` не вызывает) и прогоняет все фазы: `go test -race ./...`, integration-тесты, CLI (archive/upload/download, перезапись по ключу, delete-политики, симлинки), все режимы шифрования, HTTP-сервер (health/ready, Range, метрики, кэш), SigV4-фасад (включая multipart: клиент s3vault грузит 12 МиБ через фасад при заданной части в 5 МиБ и сверяет, что частей ровно три; отдельно проверяет дефолт — 4 МиБ-1 уходят одним `PutObject` без частей, 12 МиБ режутся на три, 32 МиБ на семь; плюс roundtrip побайтово, сверка sha256 multipart- и single-PUT-пути между собой и с прямым MinIO, проверка что `206` не объявляет чек-сумму всего объекта, настоящий `aws s3 cp` на 12 МиБ и пустой спул), локальный бэкенд и отказы.
+`make e2e` поднимает MinIO из `compose.e2e.yaml` (бакет создаётся через `minio-init`, сам код `CreateBucket` не вызывает) и прогоняет все фазы: `go test -race ./...`, integration-тесты, CLI (archive/upload/download, перезапись по ключу, delete-политики, симлинки), все режимы шифрования, HTTP-сервер (health/ready, Range, метрики, кэш), SigV4-фасад (включая multipart: клиент s3vault грузит 12 МиБ через фасад при заданной части в 5 МиБ и сверяет, что частей ровно три; отдельно проверяет дефолт — 4 МиБ-1 уходят одним `PutObject` без частей, 12 МиБ режутся на три, 32 МиБ на семь; плюс roundtrip побайтово, сверка sha256 multipart- и single-PUT-пути между собой и с прямым MinIO, проверка что `206` не объявляет чек-сумму всего объекта, настоящий `aws s3 cp` на 12 МиБ и пустой спул), локальный бэкенд, индекс дайджестов (warm/cold `List`, `ETag` `GET`=`HEAD`, внешняя перезапись с сохранением `mtime`) и отказы.
 
 ```bash
 make e2e            # всё
 make e2e-up         # только MinIO
 make e2e-down       # снести стенд
 make e2e-clean      # снести стенд и рабочий каталог
-./scripts/e2e.sh server   # одна фаза: go|cli|encrypt|server|facade|postgres|local|resilience
+./scripts/e2e.sh index    # одна фаза: go|cli|encrypt|server|facade|postgres|local|index|resilience
 ```
 
 Стенды детектора шифрования живут отдельно от `e2e.sh` (они проверяют не

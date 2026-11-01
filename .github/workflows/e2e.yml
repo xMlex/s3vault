@@ -5,6 +5,9 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # Ручной прогон из вкладки Actions: полный e2e долгий, и гонять его на
+  # каждой правке ветки не всегда нужно.
+  workflow_dispatch:
 
 permissions:
   contents: read

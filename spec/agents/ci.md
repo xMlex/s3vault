@@ -1,6 +1,6 @@
 # CI
 
-`.github/workflows/`, при push/PR в `main`: `go.yml` (build, vet, `go test -race -shuffle=on -count=1`, gofmt, tidy-check; матрица `1.26` + `stable`), `lint.yml` (golangci-lint), `security.yml` (govulncheck — гейт; gosec — `continue-on-error`), `integration.yml` и `e2e.yml` (MinIO service container), `release.yml` + `.goreleaser.yml` (теги `v*`).
+`.github/workflows/`, при push/PR в `main`: `go.yml` (build, vet, `go test -race -shuffle=on -count=1`, gofmt, tidy-check; матрица `1.26` + `stable`), `lint.yml` (golangci-lint), `security.yml` (govulncheck — гейт; gosec — `continue-on-error`), `integration.yml` и `e2e.yml` (MinIO service container), `release.yml` + `.goreleaser.yml` (теги `v*`). `go.yml` и `e2e.yml` умеют запускаться вручную (`workflow_dispatch`); `e2e.yml` гоняет `scripts/e2e.sh all`, включая фазу `index` (локальный индекс дайджестов и ETag без MinIO).
 
 Два escape hatch — калибровка, а не упущение — оба отпадут, когда долг выплачен:
 

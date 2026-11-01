@@ -7,7 +7,8 @@
 #   scripts/e2e.sh down       # снести стенд вместе с данными
 #   scripts/e2e.sh clean      # снести стенд и удалить рабочий каталог
 #   scripts/e2e.sh local      # локальный бэкенд, MinIO не нужен
-#   scripts/e2e.sh go|cli|encrypt|server|facade|postgres|postgres_target|local|resilience
+#   scripts/e2e.sh index      # кэш дайджестов и ETag, MinIO не нужен
+#   scripts/e2e.sh go|cli|encrypt|server|facade|postgres|postgres_target|local|index|resilience
 #
 # Переопределяется через окружение:
 #   S3VAULT_E2E_MINIO_API=9000 S3VAULT_E2E_HTTP_PORT=18080 \
@@ -219,6 +220,20 @@ s3_bucket_get_raw() { aws --endpoint-url "$MINIO_URL" s3api get-object --bucket 
 s3_bucket_put_raw() { aws --endpoint-url "$MINIO_URL" s3api put-object --bucket "$1" --key "$2" --body "$3" >/dev/null; }
 
 sha256_hex() { sha256sum "$1" | cut -d' ' -f1; }
+
+# facade_aws — awscli против SigV4-фасада (не против MinIO), для разбора XML/JSON
+# там, где curl + awk были бы нечитаемы. Остальное окружение — MinIO-креды.
+facade_aws() {
+	env AWS_ACCESS_KEY_ID="$FACADE_AK" AWS_SECRET_ACCESS_KEY="$FACADE_SK" \
+		AWS_DEFAULT_REGION="$REGION" AWS_EC2_METADATA_DISABLED=true \
+		aws --endpoint-url "$S3API_URL" "$@"
+}
+
+# list_etag <key> — ETag одного объекта из ListObjectsV2, как его видит клиент.
+list_etag() {
+	facade_aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+		--query "Contents[?Key=='$1'].ETag" --output text
+}
 
 # --- управляемый TCP-прокси до MinIO: им имитируем отказ S3 ---
 # Прячем stdout в /dev/null, иначе wait в фазе поймает фоновые job-ы прокси.
@@ -1420,6 +1435,90 @@ phase_local() {
 	assert_ne "local без dir отвергается" "$rc" "0"
 }
 
+# ------------------------------------------------------------------- index ---
+
+phase_index() {
+	log "Индекс SHA-256: warm/cold List, ETag GET=HEAD, sync с сохранением mtime"
+	local dir="$WORK/store-index" cache="$WORK/index-cache" ref="$WORK/index-a.mtime"
+	rm -rf "$dir" "$cache"
+	mkdir -p "$dir/photos"
+	printf 'AAAAAAAAAAAAAAAA' >"$dir/photos/a.bin"
+	printf 'BBBBBBBBBBBBBBBB' >"$dir/photos/b.bin"
+	cp -p "$dir/photos/a.bin" "$ref"
+
+	local base=(
+		S3VAULT_BACKEND_TYPE=local
+		S3VAULT_BACKEND_LOCAL_DIR="$dir"
+		S3VAULT_S3_ENDPOINT=
+		S3VAULT_S3_PREFIX=
+		S3VAULT_CACHE_DIR="$cache"
+	)
+	start_vault "${base[@]}" || return
+
+	# a и b лежали на диске до старта: их должен подхватить warm.
+	local sum_a i list_a
+	sum_a=$(sha256_hex "$dir/photos/a.bin")
+	for i in $(seq 1 150); do
+		list_a=$(list_etag photos/a.bin)
+		[[ "$list_a" == "\"$sum_a\"" ]] && break
+		sleep 0.2
+	done
+	assert_eq "warm: List отдаёт SHA-256 из индекса" "$list_a" "\"$sum_a\""
+
+	# c появляется после прогрева: кеша нет, и List не должен его хешировать.
+	printf 'CCCCCCCCCCCCCCCC' >"$dir/photos/c.bin"
+	local sum_c cold_etag
+	sum_c=$(sha256_hex "$dir/photos/c.bin")
+	cold_etag=$(list_etag photos/c.bin)
+	assert_ne "cold: List не отдаёт SHA без записи в индексе" "$cold_etag" "\"$sum_c\""
+	assert_contains "cold: синтетический валидатор size-mtime" "$cold_etag" '"10-'
+
+	# HEAD и GET обязаны называть одну и ту же идентичность.
+	local head_etag get_etag get_sum check
+	head_etag=$(facade_aws s3api head-object --bucket "$S3_BUCKET" --key photos/a.bin \
+		--query ETag --output text)
+	assert_eq "HEAD ETag = sha256(plaintext)" "$head_etag" "\"$sum_a\""
+
+	get_etag=$(facade_aws s3api get-object --bucket "$S3_BUCKET" --key photos/a.bin \
+		"$WORK/index-a.out" --query ETag --output text)
+	get_sum=$(sha256_hex "$WORK/index-a.out")
+	assert_eq "GET body = plaintext" "$get_sum" "$sum_a"
+	assert_eq "GET ETag = HEAD ETag" "$get_etag" "$head_etag"
+
+	check=$(facade_aws s3api get-object --bucket "$S3_BUCKET" --key photos/a.bin \
+		"$WORK/index-a.out" --query ChecksumSHA256 --output text)
+	assert_eq "GET ChecksumSHA256 описывает тело" "$check" \
+		"$(openssl dgst -sha256 -binary "$WORK/index-a.out" | base64)"
+
+	# Синхронизация перезаписывает файл тем же размером и восстанавливает mtime.
+	# ctime откатить нельзя, поэтому версия другая: List не имеет права отдать
+	# старый SHA, HEAD обязан пересчитать, GET — отдать новые байты.
+	local new_sum stale_etag
+	printf 'ZZZZZZZZZZZZZZZZ' >"$dir/photos/a.bin"
+	touch -r "$ref" "$dir/photos/a.bin"
+	new_sum=$(sha256_hex "$dir/photos/a.bin")
+	assert_ne "sync: содержимое изменилось" "$new_sum" "$sum_a"
+
+	stale_etag=$(list_etag photos/a.bin)
+	assert_ne "List после sync не отдаёт старый SHA" "$stale_etag" "\"$sum_a\""
+
+	assert_eq "HEAD после sync пересчитал SHA" \
+		"$(facade_aws s3api head-object --bucket "$S3_BUCKET" --key photos/a.bin \
+			--query ETag --output text)" "\"$new_sum\""
+	assert_eq "List после HEAD отдаёт новый SHA" "$(list_etag photos/a.bin)" "\"$new_sum\""
+	assert_eq "GET после sync отдаёт новые байты" \
+		"$(facade_aws s3api get-object --bucket "$S3_BUCKET" --key photos/a.bin \
+			"$WORK/index-a2.out" --query ETag --output text)" "\"$new_sum\""
+	assert_eq "GET после sync: тело = новый plaintext" \
+		"$(sha256_hex "$WORK/index-a2.out")" "$new_sum"
+
+	# Индекс переживает рестарт: a остаётся новым, c — холодным (List его не хешировал).
+	stop_vault || true
+	start_vault "${base[@]}" || return
+	assert_eq "после рестарта индекс сохранил новый SHA" "$(list_etag photos/a.bin)" "\"$new_sum\""
+	assert_contains "после рестарта cold остаётся синтетическим" "$(list_etag photos/c.bin)" '"10-'
+}
+
 # ----------------------------------------------------------- resilience ---
 
 phase_resilience() {
@@ -1602,7 +1701,7 @@ phase_resilience() {
 # Фазам, которым не нужен MinIO, не ждём его и не требуем Docker.
 phase_needs_s3() {
 	case "$1" in
-	local | postgres) return 1 ;;
+	local | postgres | index) return 1 ;;
 	*) return 0 ;;
 	esac
 }
@@ -1620,10 +1719,10 @@ main() {
 
 	local phases
 	case "$cmd" in
-	all) phases=(go cli encrypt server facade postgres postgres_target local resilience) ;;
-	go | cli | encrypt | server | facade | postgres | postgres_target | local | resilience) phases=("$cmd") ;;
+	all) phases=(go cli encrypt server facade postgres postgres_target local index resilience) ;;
+	go | cli | encrypt | server | facade | postgres | postgres_target | local | index | resilience) phases=("$cmd") ;;
 	*)
-		printf 'usage: %s [all|up|down|clean|build|go|cli|encrypt|server|facade|postgres|postgres_target|local|resilience]\n' "$0" >&2
+		printf 'usage: %s [all|up|down|clean|build|go|cli|encrypt|server|facade|postgres|postgres_target|local|index|resilience]\n' "$0" >&2
 		return 2
 		;;
 	esac
