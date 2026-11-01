@@ -412,10 +412,13 @@ start_minio() {
 }
 
 pg_ready() {
+	# pg_isready отвечает «accepting» ещё до того, как entrypoint создаст
+	# POSTGRES_DB, поэтому следующий reset_postgres_schema падал на живой
+	# свежий volume. Проверяем именно подключение к целевой базе.
 	if [[ "${S3VAULT_E2E_NO_COMPOSE:-0}" == "1" ]]; then
-		pg_isready -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER"
+		psql "$PG_DSN" -c 'SELECT 1' >/dev/null 2>&1
 	else
-		"${COMPOSE[@]}" exec -T postgres pg_isready -U "$PG_USER" -d "$PG_DB"
+		"${COMPOSE[@]}" exec -T postgres psql -U "$PG_USER" -d "$PG_DB" -c 'SELECT 1' >/dev/null 2>&1
 	fi
 }
 

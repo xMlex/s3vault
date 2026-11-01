@@ -12,24 +12,28 @@ name: s3vault-e2e
 
 services:
   minio:
-    image: minio/minio:latest
+    # MinIO больше не публикует образы на Docker Hub; cgr.dev/chainguard/minio
+    # собирается из upstream. Digest закреплён вместо тега release, чтобы
+    # зелёный/красный результат не зависел от перезаписи тега.
+    image: cgr.dev/chainguard/minio@sha256:0a01100085e30fb08d2f39e39c9f5c9d83a95707f220b007d813b690cd41622d
+    # Образ запускается nonroot, а named volume создаётся root-owned. Стенд
+    # тестовый, поэтому root внутри контейнера — меньшая цена, чем chown-init.
+    user: "0:0"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${S3VAULT_E2E_S3_ACCESS_KEY:-s3vault}
       MINIO_ROOT_PASSWORD: ${S3VAULT_E2E_S3_SECRET_KEY:-s3vaulttest}
+      MC_CONFIG_DIR: /tmp/.mc
     ports:
       - "${S3VAULT_E2E_MINIO_API:-9000}:9000"
       - "${S3VAULT_E2E_MINIO_CONSOLE:-9001}:9001"
     volumes:
       - minio-data:/data
     healthcheck:
-      # В образе есть mc; curl — запасной вариант на случай смены базового образа.
+      # В образе нет curl, но есть mc; alias local уже настроен на localhost.
       test:
         - CMD-SHELL
-        - >-
-          mc ready local ||
-          curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null ||
-          exit 1
+        - mc ready local
       interval: 2s
       timeout: 3s
       retries: 30
@@ -58,7 +62,7 @@ services:
   # Создаёт бакет и выходит. s3store.New только проверяет, что имя бакета
   # непустое, и ни разу не вызывает CreateBucket — бакет обязан существовать.
   minio-init:
-    image: minio/mc:latest
+    image: cgr.dev/chainguard/minio@sha256:0a01100085e30fb08d2f39e39c9f5c9d83a95707f220b007d813b690cd41622d
     depends_on:
       minio:
         condition: service_healthy
@@ -66,6 +70,7 @@ services:
       MINIO_ROOT_USER: ${S3VAULT_E2E_S3_ACCESS_KEY:-s3vault}
       MINIO_ROOT_PASSWORD: ${S3VAULT_E2E_S3_SECRET_KEY:-s3vaulttest}
       S3VAULT_E2E_S3_BUCKET: ${S3VAULT_E2E_S3_BUCKET:-s3vault}
+      MC_CONFIG_DIR: /tmp/.mc
     entrypoint:
       - /bin/sh
       - -c

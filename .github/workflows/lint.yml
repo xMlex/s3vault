@@ -41,5 +41,7 @@ jobs:
     - name: golangci-lint
       uses: golangci/golangci-lint-action@v9
       with:
-        version: latest
+        # Версия закреплена: :latest ломает воспроизводимость гейта между
+        # прогонами (конфиг version: "2" рассчитан на v2.x).
+        version: v2.15.0
         only-new-issues: true
