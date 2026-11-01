@@ -408,6 +408,7 @@ func TestFetchOpenContainerlessUsesDeclaredSize(t *testing.T) {
 	assert.Equal(t, int64(len(plain)), meta.Size)
 
 	const tail = 10
+
 	_, err = rc.Seek(meta.Size-tail, io.SeekStart)
 	require.NoError(t, err)
 

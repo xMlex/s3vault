@@ -481,6 +481,7 @@ func (c *Config) Normalize() error {
 	return nil
 }
 
+//nolint:gocyclo // flat validation of each auth knob; splitting it would hide the config surface.
 func (c *Config) normalizeAuth() error {
 	c.Server.Auth.Backend = strings.ToLower(strings.TrimSpace(c.Server.Auth.Backend))
 	if c.Server.Auth.Backend == "" {
@@ -563,6 +564,7 @@ func (c *Config) normalizeBackend() error {
 		if c.Backend.Local.IndexShards == 0 {
 			c.Backend.Local.IndexShards = DefaultLocalIndexShards
 		}
+
 		if c.Backend.Local.IndexShards < 1 || c.Backend.Local.IndexShards > MaxLocalIndexShards {
 			return fmt.Errorf("backend.local.index_shards: must be between 1 and %d, got %d",
 				MaxLocalIndexShards, c.Backend.Local.IndexShards)

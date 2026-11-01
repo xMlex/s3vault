@@ -33,15 +33,18 @@ func (f *fakeDigestIndex) Lookup(string, domain.FileVersion) (string, bool) {
 func (f *fakeDigestIndex) Store(key string, _ domain.FileVersion, sum string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	if f.stored == nil {
 		f.stored = map[string]string{}
 	}
+
 	f.stored[key] = sum
 }
 
 func (f *fakeDigestIndex) Delete(key string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	f.deleted = append(f.deleted, key)
 }
 

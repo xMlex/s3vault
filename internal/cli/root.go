@@ -452,6 +452,7 @@ func newServerCmd(state *runState) *cobra.Command {
 				// Even without a usable index, a client disconnect must not abort a
 				// hash the next HEAD needs; the server lifetime is the right scope.
 				ls.WithHashContext(ctx)
+
 				idx, idxErr := digest.Open(digest.Options{
 					Dir:    filepath.Join(cfg.Backend.Local.Dir, localstore.IndexDirName),
 					Shards: cfg.Backend.Local.IndexShards,
@@ -462,8 +463,10 @@ func newServerCmd(state *runState) *cobra.Command {
 				} else {
 					ls.WithDigestIndex(idx)
 					warm := idx.NeedsWarm()
+
 					idx.Start(ctx, cfg.Backend.Local.Dir, digest.WarmWorkers)
 					defer func() { _ = idx.Close() }()
+
 					state.logger.Info("digest index enabled",
 						"op", "index", "dir", idx.Dir(), "shards", idx.Shards(), "warm", warm)
 				}
@@ -624,6 +627,7 @@ func newS3Gateway(ctx context.Context, cfg config.Config, log *slog.Logger, met 
 		// A local backend has no bucket of its own.
 		virtBucket = cfg.S3.Bucket
 	}
+
 	if virtBucket == "" {
 		virtBucket = defaultVirtualBucket
 	}

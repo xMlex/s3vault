@@ -89,6 +89,7 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 	})
 	if err != nil {
 		a.metric("put", "error")
+
 		if errors.Is(err, domain.ErrInvalidPath) {
 			s3err.WriteError(w, r, s3err.InvalidRequest, "")
 			return

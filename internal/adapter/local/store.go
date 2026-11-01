@@ -135,6 +135,7 @@ func (s *Store) hashContext(ctx context.Context) context.Context {
 	if s.hashCtx != nil {
 		return s.hashCtx
 	}
+
 	return ctx
 }
 
@@ -305,12 +306,16 @@ func (s *Store) lookupDigest(key, rel string, fi fs.FileInfo) (string, bool) {
 	if s.digest == nil {
 		return "", false
 	}
+
 	v := FileVersionOf(fi)
+
 	sum, ok := s.digest.Lookup(key, v)
 	if !ok || sum == "" {
 		return "", false
 	}
+
 	s.rememberSHA(rel, v, sum)
+
 	return sum, true
 }
 
@@ -320,6 +325,7 @@ func (s *Store) rememberDigest(key string, v domain.FileVersion, sum string) {
 	if s.digest == nil || sum == "" {
 		return
 	}
+
 	s.digest.Store(key, v, sum)
 }
 
@@ -331,12 +337,15 @@ func (s *Store) forgetDigest(key, rel string) {
 	if s.digest != nil {
 		s.digest.Delete(key)
 	}
+
 	s.shaMu.Lock()
 	defer s.shaMu.Unlock()
+
 	if el, ok := s.shaElems[rel]; ok {
 		s.shaOrder.Remove(el)
 		delete(s.shaElems, rel)
 	}
+
 	delete(s.shaCache, rel)
 }
 
@@ -372,6 +381,7 @@ func (s *Store) sha256For(ctx context.Context, key, rel string, fi fs.FileInfo) 
 	if sum, ok := s.cachedSHA(rel, fi); ok {
 		return sum, nil
 	}
+
 	if sum, ok := s.lookupDigest(key, rel, fi); ok {
 		return sum, nil
 	}
@@ -386,17 +396,21 @@ func (s *Store) sha256For(ctx context.Context, key, rel string, fi fs.FileInfo) 
 		strconv.FormatInt(ver.ChangeTime.UnixNano(), 10) + "\x00" +
 		strconv.FormatUint(ver.Inode, 10) + "\x00" +
 		strconv.FormatUint(ver.Device, 10)
+
 	v, err, _ := s.digestGroup.Do(groupKey, func() (any, error) {
 		if sum, ok := s.cachedSHA(rel, fi); ok {
 			return sum, nil
 		}
+
 		if sum, ok := s.lookupDigest(key, rel, fi); ok {
 			return sum, nil
 		}
+
 		f, openErr := s.root.Open(rel)
 		if openErr != nil {
 			return "", fmt.Errorf("hash %s: %w", key, openErr)
 		}
+
 		defer func() { _ = f.Close() }()
 
 		return s.sha256ForFile(ctx, key, rel, fi, f)
@@ -404,10 +418,12 @@ func (s *Store) sha256For(ctx context.Context, key, rel string, fi fs.FileInfo) 
 	if err != nil {
 		return "", err
 	}
+
 	sum, ok := v.(string)
 	if !ok {
 		return "", fmt.Errorf("hash %s: unexpected result", key)
 	}
+
 	return sum, nil
 }
 
@@ -417,6 +433,7 @@ func (s *Store) sha256ForFile(ctx context.Context, key, rel string, fi fs.FileIn
 	if sum, ok := s.cachedSHA(rel, fi); ok {
 		return sum, nil
 	}
+
 	ver := FileVersionOf(fi)
 	ctx = s.hashContext(ctx)
 	h := sha256.New()
@@ -432,6 +449,7 @@ func (s *Store) sha256ForFile(ctx context.Context, key, rel string, fi fs.FileIn
 	if err != nil {
 		return "", fmt.Errorf("hash %s: %w", key, err)
 	}
+
 	afterVer := FileVersionOf(after)
 	if !afterVer.Equal(ver) {
 		return "", fmt.Errorf("hash %s: file changed during read", key)
@@ -469,6 +487,7 @@ func (s *Store) rememberSHA(rel string, version domain.FileVersion, sum string) 
 	} else {
 		s.shaElems[rel] = s.shaOrder.PushBack(rel)
 	}
+
 	s.shaCache[rel] = shaEntry{version: version, sum: sum}
 	for s.shaOrder.Len() > s.shaCacheMax {
 		oldest := s.shaOrder.Front()
@@ -529,6 +548,7 @@ func (s *Store) open(ctx context.Context, key string) (*os.File, fs.FileInfo, er
 	}
 	if !fi.Mode().IsRegular() {
 		_ = f.Close()
+
 		s.forgetDigest(key, rel)
 		return nil, nil, domain.ErrNotFound
 	}

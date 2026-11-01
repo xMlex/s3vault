@@ -36,6 +36,7 @@ func relPath(key string) (string, error) {
 	if key == tmpDir || strings.HasPrefix(key, tmpDir+"/") {
 		return "", fmt.Errorf("%w: object key %q is reserved", domain.ErrInvalidPath, key)
 	}
+
 	if key == IndexDirName || strings.HasPrefix(key, IndexDirName+"/") {
 		return "", fmt.Errorf("%w: object key %q is reserved", domain.ErrInvalidPath, key)
 	}

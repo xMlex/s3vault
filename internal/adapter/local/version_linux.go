@@ -15,6 +15,7 @@ func applyFileChangeInfo(fi fs.FileInfo, v *domain.FileVersion) {
 	if !ok {
 		return
 	}
+
 	v.ChangeTime = time.Unix(st.Ctim.Sec, st.Ctim.Nsec)
 	v.Inode = st.Ino
 	v.Device = st.Dev

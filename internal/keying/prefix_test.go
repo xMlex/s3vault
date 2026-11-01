@@ -131,11 +131,11 @@ func TestNormalizeOptionalPrefix(t *testing.T) {
 	for _, tt := range tests {
 		got, err := NormalizeOptionalPrefix(tt.in)
 		if tt.wantErr {
-			assert.Error(t, err, tt.in)
+			require.Error(t, err, tt.in)
 			continue
 		}
 
-		assert.NoError(t, err, tt.in)
+		require.NoError(t, err, tt.in)
 		assert.Equal(t, tt.want, got, tt.in)
 	}
 

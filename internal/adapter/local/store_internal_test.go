@@ -44,6 +44,7 @@ func TestSHAMemoEvictsLeastRecentlyUsed(t *testing.T) {
 	// Inserting c overflows the memo: b must be evicted, a and c must survive.
 	st.shaMu.Lock()
 	defer st.shaMu.Unlock()
+
 	assert.Contains(t, st.shaCache, "a")
 	assert.Contains(t, st.shaCache, "c")
 	assert.NotContains(t, st.shaCache, "b", "least-recently-used entry must be evicted")

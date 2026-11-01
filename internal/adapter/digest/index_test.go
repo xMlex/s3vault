@@ -53,6 +53,7 @@ func TestIndexPersistsAndValidatesStat(t *testing.T) {
 
 	idx2, err := digest.Open(digest.Options{Dir: filepath.Join(root, localstore.IndexDirName), Shards: 4})
 	require.NoError(t, err)
+
 	defer func() { _ = idx2.Close() }()
 
 	got, ok = idx2.Lookup("2023/10/09/video.mp4", version)
@@ -69,6 +70,7 @@ func TestIndexRoundTripsZeroChangeTime(t *testing.T) {
 	root := t.TempDir()
 	idx, err := digest.Open(digest.Options{Dir: filepath.Join(root, localstore.IndexDirName), Shards: 2})
 	require.NoError(t, err)
+
 	defer func() { _ = idx.Close() }()
 
 	sum := sha256.Sum256([]byte("payload"))
@@ -104,6 +106,7 @@ func TestListUsesCachedDigestAndDoesNotHashMisses(t *testing.T) {
 	// Cache a digest for a.bin only, as a previous HEAD or warm would.
 	fiA, err := os.Stat(filepath.Join(root, "a.bin"))
 	require.NoError(t, err)
+
 	sumA := sha256.Sum256([]byte("alpha"))
 	hexA := hex.EncodeToString(sumA[:])
 	idx.Store("a.bin", localstore.FileVersionOf(fiA), hexA)
@@ -126,6 +129,7 @@ func TestListUsesCachedDigestAndDoesNotHashMisses(t *testing.T) {
 	// A list must not hash cold objects, so b.bin stays out of the index.
 	fiB, err := os.Stat(filepath.Join(root, "b.bin"))
 	require.NoError(t, err)
+
 	_, ok := idx.Lookup("b.bin", localstore.FileVersionOf(fiB))
 	assert.False(t, ok, "List must not hash or populate the index on a miss")
 }
@@ -144,7 +148,9 @@ func TestWarmFillsMissingEntries(t *testing.T) {
 
 	idx, err := digest.Open(digest.Options{Dir: indexDir, Shards: 2})
 	require.NoError(t, err)
+
 	defer func() { _ = idx.Close() }()
+
 	require.True(t, idx.NeedsWarm())
 
 	require.NoError(t, idx.Warm(context.Background(), root, 2))
@@ -155,6 +161,7 @@ func TestWarmFillsMissingEntries(t *testing.T) {
 	} {
 		fi, err := os.Stat(filepath.Join(root, filepath.FromSlash(key)))
 		require.NoError(t, err)
+
 		sum := sha256.Sum256([]byte(want))
 		got, ok := idx.Lookup(key, localstore.FileVersionOf(fi))
 		require.True(t, ok, key)
@@ -181,6 +188,7 @@ func TestStartWarmsEmptyIndex(t *testing.T) {
 
 	fi, err := os.Stat(filepath.Join(root, "a.mp4"))
 	require.NoError(t, err)
+
 	sum := sha256.Sum256([]byte("alpha"))
 
 	require.Eventually(t, func() bool {
@@ -195,6 +203,7 @@ func TestOpenLockedReturnsError(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), localstore.IndexDirName)
 	first, err := digest.Open(digest.Options{Dir: dir, Shards: 2})
 	require.NoError(t, err)
+
 	defer func() { _ = first.Close() }()
 
 	_, err = digest.Open(digest.Options{Dir: dir, Shards: 2})
@@ -261,8 +270,10 @@ func TestLocalStoreRehashesSameSizeSameMTimeOverwrite(t *testing.T) {
 
 	head := func(body string) {
 		t.Helper()
+
 		got, err := st.Head(context.Background(), "k.bin")
 		require.NoError(t, err)
+
 		sum := sha256.Sum256([]byte(body))
 		assert.Equal(t, hex.EncodeToString(sum[:]), got.SHA256)
 	}

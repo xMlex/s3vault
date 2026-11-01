@@ -101,10 +101,12 @@ func Open(opts Options) (*Index, error) {
 		log:    log,
 		dbs:    make([]*pogreb.DB, shards),
 	}
+
 	total, firstErr, err := idx.openShards()
 	if err != nil {
 		return nil, err
 	}
+
 	if firstErr != nil && total == 0 && allNil(idx.dbs) {
 		return nil, fmt.Errorf("open digest index %s: %w", opts.Dir, firstErr)
 	}
@@ -118,29 +120,36 @@ func normalizeOptions(opts Options) (int, *slog.Logger, error) {
 	if opts.Dir == "" {
 		return 0, nil, errors.New("digest index dir is required")
 	}
+
 	shards := opts.Shards
 	if shards == 0 {
 		shards = DefaultShards
 	}
+
 	if shards < 1 || shards > config.MaxLocalIndexShards {
 		return 0, nil, fmt.Errorf("digest index shards: must be between 1 and %d, got %d",
 			config.MaxLocalIndexShards, shards)
 	}
+
 	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
+
 	return shards, log, nil
 }
 
 func ensureIndexDir(dir string) (bool, error) {
 	missing := false
+
 	if _, err := os.Stat(dir); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			return false, fmt.Errorf("stat digest index %s: %w", dir, err)
 		}
+
 		missing = true
 	}
+
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return false, fmt.Errorf("mkdir digest index %s: %w", dir, err)
 	}
@@ -149,6 +158,7 @@ func ensureIndexDir(dir string) (bool, error) {
 	if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // directory mode
 		return false, fmt.Errorf("chmod digest index %s: %w", dir, err)
 	}
+
 	return missing, nil
 }
 
@@ -159,12 +169,15 @@ func (i *Index) openShards() (uint32, error, error) {
 		BackgroundSyncInterval:       0,
 		BackgroundCompactionInterval: 0,
 	}
+
 	var (
 		firstErr error
 		total    uint32
 	)
+
 	for n := range i.shards {
 		dir := filepath.Join(i.dir, fmt.Sprintf("%02d", n))
+
 		db, err := pogreb.Open(dir, pogrebOpts)
 		if err != nil {
 			if strings.Contains(err.Error(), "database is locked") {
@@ -175,18 +188,24 @@ func (i *Index) openShards() (uint32, error, error) {
 				_ = i.closeShards()
 				return 0, nil, fmt.Errorf("open digest index %s: %w", i.dir, err)
 			}
+
 			if firstErr == nil {
 				firstErr = err
 			}
+
 			i.log.Warn("digest shard unavailable", "op", "index", "shard", n, "err", err)
+
 			continue
 		}
+
 		if err := os.Chmod(dir, 0o700); err != nil { //nolint:gosec // directory mode
 			i.log.Warn("digest shard chmod", "op", "index", "shard", n, "err", err)
 		}
+
 		i.dbs[n] = db
 		total += db.Count()
 	}
+
 	return total, firstErr, nil
 }
 
@@ -196,6 +215,7 @@ func allNil(dbs []*pogreb.DB) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -216,21 +236,26 @@ func (i *Index) Start(ctx context.Context, root string, workers int) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
 	i.startOnce.Do(func() {
 		ctx, i.cancel = context.WithCancel(ctx) //nolint:fatcontext // owned by Start, not by a loop
 		if i.needsWarm {
 			i.wg.Go(func() {
 				i.log.Info("digest index warm started", "op", "index", "root", root, "workers", workers)
+
 				err := i.Warm(ctx, root, workers)
 				if err != nil {
 					if !errors.Is(err, context.Canceled) {
 						i.log.Error("digest index warm", "op", "index", "err", err)
 					}
+
 					return
 				}
+
 				i.log.Info("digest index warm finished", "op", "index", "root", root)
 			})
 		}
+
 		i.wg.Go(func() {
 			i.maintain(ctx)
 		})
@@ -242,31 +267,39 @@ func (i *Index) Close() error {
 	if i.cancel != nil {
 		i.cancel()
 	}
+
 	i.wg.Wait()
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
+
 	return i.closeShards()
 }
 
 func (i *Index) closeShards() error {
 	var firstErr error
+
 	for n, db := range i.dbs {
 		if db == nil {
 			continue
 		}
+
 		if err := db.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("close digest shard %d: %w", n, err)
 		}
+
 		i.dbs[n] = nil
 	}
+
 	return firstErr
 }
 
 // Lookup returns the cached digest when the entry matches the file version.
 func (i *Index) Lookup(key string, version domain.FileVersion) (string, bool) {
 	h := sha256.Sum256([]byte(key))
+
 	i.mu.RLock()
+
 	db := i.shardForHash(h)
 	if db == nil {
 		i.mu.RUnlock()
@@ -276,14 +309,18 @@ func (i *Index) Lookup(key string, version domain.FileVersion) (string, bool) {
 	// have to collide in the index key itself; the value's version check below
 	// makes a wrong answer even less likely.
 	val, err := db.Get(h[:])
+
 	i.mu.RUnlock()
+
 	if err != nil || val == nil {
 		return "", false
 	}
+
 	got, sum, ok := decodeValue(val)
 	if !ok || !got.Equal(version) {
 		return "", false
 	}
+
 	return sum, true
 }
 
@@ -294,15 +331,21 @@ func (i *Index) Store(key string, version domain.FileVersion, sum string) {
 	if !ok {
 		return
 	}
+
 	h := sha256.Sum256([]byte(key))
+
 	i.mu.RLock()
+
 	db := i.shardForHash(h)
 	if db == nil {
 		i.mu.RUnlock()
 		return
 	}
+
 	err := db.Put(h[:], val)
+
 	i.mu.RUnlock()
+
 	if err != nil {
 		i.log.Debug("digest store", "op", "index", "err", err)
 	}
@@ -311,14 +354,19 @@ func (i *Index) Store(key string, version domain.FileVersion, sum string) {
 // Delete removes a digest. A miss is a no-op.
 func (i *Index) Delete(key string) {
 	h := sha256.Sum256([]byte(key))
+
 	i.mu.RLock()
+
 	db := i.shardForHash(h)
 	if db == nil {
 		i.mu.RUnlock()
 		return
 	}
+
 	err := db.Delete(h[:])
+
 	i.mu.RUnlock()
+
 	if err != nil {
 		i.log.Debug("digest delete", "op", "index", "err", err)
 	}
@@ -328,6 +376,7 @@ func (i *Index) shardForHash(h [sha256.Size]byte) *pogreb.DB {
 	if len(i.dbs) == 0 {
 		return nil
 	}
+
 	return i.dbs[int(h[0])%len(i.dbs)]
 }
 
@@ -336,6 +385,7 @@ func encodeValue(version domain.FileVersion, sumHex string) ([]byte, bool) {
 	if err != nil || len(sum) != sha256.Size {
 		return nil, false
 	}
+
 	b := make([]byte, 0, valueLen)
 	b = append(b, valueVersion)
 	b = binary.LittleEndian.AppendUint64(b, uint64(version.Size)) //nolint:gosec // fixed-width round trip
@@ -345,6 +395,7 @@ func encodeValue(version domain.FileVersion, sumHex string) ([]byte, bool) {
 	b = binary.LittleEndian.AppendUint64(b, version.Device)
 	b = append(b, sum...)
 	b = binary.LittleEndian.AppendUint32(b, crc32.ChecksumIEEE(b))
+
 	return b, true
 }
 
@@ -355,13 +406,15 @@ func encodeTime(t time.Time) uint64 {
 	if t.IsZero() {
 		return 0
 	}
-	return uint64(t.UnixNano()) //nolint:gosec // fixed-width round trip
+
+	return uint64(t.UnixNano())
 }
 
 func decodeTime(ns uint64) time.Time {
 	if ns == 0 {
 		return time.Time{}
 	}
+
 	return time.Unix(0, int64(ns)) //nolint:gosec // fixed-width round trip
 }
 
@@ -369,10 +422,12 @@ func decodeValue(b []byte) (version domain.FileVersion, sum string, ok bool) {
 	if len(b) != valueLen || b[0] != valueVersion {
 		return domain.FileVersion{}, "", false
 	}
+
 	body := b[:valueLen-4]
 	if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(b[valueLen-4:]) {
 		return domain.FileVersion{}, "", false
 	}
+
 	version = domain.FileVersion{
 		Size:       int64(binary.LittleEndian.Uint64(b[1:])), //nolint:gosec // fixed-width round trip
 		ModTime:    decodeTime(binary.LittleEndian.Uint64(b[9:])),
@@ -380,6 +435,7 @@ func decodeValue(b []byte) (version domain.FileVersion, sum string, ok bool) {
 		Inode:      binary.LittleEndian.Uint64(b[25:]),
 		Device:     binary.LittleEndian.Uint64(b[33:]),
 	}
+
 	return version, hex.EncodeToString(b[41:73]), true
 }
 
@@ -390,33 +446,41 @@ func (i *Index) Warm(ctx context.Context, root string, workers int) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
 	if workers <= 0 {
 		workers = WarmWorkers
 	}
+
 	rootDir, err := os.OpenRoot(root)
 	if err != nil {
 		return fmt.Errorf("warm digest index: %w", err)
 	}
+
 	defer func() { _ = rootDir.Close() }()
 
 	files := make(chan string)
+
 	var wg sync.WaitGroup
 	i.startWarmWorkers(ctx, rootDir, files, workers, &wg)
 
 	err = i.walkWarm(ctx, root, files)
 	close(files)
 	wg.Wait()
+
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("warm digest index: %w", err)
 	}
+
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
 	if err := writeWarmMarker(i.dir, i.shards); err != nil {
 		// The warm itself succeeded; only the "completed" marker is missing, so
 		// the next start will warm again and skip the entries already present.
 		i.log.Warn("digest warm marker", "op", "index", "err", err)
 	}
+
 	return nil
 }
 
@@ -436,26 +500,33 @@ func (i *Index) walkWarm(ctx context.Context, root string, files chan<- string) 
 			i.log.Warn("digest warm walk", "op", "index", "path", p, "err", err)
 			return nil
 		}
+
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+
 		if d.IsDir() {
 			if p == "." {
 				return nil
 			}
+
 			if d.Name() == localstore.IndexDirName || d.Name() == localstore.TmpDirName {
 				return fs.SkipDir
 			}
+
 			return nil
 		}
+
 		if !d.Type().IsRegular() {
 			return nil
 		}
+
 		select {
 		case files <- p:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+
 		return nil
 	})
 }
@@ -474,6 +545,7 @@ func writeWarmMarker(dir string, shards int) error {
 	if err := os.WriteFile(tmp, []byte(warmMarker(shards)), 0o600); err != nil {
 		return err
 	}
+
 	return os.Rename(tmp, filepath.Join(dir, warmMarkerName))
 }
 
@@ -481,23 +553,29 @@ func isContainerObject(f *os.File) (bool, error) {
 	// Container objects already carry the digest in S3VCTR01; indexing them
 	// would be wasted I/O. Only containerless (mode=none) objects need hashing.
 	var head [container.HeaderSize]byte
+
 	n, err := f.ReadAt(head[:], 0)
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return false, err
 	}
+
 	if n != container.HeaderSize || !container.IsMagic(head[:]) {
 		return false, nil
 	}
+
 	_, parseErr := container.Parse(head[:])
+
 	return parseErr == nil, nil
 }
 
 func (i *Index) hashOne(ctx context.Context, root *os.Root, key string) {
 	rel := filepath.FromSlash(key)
+
 	fi, err := root.Stat(rel)
 	if err != nil || !fi.Mode().IsRegular() {
 		return
 	}
+
 	ver := localstore.FileVersionOf(fi)
 	if _, ok := i.Lookup(key, ver); ok {
 		return
@@ -513,6 +591,7 @@ func (i *Index) hashOne(ctx context.Context, root *os.Root, key string) {
 	if isContainer, err := isContainerObject(f); err != nil || isContainer {
 		return
 	}
+
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return
 	}
@@ -522,24 +601,29 @@ func (i *Index) hashOne(ctx context.Context, root *os.Root, key string) {
 		if !errors.Is(err, context.Canceled) {
 			i.log.Debug("digest warm hash", "op", "index", "key", key, "err", err)
 		}
+
 		return
 	}
+
 	after, err := f.Stat()
 	if err != nil {
 		return
 	}
+
 	afterVer := localstore.FileVersionOf(after)
 	if !afterVer.Equal(ver) {
 		// The file changed while it was read; do not cache a digest that never
 		// described one complete version.
 		return
 	}
+
 	i.Store(key, afterVer, hex.EncodeToString(h.Sum(nil)))
 }
 
 func (i *Index) maintain(ctx context.Context) {
 	ticker := time.NewTicker(maintenanceInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -557,20 +641,25 @@ func (i *Index) compactNext() {
 	if len(i.dbs) == 0 {
 		return
 	}
+
 	n := int(i.next.Add(1)-1) % len(i.dbs)
 	i.mu.RLock()
 	db := i.dbs[n]
 	i.mu.RUnlock()
+
 	if db == nil {
 		return
 	}
+
 	cr, err := db.Compact()
 	if err != nil {
 		if !strings.Contains(err.Error(), "busy") {
 			i.log.Warn("digest compact", "op", "index", "shard", n, "err", err)
 		}
+
 		return
 	}
+
 	if cr.CompactedSegments > 0 {
 		i.log.Info("digest compacted",
 			"op", "index", "shard", n,
@@ -590,5 +679,6 @@ func (c *contextReader) Read(p []byte) (int, error) {
 	if err := c.ctx.Err(); err != nil {
 		return 0, err
 	}
+
 	return c.r.Read(p)
 }

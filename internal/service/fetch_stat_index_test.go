@@ -40,6 +40,7 @@ func TestFetchStatLocalIndexMissHashesWithoutMaterializing(t *testing.T) {
 	key := "2023/10/09/VID.mp4"
 	full := filepath.Join(root, filepath.FromSlash(key))
 	require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o700))
+
 	plain := []byte("0123456789abcdef")
 	require.NoError(t, os.WriteFile(full, plain, 0o600))
 
@@ -57,6 +58,7 @@ func TestFetchStatLocalIndexMissHashesWithoutMaterializing(t *testing.T) {
 
 	got, err := f.Stat(context.Background(), key)
 	require.NoError(t, err)
+
 	sum := sha256.Sum256(plain)
 	assert.Equal(t, hex.EncodeToString(sum[:]), got.SHA256)
 	assert.Equal(t, int64(len(plain)), got.Size)
@@ -66,6 +68,7 @@ func TestFetchStatLocalIndexMissHashesWithoutMaterializing(t *testing.T) {
 	// The computed digest must now be persisted for the next HEAD.
 	fi, err := os.Stat(full)
 	require.NoError(t, err)
+
 	cached, ok := idx.Lookup(key, localstore.FileVersionOf(fi))
 	require.True(t, ok)
 	assert.Equal(t, hex.EncodeToString(sum[:]), cached)
@@ -81,6 +84,7 @@ func TestFetchStatLocalDigestIndex(t *testing.T) {
 	key := "2023/10/09/VID.mp4"
 	full := filepath.Join(root, filepath.FromSlash(key))
 	require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o700))
+
 	plain := []byte("0123456789abcdef")
 	require.NoError(t, os.WriteFile(full, plain, 0o600))
 
@@ -94,6 +98,7 @@ func TestFetchStatLocalDigestIndex(t *testing.T) {
 
 	fi, err := os.Stat(full)
 	require.NoError(t, err)
+
 	sum := sha256.Sum256(plain)
 	hexSum := hex.EncodeToString(sum[:])
 	idx.Store(key, localstore.FileVersionOf(fi), hexSum)

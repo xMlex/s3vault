@@ -16,6 +16,7 @@ func (a *API) handleDelete(w http.ResponseWriter, r *http.Request, sc *scope, bu
 		s3err.WriteError(w, r, s3err.InvalidBucketName, "invalid object key")
 		return
 	}
+
 	store, err := sc.storeFor(r.Context())
 	if err != nil {
 		a.metric("delete", "error")
@@ -30,6 +31,7 @@ func (a *API) handleDelete(w http.ResponseWriter, r *http.Request, sc *scope, bu
 
 	if err := store.Delete(r.Context(), backendKey); err != nil {
 		a.metric("delete", "error")
+
 		if errors.Is(err, domain.ErrInvalidPath) {
 			s3err.WriteError(w, r, s3err.NoSuchKey, "")
 			return

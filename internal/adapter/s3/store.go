@@ -174,6 +174,7 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, meta domain.Pu
 			metaSize:   strconv.FormatInt(meta.PlaintextSize, 10),
 		}
 	}
+
 	if err := applyWriteOptions(in, s.opts); err != nil {
 		return fmt.Errorf("put %s: %w", key, err)
 	}

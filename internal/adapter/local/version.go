@@ -13,5 +13,6 @@ import (
 func FileVersionOf(fi fs.FileInfo) domain.FileVersion {
 	v := domain.FileVersion{Size: fi.Size(), ModTime: fi.ModTime()}
 	applyFileChangeInfo(fi, &v)
+
 	return v
 }

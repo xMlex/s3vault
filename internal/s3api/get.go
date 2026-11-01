@@ -55,10 +55,12 @@ func (a *API) handleGet(w http.ResponseWriter, r *http.Request, sc *scope, bucke
 	}
 	if err != nil {
 		a.metric(op, "error")
+
 		if errors.Is(err, domain.ErrInvalidPath) {
 			s3err.WriteError(w, r, s3err.NoSuchKey, "")
 			return
 		}
+
 		a.log.ErrorContext(r.Context(), "s3 open",
 			slog.String("op", "s3."+op),
 			slog.String("err", err.Error()),
@@ -83,6 +85,7 @@ func (a *API) handleHead(w http.ResponseWriter, r *http.Request, fetch *service.
 	}
 	if err != nil {
 		a.metric("head", "error")
+
 		if errors.Is(err, domain.ErrInvalidPath) {
 			// A reserved key (for example .s3vault-index/...) is not an object
 			// and must not turn into a 500 in the log.
@@ -90,6 +93,7 @@ func (a *API) handleHead(w http.ResponseWriter, r *http.Request, fetch *service.
 
 			return
 		}
+
 		a.log.ErrorContext(r.Context(), "s3 stat",
 			slog.String("op", "s3.head"),
 			slog.String("err", err.Error()),

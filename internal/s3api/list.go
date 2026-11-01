@@ -97,6 +97,7 @@ func (a *API) handleList(w http.ResponseWriter, r *http.Request, sc *scope, buck
 		}
 		opts.MaxKeys = int32(n)
 	}
+
 	store, err := sc.storeFor(r.Context())
 	if err != nil {
 		a.metric("list", "error")

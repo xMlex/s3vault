@@ -110,6 +110,7 @@ func (s *Store) walk(ctx context.Context, prefix string) ([]domain.ListObject, e
 			if p == "." {
 				return nil
 			}
+
 			if p == tmpDir || p == IndexDirName || !dirCanMatch(p, prefix) {
 				return fs.SkipDir
 			}
@@ -147,11 +148,13 @@ func (s *Store) listETag(key string, fi fs.FileInfo) string {
 	if sum, ok := s.cachedSHA(filepath.FromSlash(key), fi); ok {
 		return strconv.Quote(sum)
 	}
+
 	if s.digest != nil {
 		if sum, ok := s.digest.Lookup(key, FileVersionOf(fi)); ok && sum != "" {
 			return strconv.Quote(sum)
 		}
 	}
+
 	return etag(fi)
 }
 
