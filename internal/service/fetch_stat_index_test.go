@@ -66,7 +66,7 @@ func TestFetchStatLocalIndexMissHashesWithoutMaterializing(t *testing.T) {
 	// The computed digest must now be persisted for the next HEAD.
 	fi, err := os.Stat(full)
 	require.NoError(t, err)
-	cached, ok := idx.Lookup(key, fi.Size(), fi.ModTime())
+	cached, ok := idx.Lookup(key, localstore.FileVersionOf(fi))
 	require.True(t, ok)
 	assert.Equal(t, hex.EncodeToString(sum[:]), cached)
 }
@@ -96,7 +96,7 @@ func TestFetchStatLocalDigestIndex(t *testing.T) {
 	require.NoError(t, err)
 	sum := sha256.Sum256(plain)
 	hexSum := hex.EncodeToString(sum[:])
-	idx.Store(key, fi.Size(), fi.ModTime(), hexSum)
+	idx.Store(key, localstore.FileVersionOf(fi), hexSum)
 	st.WithDigestIndex(idx)
 
 	counted := &localCountingStore{Store: st}

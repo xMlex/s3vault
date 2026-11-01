@@ -1,8 +1,8 @@
-// Package digest is the gateway's persistent cache of plaintext SHA-256 and
-// mtime for containerless local objects. It is a read-mostly point store: one
-// pogreb database per shard, sharded by a hash of the object key. The index is
-// derived state, never the identity source of truth: a miss or a broken index
-// simply falls back to hashing the file.
+// Package digest is the gateway's persistent cache of plaintext SHA-256 keyed
+// by the on-disk file version for containerless local objects. It is a
+// read-mostly point store: one pogreb database per shard, sharded by a hash of
+// the object key. The index is derived state, never the identity source of
+// truth: a miss or a broken index simply falls back to hashing the file.
 package digest
 
 import (
@@ -29,6 +29,7 @@ import (
 	localstore "github.com/xMlex/s3vault/internal/adapter/local"
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/container"
+	"github.com/xMlex/s3vault/internal/domain"
 	"github.com/xMlex/s3vault/internal/iocopy"
 )
 
@@ -44,8 +45,9 @@ const (
 	// interval is safe. Exactly one shard is touched per tick.
 	maintenanceInterval = 12 * time.Hour
 
-	valueVersion = 1
-	valueLen     = 1 + 8 + 8 + 32 + 4
+	valueVersion = 2
+	// valueLayout: version, size, mtime, ctime, inode, device, digest, crc32.
+	valueLen = 1 + 8*5 + sha256.Size + 4
 
 	warmMarkerName    = ".warm.done"
 	warmMarkerVersion = "1"
@@ -261,8 +263,8 @@ func (i *Index) closeShards() error {
 	return firstErr
 }
 
-// Lookup returns the cached digest when the entry matches size and mtime.
-func (i *Index) Lookup(key string, size int64, mtime time.Time) (string, bool) {
+// Lookup returns the cached digest when the entry matches the file version.
+func (i *Index) Lookup(key string, version domain.FileVersion) (string, bool) {
 	h := sha256.Sum256([]byte(key))
 	i.mu.RLock()
 	db := i.shardForHash(h)
@@ -271,15 +273,15 @@ func (i *Index) Lookup(key string, size int64, mtime time.Time) (string, bool) {
 		return "", false
 	}
 	// The shard key is the same 32-byte object-key hash, so a collision would
-	// have to collide in the index key itself; the value's size/mtime check below
+	// have to collide in the index key itself; the value's version check below
 	// makes a wrong answer even less likely.
 	val, err := db.Get(h[:])
 	i.mu.RUnlock()
 	if err != nil || val == nil {
 		return "", false
 	}
-	gotSize, gotMtime, sum, ok := decodeValue(val)
-	if !ok || gotSize != size || gotMtime != mtime.UnixNano() {
+	got, sum, ok := decodeValue(val)
+	if !ok || !got.Equal(version) {
 		return "", false
 	}
 	return sum, true
@@ -287,8 +289,8 @@ func (i *Index) Lookup(key string, size int64, mtime time.Time) (string, bool) {
 
 // Store writes a digest for key. Failures are logged at debug and ignored: the
 // index is a cache.
-func (i *Index) Store(key string, size int64, mtime time.Time, sum string) {
-	val, ok := encodeValue(size, mtime.UnixNano(), sum)
+func (i *Index) Store(key string, version domain.FileVersion, sum string) {
+	val, ok := encodeValue(version, sum)
 	if !ok {
 		return
 	}
@@ -329,31 +331,56 @@ func (i *Index) shardForHash(h [sha256.Size]byte) *pogreb.DB {
 	return i.dbs[int(h[0])%len(i.dbs)]
 }
 
-func encodeValue(size, mtimeNS int64, sumHex string) ([]byte, bool) {
+func encodeValue(version domain.FileVersion, sumHex string) ([]byte, bool) {
 	sum, err := hex.DecodeString(sumHex)
 	if err != nil || len(sum) != sha256.Size {
 		return nil, false
 	}
 	b := make([]byte, 0, valueLen)
 	b = append(b, valueVersion)
-	b = binary.LittleEndian.AppendUint64(b, uint64(size))    //nolint:gosec // fixed-width round trip
-	b = binary.LittleEndian.AppendUint64(b, uint64(mtimeNS)) //nolint:gosec // fixed-width round trip
+	b = binary.LittleEndian.AppendUint64(b, uint64(version.Size)) //nolint:gosec // fixed-width round trip
+	b = binary.LittleEndian.AppendUint64(b, encodeTime(version.ModTime))
+	b = binary.LittleEndian.AppendUint64(b, encodeTime(version.ChangeTime))
+	b = binary.LittleEndian.AppendUint64(b, version.Inode)
+	b = binary.LittleEndian.AppendUint64(b, version.Device)
 	b = append(b, sum...)
 	b = binary.LittleEndian.AppendUint32(b, crc32.ChecksumIEEE(b))
 	return b, true
 }
 
-func decodeValue(b []byte) (size, mtimeNS int64, sum string, ok bool) {
+// encodeTime keeps a zero time distinguishable from the Unix epoch: the zero
+// value means "the platform did not report this timestamp" (ChangeTime on
+// Windows), while a real timestamp is stored as nanoseconds.
+func encodeTime(t time.Time) uint64 {
+	if t.IsZero() {
+		return 0
+	}
+	return uint64(t.UnixNano()) //nolint:gosec // fixed-width round trip
+}
+
+func decodeTime(ns uint64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, int64(ns)) //nolint:gosec // fixed-width round trip
+}
+
+func decodeValue(b []byte) (version domain.FileVersion, sum string, ok bool) {
 	if len(b) != valueLen || b[0] != valueVersion {
-		return 0, 0, "", false
+		return domain.FileVersion{}, "", false
 	}
 	body := b[:valueLen-4]
 	if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(b[valueLen-4:]) {
-		return 0, 0, "", false
+		return domain.FileVersion{}, "", false
 	}
-	size = int64(binary.LittleEndian.Uint64(b[1:]))    //nolint:gosec // fixed-width round trip
-	mtimeNS = int64(binary.LittleEndian.Uint64(b[9:])) //nolint:gosec // fixed-width round trip
-	return size, mtimeNS, hex.EncodeToString(b[17:49]), true
+	version = domain.FileVersion{
+		Size:       int64(binary.LittleEndian.Uint64(b[1:])), //nolint:gosec // fixed-width round trip
+		ModTime:    decodeTime(binary.LittleEndian.Uint64(b[9:])),
+		ChangeTime: decodeTime(binary.LittleEndian.Uint64(b[17:])),
+		Inode:      binary.LittleEndian.Uint64(b[25:]),
+		Device:     binary.LittleEndian.Uint64(b[33:]),
+	}
+	return version, hex.EncodeToString(b[41:73]), true
 }
 
 // Warm walks root and fills every missing digest using workers goroutines. It
@@ -471,7 +498,8 @@ func (i *Index) hashOne(ctx context.Context, root *os.Root, key string) {
 	if err != nil || !fi.Mode().IsRegular() {
 		return
 	}
-	if _, ok := i.Lookup(key, fi.Size(), fi.ModTime()); ok {
+	ver := localstore.FileVersionOf(fi)
+	if _, ok := i.Lookup(key, ver); ok {
 		return
 	}
 
@@ -500,12 +528,13 @@ func (i *Index) hashOne(ctx context.Context, root *os.Root, key string) {
 	if err != nil {
 		return
 	}
-	if after.Size() != fi.Size() || !after.ModTime().Equal(fi.ModTime()) {
+	afterVer := localstore.FileVersionOf(after)
+	if !afterVer.Equal(ver) {
 		// The file changed while it was read; do not cache a digest that never
 		// described one complete version.
 		return
 	}
-	i.Store(key, after.Size(), after.ModTime(), hex.EncodeToString(h.Sum(nil)))
+	i.Store(key, afterVer, hex.EncodeToString(h.Sum(nil)))
 }
 
 func (i *Index) maintain(ctx context.Context) {

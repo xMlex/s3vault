@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,11 +26,11 @@ type fakeDigestIndex struct {
 	deleted []string
 }
 
-func (f *fakeDigestIndex) Lookup(string, int64, time.Time) (string, bool) {
+func (f *fakeDigestIndex) Lookup(string, domain.FileVersion) (string, bool) {
 	return f.sum, f.hit
 }
 
-func (f *fakeDigestIndex) Store(key string, _ int64, _ time.Time, sum string) {
+func (f *fakeDigestIndex) Store(key string, _ domain.FileVersion, sum string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.stored == nil {

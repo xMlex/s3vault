@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/xMlex/s3vault/internal/adapter/encrypt"
+	localstore "github.com/xMlex/s3vault/internal/adapter/local"
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/container"
 	"github.com/xMlex/s3vault/internal/domain"
@@ -307,6 +309,37 @@ func TestFetchOpenFallsBackForCommand(t *testing.T) {
 
 // TestFetchOpenContainerlessPlaintext covers mode=none objects written without a
 // container: the stored bytes are the plaintext, so they can be ranged directly.
+// TestFetchOpenLocalContainerlessETag pins GET/HEAD consistency on the local
+// backend: GetRange carries only the synthetic size+mtime validator, so the
+// ranged reader must take the digest from Head. Otherwise GET advertises a
+// different ETag than HEAD for the same containerless object.
+func TestFetchOpenLocalContainerlessETag(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	plain := bytes.Repeat([]byte("abc"), 1000)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "k"), plain, 0o600))
+
+	st, err := localstore.New(config.LocalConfig{Dir: dir})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	f := service.NewFetch(st, encrypt.Passthrough{})
+
+	rc, meta, err := f.Open(context.Background(), "k")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rc.Close() })
+
+	want := sha256Hex(plain)
+	assert.Equal(t, want, meta.SHA256)
+	assert.Equal(t, want, meta.ETag, "GET ETag must be the content digest, not the synthetic validator")
+	assert.Equal(t, int64(len(plain)), meta.Size)
+
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, plain, got)
+}
+
 func TestFetchOpenContainerlessPlaintext(t *testing.T) {
 	t.Parallel()
 

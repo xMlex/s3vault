@@ -453,6 +453,17 @@ func (f *Fetch) openRanged(ctx context.Context, key string) (*objectReader, Cach
 		return nil, CachedPlaintext{}, errNotSeekable
 	}
 
+	// GetRange returns the store's validator, which for the local backend is
+	// synthetic (size + mtime). A containerless object has no header to carry
+	// the digest, so Ask Head for the same content identity that HEAD reports:
+	// GET and HEAD must not advertise different ETags for one object. The local
+	// store answers this from the digest index, not by re-reading the file.
+	if meta.SHA256 == "" {
+		if head, headErr := f.store.Head(ctx, key); headErr == nil {
+			meta.SHA256 = head.SHA256
+		}
+	}
+
 	// A containerless payload is served byte for byte, so the digest the store
 	// reports for the stored bytes is the plaintext digest. ContentSize is the
 	// declared plaintext length when the object carries it; Size is the fallback

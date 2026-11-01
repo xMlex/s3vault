@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/xMlex/s3vault/internal/domain"
@@ -126,7 +128,7 @@ func (s *Store) walk(ctx context.Context, prefix string) ([]domain.ListObject, e
 		out = append(out, domain.ListObject{
 			Key:          p,
 			Size:         fi.Size(),
-			ETag:         etag(fi),
+			ETag:         s.listETag(p, fi),
 			LastModified: fi.ModTime().UTC(),
 		})
 		return nil
@@ -135,6 +137,22 @@ func (s *Store) walk(ctx context.Context, prefix string) ([]domain.ListObject, e
 		return nil, fmt.Errorf("list: %w", err)
 	}
 	return out, nil
+}
+
+// listETag prefers a digest already known for this file version, so List and
+// HEAD report the same content identity for an object whose digest is cached.
+// On a miss it returns the synthetic size+mtime validator and never hashes:
+// list must stay linear in object count, not in bytes.
+func (s *Store) listETag(key string, fi fs.FileInfo) string {
+	if sum, ok := s.cachedSHA(filepath.FromSlash(key), fi); ok {
+		return strconv.Quote(sum)
+	}
+	if s.digest != nil {
+		if sum, ok := s.digest.Lookup(key, FileVersionOf(fi)); ok && sum != "" {
+			return strconv.Quote(sum)
+		}
+	}
+	return etag(fi)
 }
 
 // dirCanMatch reports whether a directory may hold keys under prefix.

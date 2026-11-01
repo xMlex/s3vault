@@ -46,8 +46,9 @@ type LocalConfig struct {
 	Dir string `mapstructure:"dir"`
 	// IndexShards is the number of independent digest index shards kept inside
 	// backend.local.dir/.s3vault-index. Zero means the default (8). The index
-	// stores sha256+mtime for containerless objects so HEAD does not have to
-	// rehash every file; each shard is maintained independently.
+	// stores sha256 keyed by file version (size, mtime, ctime, inode) for
+	// containerless objects so HEAD does not have to rehash every file; each
+	// shard is maintained independently.
 	IndexShards int `mapstructure:"index_shards"`
 }
 
