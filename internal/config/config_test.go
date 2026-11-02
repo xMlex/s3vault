@@ -32,6 +32,64 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, DefaultMultipartPartSize, cfg.S3.MultipartPartSize)
 }
 
+func TestLocalIndexShards(t *testing.T) {
+	t.Parallel()
+
+	t.Run("default 8", func(t *testing.T) {
+		t.Parallel()
+
+		v := viper.New()
+		SetDefaults(v)
+		v.Set("backend.type", BackendLocal)
+		v.Set("backend.local.dir", t.TempDir())
+		cfg, err := Load(v)
+		require.NoError(t, err)
+		assert.Equal(t, DefaultLocalIndexShards, cfg.Backend.Local.IndexShards)
+	})
+
+	t.Run("env override", func(t *testing.T) {
+		t.Parallel()
+
+		v := viper.New()
+		SetDefaults(v)
+		v.Set("backend.type", BackendLocal)
+		v.Set("backend.local.dir", t.TempDir())
+		v.Set("backend.local.index_shards", 4)
+		cfg, err := Load(v)
+		require.NoError(t, err)
+		assert.Equal(t, 4, cfg.Backend.Local.IndexShards)
+	})
+
+	t.Run("bounded", func(t *testing.T) {
+		t.Parallel()
+
+		v := viper.New()
+		SetDefaults(v)
+		v.Set("backend.type", BackendLocal)
+		v.Set("backend.local.dir", t.TempDir())
+		v.Set("backend.local.index_shards", MaxLocalIndexShards+1)
+		_, err := Load(v)
+		require.ErrorContains(t, err, "backend.local.index_shards")
+	})
+}
+
+func TestLocalIndexShardsFromEnv(t *testing.T) {
+	t.Setenv("S3VAULT_BACKEND_TYPE", BackendLocal)
+	t.Setenv("S3VAULT_BACKEND_LOCAL_DIR", t.TempDir())
+	t.Setenv("S3VAULT_BACKEND_LOCAL_INDEX_SHARDS", "4")
+
+	v := viper.New()
+	SetDefaults(v)
+	v.SetEnvPrefix("S3VAULT")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
+	v.AutomaticEnv()
+	require.NoError(t, BindEnv(v))
+
+	cfg, err := Load(v)
+	require.NoError(t, err)
+	assert.Equal(t, 4, cfg.Backend.Local.IndexShards)
+}
+
 // The part size is bounded by S3 on both sides. The bounds are checked in
 // Normalize rather than left to the SDK, which would only complain about a
 // too-small value at the first upload, naming neither the key nor the reason.

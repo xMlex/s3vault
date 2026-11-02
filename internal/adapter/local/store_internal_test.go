@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -35,32 +36,52 @@ func TestSHAMemoEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 
 	// Fill the memo (a, b), then touch a so b becomes least-recently-used.
-	for _, key := range []string{"a", "b", "a"} {
+	for _, key := range []string{"a", "b", "a", "c"} {
 		_, err := st.Head(ctx, key)
 		require.NoError(t, err)
 	}
-	// Inserting c overflows the memo: b must be evicted, a must survive.
-	_, err = st.Head(ctx, "c")
-	require.NoError(t, err)
 
-	// Overwrite a and b with equal-length bodies and restore the original mtime,
-	// so only the memo decides whether the digest is stale. a is served from the
-	// memo; b was evicted, so it is re-hashed.
+	// Inserting c overflows the memo: b must be evicted, a and c must survive.
+	st.shaMu.Lock()
+	defer st.shaMu.Unlock()
+
+	assert.Contains(t, st.shaCache, "a")
+	assert.Contains(t, st.shaCache, "c")
+	assert.NotContains(t, st.shaCache, "b", "least-recently-used entry must be evicted")
+}
+
+// A sync tool that restores timestamps rewrites the bytes while keeping size
+// and mtime, so the memo must compare the full file version, not those two
+// fields alone.
+func TestSHAMemoInvalidatesSameSizeSameMTimeOverwrite(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "objects")
+	st, err := New(config.LocalConfig{Dir: dir})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	mtime := time.Unix(1_700_000_000, 0).UTC()
+	p := filepath.Join(dir, "a")
+	require.NoError(t, os.WriteFile(p, []byte("aaa"), 0o600))
+	require.NoError(t, os.Chtimes(p, mtime, mtime))
+
+	first, err := st.Head(ctx, "a")
+	require.NoError(t, err)
+	assert.Equal(t, sumHex("aaa"), first.SHA256)
+
 	overwriteKeepingIdentity(t, dir, "a", "zzz")
-	overwriteKeepingIdentity(t, dir, "b", "yyy")
 
-	gotA, err := st.Head(ctx, "a")
+	second, err := st.Head(ctx, "a")
 	require.NoError(t, err)
-	assert.Equal(t, sumHex("aaa"), gotA.SHA256, "recently used entry must survive and serve its memoized digest")
-
-	gotB, err := st.Head(ctx, "b")
-	require.NoError(t, err)
-	assert.Equal(t, sumHex("yyy"), gotB.SHA256, "evicted entry must be recomputed, not left stale")
+	assert.Equal(t, sumHex("zzz"), second.SHA256, "a rewritten file must never serve its previous digest")
 }
 
 // overwriteKeepingIdentity rewrites a raw object in place with a same-length
-// body and restores the previous mtime, reproducing the size+mtime identity the
-// SHA memo keys on.
+// body and restores the previous mtime, reproducing the size+mtime identity
+// older cache keys used. The inode change time still advances, which is what
+// makes the new version distinguishable.
 func overwriteKeepingIdentity(t *testing.T, dir, key, body string) {
 	t.Helper()
 

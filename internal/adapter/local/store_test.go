@@ -725,9 +725,8 @@ func TestOverwriteSameSizeSameMTimeChangesSHA256(t *testing.T) {
 			}
 
 			write([]byte("AAAA"))
-			// Fresh store so the containerless size+mtime memo (tested
-			// separately) cannot mask the digest; revalidation runs in a fresh
-			// process.
+			// Resolve through a fresh store, as revalidation in a new process
+			// would.
 			before, err := resSHA(ctx, dir)
 			require.NoError(t, err)
 

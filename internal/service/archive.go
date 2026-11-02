@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -9,7 +10,7 @@ import (
 	"log/slog"
 	"mime"
 	"os"
-	"path/filepath"
+	"path"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/xMlex/s3vault/internal/domain"
 	"github.com/xMlex/s3vault/internal/hash"
 	"github.com/xMlex/s3vault/internal/identity"
+	"github.com/xMlex/s3vault/internal/iocopy"
 	"github.com/xMlex/s3vault/internal/keying"
 	"github.com/xMlex/s3vault/internal/metrics"
 	"github.com/xMlex/s3vault/internal/port"
@@ -77,10 +79,35 @@ func (a *Archive) WithMetrics(m *metrics.Collector) *Archive {
 	return a
 }
 
+// WithProfile returns a view that writes through another key namespace and
+// encryptor. The value has no mutable shared state of its own, so a shallow copy
+// is safe; store, logger, metrics and the framing flag stay shared.
+func (a *Archive) WithProfile(keys keying.Mapper, enc port.Encryptor) *Archive {
+	c := *a
+	c.keys = keys
+
+	if enc == nil {
+		enc = nopEncryptor{}
+	}
+
+	c.enc = enc
+
+	return &c
+}
+
+// WithStore returns a view that writes to another object store. It is used for
+// a user whose destination is not the gateway's global s3.* backend.
+func (a *Archive) WithStore(store port.ObjectStore) *Archive {
+	c := *a
+	c.store = store
+
+	return &c
+}
+
 type nopEncryptor struct{}
 
 func (nopEncryptor) Encrypt(_ context.Context, dst io.Writer, src io.Reader) error {
-	_, err := io.Copy(dst, src)
+	_, err := iocopy.Copy(dst, src)
 	return err
 }
 
@@ -348,7 +375,10 @@ func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, 
 	var hdrBytes []byte
 
 	putMeta := domain.PutMeta{
-		ContentType:   mime.TypeByExtension(filepath.Ext(info.AbsPath)),
+		// The content type belongs to the object name the client sees, not to the
+		// spool file the bytes happen to live in: a PutObject body is spooled as
+		// "s3vault-s3put-123", whose extension is empty.
+		ContentType:   mime.TypeByExtension(path.Ext(key)),
 		PlaintextSize: info.Size,
 	}
 	if a.writesRaw() {
@@ -400,9 +430,23 @@ func (a *Archive) encryptPipe(ctx context.Context, path string) (io.Reader, func
 			return err
 		}
 		defer f.Close()
-		err = a.enc.Encrypt(ctx, pw, f)
-		_ = pw.CloseWithError(err)
-		return err
+		// The pipe is unbuffered, so every Write of the encryptor would be one
+		// handoff to the uploader. A buffered writer turns a chunk (64 KiB by
+		// default) into a quarter of a pipe round trip.
+		bw := bufio.NewWriterSize(pw, iocopy.BufferSize)
+		if err = a.enc.Encrypt(ctx, bw, f); err != nil {
+			_ = pw.CloseWithError(err)
+			return err
+		}
+
+		if err = bw.Flush(); err != nil {
+			_ = pw.CloseWithError(err)
+			return err
+		}
+
+		_ = pw.Close()
+
+		return nil
 	})
 
 	return pr, func() error {

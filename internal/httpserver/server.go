@@ -24,7 +24,8 @@ type Config struct {
 	Logger        *slog.Logger
 	Store         port.ObjectStore
 	Metrics       *metrics.Collector
-	S3Handler     http.Handler // required SigV4 S3 API
+	S3Handler     http.Handler                // required SigV4 S3 API
+	ReadyCheck    func(context.Context) error // optional extra readiness probe (auth DB)
 }
 
 // Server serves health probes and the S3 API facade.
@@ -37,6 +38,7 @@ type Server struct {
 	handler       http.Handler
 	s3Handler     http.Handler
 	metricsH      http.Handler
+	readyCheck    func(context.Context) error
 }
 
 // New validates bind policy and builds handlers.
@@ -69,6 +71,7 @@ func New(cfg Config) (*Server, error) {
 		log:           log,
 		store:         cfg.Store,
 		metricsH:      met.Handler(),
+		readyCheck:    cfg.ReadyCheck,
 	}
 
 	mux := http.NewServeMux()
@@ -214,6 +217,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	_, err := s.store.Head(r.Context(), ".s3vault-ready")
+	if err == nil && s.readyCheck != nil {
+		err = s.readyCheck(r.Context())
+	}
 	if err != nil {
 		s.log.ErrorContext(r.Context(), "ready check", slog.String("op", "http"), slog.String("err", err.Error()))
 		http.Error(w, "not ready", http.StatusServiceUnavailable)

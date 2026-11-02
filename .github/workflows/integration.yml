@@ -18,17 +18,16 @@ jobs:
   s3:
     runs-on: ubuntu-latest
     services:
-      minio:
-        # Пин на релизный тег, не :latest — иначе зелёный/красный результат
-        # зависит от того, что попало в реестр в день запуска.
-        image: minio/minio:RELEASE.2025-10-15T17-29-55Z
+      postgres:
+        image: postgres:18
         env:
-          MINIO_ROOT_USER: s3vault
-          MINIO_ROOT_PASSWORD: s3vaulttest
+          POSTGRES_USER: s3vault
+          POSTGRES_PASSWORD: s3vaulttest
+          POSTGRES_DB: s3vault
         ports:
-          - '9000:9000'
+          - '5432:5432'
         options: >-
-          --health-cmd "curl -fsS http://127.0.0.1:9000/minio/health/live"
+          --health-cmd "pg_isready -U s3vault -d s3vault"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
@@ -41,6 +40,7 @@ jobs:
       S3VAULT_S3_SECRET_KEY: s3vaulttest
       S3VAULT_S3_PREFIX: it/
       S3VAULT_LOG_LEVEL: error
+      S3VAULT_TEST_POSTGRES_DSN: postgres://s3vault:s3vaulttest@127.0.0.1:5432/s3vault?sslmode=disable
     steps:
     - uses: actions/checkout@v7
 
@@ -49,6 +49,27 @@ jobs:
       with:
         go-version: '1.26'
         check-latest: true
+
+    - name: Start MinIO
+      # Service container не умеет передать command, а образу MinIO он нужен
+      # (`server /data`). MinIO убрал образы с Docker Hub, поэтому берём
+      # публичную сборку Chainguard, закреплённую по digest.
+      run: |
+        docker run -d --name minio --user 0:0 \
+          -p 9000:9000 -p 9001:9001 \
+          -e MINIO_ROOT_USER=s3vault \
+          -e MINIO_ROOT_PASSWORD=s3vaulttest \
+          -e MC_CONFIG_DIR=/tmp/.mc \
+          cgr.dev/chainguard/minio@sha256:0a01100085e30fb08d2f39e39c9f5c9d83a95707f220b007d813b690cd41622d \
+          server /data --console-address ":9001"
+        for _ in $(seq 1 30); do
+          if curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null 2>&1; then
+            exit 0
+          fi
+          sleep 1
+        done
+        docker logs minio
+        exit 1
 
     - name: Ensure aws cli
       # На ubuntu-latest он есть, но полагаться на образ раннера в 2026+ рискованно.
@@ -77,3 +98,11 @@ jobs:
       # -count=1 обязателен: закэшированный результат скрывает плавающие
       # взаимодействия с сервисом. Без S3VAULT_* тесты просто t.Skip.
       run: go test -tags=integration -race -count=1 -v ./internal/integration/
+
+    - name: PostgreSQL auth integration
+      # Схема, секреты, prefix-инварианты и запросы фасада против живой БД.
+      run: go test -tags=integration -race -count=1 -p 1 -v ./internal/adapter/s3auth/postgres ./internal/s3api
+
+    - name: MinIO log on failure
+      if: failure()
+      run: docker logs minio || true

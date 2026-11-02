@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	localstore "github.com/xMlex/s3vault/internal/adapter/local"
 	"github.com/xMlex/s3vault/internal/adapter/scanner"
 	"github.com/xMlex/s3vault/internal/domain"
 )
@@ -41,6 +42,33 @@ func TestFSScanOlderThan(t *testing.T) {
 	}
 
 	assert.ElementsMatch(t, []string{"file1.log", "logs/file3.log"}, found)
+}
+
+func TestFSScanSkipsReservedDirs(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	indexed := filepath.Join(root, localstore.IndexDirName, "00", "db")
+	tmp := filepath.Join(root, localstore.TmpDirName, "put")
+	ordinary := filepath.Join(root, "file.log")
+
+	require.NoError(t, os.MkdirAll(filepath.Dir(indexed), 0o700))
+	require.NoError(t, os.MkdirAll(filepath.Dir(tmp), 0o700))
+	require.NoError(t, os.WriteFile(indexed, []byte("i"), 0o600))
+	require.NoError(t, os.WriteFile(tmp, []byte("t"), 0o600))
+	require.NoError(t, os.WriteFile(ordinary, []byte("r"), 0o600))
+
+	s := scanner.New(scanner.Options{})
+
+	var found []string
+
+	for info, err := range s.Scan(context.Background(), root, 0) {
+		require.NoError(t, err)
+
+		found = append(found, info.RelPath)
+	}
+
+	assert.Equal(t, []string{"file.log"}, found)
 }
 
 func TestFSScanSkipsSymlinkByDefault(t *testing.T) {

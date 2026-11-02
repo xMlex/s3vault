@@ -1,13 +1,19 @@
 package s3store
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -25,14 +31,38 @@ type Store struct {
 	client *s3.Client
 	bucket string
 	put    *manager.Uploader
+	opts   Options
 }
 
 var _ port.ObjectStore = (*Store)(nil)
 
+// Options are destination-side write options. They are set only by a user's
+// s3_target, never by the gateway's global s3.* config.
+type Options struct {
+	// ServerSideEncryption enables SSE on the destination. Empty sends no
+	// server-side-encryption header at all.
+	ServerSideEncryption string
+	SSEKMSKeyID          string
+	SSEKMSContext        map[string]string
+	BucketKeyEnabled     bool
+	// StorageClass is sent as x-amz-storage-class when non-empty.
+	StorageClass string
+}
+
 // New builds an S3 client from config (AWS or MinIO-style endpoint).
 func New(ctx context.Context, cfg config.S3Config) (*Store, error) {
+	return NewWithOptions(ctx, cfg, Options{})
+}
+
+// NewWithOptions builds an S3 client with destination-side write options.
+func NewWithOptions(ctx context.Context, cfg config.S3Config, opts Options) (*Store, error) {
 	if cfg.Bucket == "" {
-		return nil, fmt.Errorf("s3 bucket is required")
+		return nil, errors.New("s3 bucket is required")
+	}
+
+	if opts.ServerSideEncryption == "" &&
+		(opts.SSEKMSKeyID != "" || len(opts.SSEKMSContext) > 0 || opts.BucketKeyEnabled) {
+		return nil, errors.New("s3: SSE-KMS options require ServerSideEncryption")
 	}
 	// Re-checked at the point of use. The SDK would only complain about a too-small
 	// part size at the first upload, naming neither the config key nor the S3
@@ -69,10 +99,21 @@ func New(ctx context.Context, cfg config.S3Config) (*Store, error) {
 			}
 		},
 	}
-	client := s3.NewFromConfig(awsCfg, clientOpts...)
+	// The SDK's default transport keeps 10 idle connections per host. The
+	// gateway multiplexes every object read and write onto one storage endpoint,
+	// so at higher concurrency the surplus connections are closed and reopened —
+	// a TLS handshake per request burst. Keep enough of them alive instead.
+	httpClient := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.MaxIdleConns = 256
+		t.MaxIdleConnsPerHost = 64
+	})
+	client := s3.NewFromConfig(awsCfg, append(clientOpts, func(o *s3.Options) {
+		o.HTTPClient = httpClient
+	})...)
 	return &Store{
 		client: client,
 		bucket: cfg.Bucket,
+		opts:   opts,
 		put: manager.NewUploader(client, func(u *manager.Uploader) { //nolint:staticcheck // the uploader s3vault itself uses, on purpose
 			// The part size is this client's choice and travels with the request;
 			// it is not negotiated with the store and not probed for. Raising it
@@ -133,9 +174,47 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, meta domain.Pu
 			metaSize:   strconv.FormatInt(meta.PlaintextSize, 10),
 		}
 	}
+
+	if err := applyWriteOptions(in, s.opts); err != nil {
+		return fmt.Errorf("put %s: %w", key, err)
+	}
 	if _, err := s.put.Upload(ctx, in); err != nil {
 		return fmt.Errorf("put %s: %w", key, err)
 	}
+	return nil
+}
+
+// applyWriteOptions attaches the destination's SSE-KMS and storage-class
+// headers. An empty field means "send no header", which is the only way to let
+// the destination keep its own defaults.
+func applyWriteOptions(in *s3.PutObjectInput, opts Options) error {
+	if opts.StorageClass != "" {
+		in.StorageClass = types.StorageClass(opts.StorageClass)
+	}
+
+	if opts.ServerSideEncryption == "" {
+		return nil
+	}
+
+	in.ServerSideEncryption = types.ServerSideEncryption(opts.ServerSideEncryption)
+
+	if opts.SSEKMSKeyID != "" {
+		in.SSEKMSKeyId = aws.String(opts.SSEKMSKeyID)
+	}
+
+	if len(opts.SSEKMSContext) > 0 {
+		raw, err := json.Marshal(opts.SSEKMSContext)
+		if err != nil {
+			return fmt.Errorf("sse-kms context: %w", err)
+		}
+
+		in.SSEKMSEncryptionContext = aws.String(base64.StdEncoding.EncodeToString(raw))
+	}
+
+	if opts.BucketKeyEnabled {
+		in.BucketKeyEnabled = aws.Bool(true)
+	}
+
 	return nil
 }
 
@@ -147,7 +226,34 @@ func (s *Store) GetRange(ctx context.Context, key string, start, end int64) (io.
 	if start < 0 || end < start {
 		return nil, domain.ObjectMeta{}, fmt.Errorf("get range %s: invalid range %d-%d", key, start, end)
 	}
-	return s.getObject(ctx, key, fmt.Sprintf("bytes=%d-%d", start, end))
+
+	body, meta, err := s.getObject(ctx, key, fmt.Sprintf("bytes=%d-%d", start, end))
+	if err == nil {
+		return body, meta, nil
+	}
+
+	// S3 answers a range on an empty object, or one that starts at/after the
+	// object's end, with 416. The local store already returns an empty body in
+	// that case; mirror it here so an empty object stays readable instead of
+	// surfacing as a 500 from callers that only handle ErrNotFound.
+	if !isInvalidRange(err) {
+		return nil, domain.ObjectMeta{}, err
+	}
+
+	head, headErr := s.Head(ctx, key)
+	if headErr != nil {
+		return nil, domain.ObjectMeta{}, err
+	}
+
+	if !head.Exists {
+		return nil, domain.ObjectMeta{}, domain.ErrNotFound
+	}
+
+	if start < head.Size {
+		return nil, domain.ObjectMeta{}, err
+	}
+
+	return io.NopCloser(bytes.NewReader(nil)), head, nil
 }
 
 func (s *Store) getObject(ctx context.Context, key, rangeHdr string) (io.ReadCloser, domain.ObjectMeta, error) {
@@ -169,6 +275,15 @@ func (s *Store) getObject(ctx context.Context, key, rangeHdr string) (io.ReadClo
 	meta := domain.ObjectMeta{Key: key, Exists: true, ETag: aws.ToString(out.ETag)}
 	if out.ContentLength != nil {
 		meta.Size = *out.ContentLength
+	}
+	// A 206 carries the length of the returned range in Content-Length and the
+	// full object size in Content-Range. Callers use Size as the object size
+	// (the local store reports the full size for GetRange too), so prefer the
+	// Content-Range total when the server supplies one.
+	if out.ContentRange != nil {
+		if total, ok := totalFromContentRange(*out.ContentRange); ok {
+			meta.Size = total
+		}
 	}
 	if out.LastModified != nil {
 		meta.LastModified = *out.LastModified
@@ -214,6 +329,39 @@ func fillObjectMeta(meta *domain.ObjectMeta, md map[string]string) {
 			meta.ContentSize = n
 		}
 	}
+}
+
+// totalFromContentRange extracts the complete length from an S3 Content-Range
+// value such as "bytes 0-65535/1048576". A missing or unknown total ("*") is
+// not an error: the caller keeps Content-Length as a best-effort size.
+func totalFromContentRange(v string) (int64, bool) {
+	slash := strings.LastIndexByte(v, '/')
+	if slash < 0 || slash == len(v)-1 {
+		return 0, false
+	}
+
+	total := v[slash+1:]
+	if total == "*" {
+		return 0, false
+	}
+
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+
+	return n, true
+}
+
+// isInvalidRange reports the S3 416 response. The SDK does not generate a typed
+// InvalidRange error for GetObject, so the smithy code is the stable signal.
+func isInvalidRange(err error) bool {
+	var api smithy.APIError
+	if !errors.As(err, &api) {
+		return false
+	}
+
+	return api.ErrorCode() == "InvalidRange" || api.ErrorCode() == "416"
 }
 
 func isNotFound(err error) bool {

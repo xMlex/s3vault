@@ -47,22 +47,12 @@ func (m Mapper) Key(root, absPath string) (string, error) {
 
 const maxHTTPPath = 2048
 
-// FromRequestPath maps GET /files/{path...} onto an object key (same prefix rules as upload).
+// FromRequestPath maps a client-supplied relative path onto an object key (same
+// prefix rules as upload).
 func (m Mapper) FromRequestPath(rel string) (string, error) {
-	if len(rel) > maxHTTPPath {
-		return "", fmt.Errorf("%w: path too long", domain.ErrInvalidPath)
-	}
-	rel = strings.TrimSpace(rel)
-	rel = strings.Trim(rel, "/")
-	if rel == "" || strings.Contains(rel, "\\") || strings.ContainsRune(rel, 0) {
-		return "", fmt.Errorf("%w: %q", domain.ErrInvalidPath, rel)
-	}
-	unix := path.Clean(rel)
-	if unix == "." || unix == ".." || strings.HasPrefix(unix, "../") {
-		return "", fmt.Errorf("%w: %s", domain.ErrInvalidPath, unix)
-	}
-	if !filepath.IsLocal(filepath.FromSlash(unix)) {
-		return "", fmt.Errorf("%w: %s", domain.ErrInvalidPath, unix)
+	unix, err := ValidateRelative(rel)
+	if err != nil {
+		return "", err
 	}
 	prefix := strings.Trim(strings.ReplaceAll(m.Prefix, "\\", "/"), "/")
 	if prefix == "" {

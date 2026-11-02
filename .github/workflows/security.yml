@@ -36,16 +36,11 @@ jobs:
       run: govulncheck ./...
 
   gosec:
-    # Отдельный джоб на всё дерево сейчас красный: gosec уже включён в
-    # .golangci.yml и находит ~41 замечание (14 в production, 27 в _test.go),
-    # почти все — G304 «file inclusion via variable», которая для этого CLI
-    # (сканирование каталогов, чтение ключей/конфигов) является прямым
-    # назначением, а не дефектом. Подавить их молча = повесить трубку на
-    # будущие настоящие находки, поэтому новые ловит lint.yml (gosec включён),
-    # а этот джоб поднят с continue-on-error и служит видимым счётчиком долга.
-    # Когда находки разобраны — снять continue-on-error.
+    # Полный прогон остаётся видимым счётчиком долга, но не гейтом. Standalone
+    # gosec не понимает //nolint:gosec (в отличие от golangci-lint), поэтому на
+    # дереве с осознанными G115/G302/G501 он всегда красный. Новые находки
+    # гейтит lint.yml: gosec включён в .golangci.yml и only-new-issues.
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
     - uses: actions/checkout@v7
 
@@ -58,5 +53,12 @@ jobs:
     - name: Install gosec
       run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
-    - name: Run gosec
-      run: gosec -quiet -fmt=golangci-lint ./...
+    - name: Run gosec (informational)
+      run: |
+        set +e
+        gosec -quiet -fmt=golangci-lint ./...
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+          echo "::warning title=gosec::known full-tree debt; new findings gate through lint.yml"
+        fi
+        exit 0

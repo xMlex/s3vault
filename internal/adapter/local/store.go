@@ -5,7 +5,7 @@
 // writer's decision (encryption.mode), not the store's: a containerless object
 // arrives here as a bare payload and is kept as one. Because such an object has
 // no header to read a digest from, Head and Get derive the stored-bytes SHA-256
-// by hashing the file, memoized per (path, size, mtime).
+// by hashing the file, memoized per file version (size, mtime, ctime, inode).
 package localstore
 
 import (
@@ -24,9 +24,12 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/container"
 	"github.com/xMlex/s3vault/internal/domain"
+	"github.com/xMlex/s3vault/internal/iocopy"
 	"github.com/xMlex/s3vault/internal/port"
 )
 
@@ -43,10 +46,28 @@ const (
 // tmpSeq makes concurrent Put temp names distinct within a process.
 var tmpSeq atomic.Uint64
 
+// DigestIndex is the optional persistent cache of containerless-object digests.
+// It is owned by the server process; a miss is always safe to resolve by reading
+// and hashing the file. Implementations must be safe for concurrent use.
+type DigestIndex interface {
+	Lookup(key string, version domain.FileVersion) (string, bool)
+	Store(key string, version domain.FileVersion, sum string)
+	Delete(key string)
+}
+
 // Store is a local-filesystem ObjectStore.
 type Store struct {
 	root *os.Root
 	dir  string
+	// digest is the optional persistent index used by the gateway. It is set
+	// once before serving; the CLI leaves it nil.
+	digest DigestIndex
+	// hashCtx is the server lifetime context used for digest computation when
+	// an index is attached. A client disconnect must not abort a hash that the
+	// next HEAD needs, and the result is what the index stores.
+	hashCtx context.Context //nolint:containedctx // set once by the server before serving
+	// digestGroup coalesces concurrent cold hashes for the same key version.
+	digestGroup singleflight.Group
 	// shaCache memoizes the stored-bytes SHA-256 of containerless objects per
 	// path, which have no header to read a digest from. shaOrder/shaElems track
 	// access order so overflow evicts the least-recently-used entry
@@ -58,11 +79,10 @@ type Store struct {
 	shaCacheMax int
 }
 
-// shaEntry is a cached digest validated by size and mtime.
+// shaEntry is a cached digest validated by the full file version.
 type shaEntry struct {
-	size  int64
-	mtime int64
-	sum   string
+	version domain.FileVersion
+	sum     string
 }
 
 var _ port.ObjectStore = (*Store)(nil)
@@ -95,6 +115,30 @@ func New(cfg config.LocalConfig) (*Store, error) {
 	}, nil
 }
 
+// WithDigestIndex attaches the optional persistent digest index. The server sets
+// it before serving; the CLI leaves it nil, so archive/upload/download keep their
+// existing behaviour.
+func (s *Store) WithDigestIndex(idx DigestIndex) *Store {
+	s.digest = idx
+	return s
+}
+
+// WithHashContext makes digest computation ignore request cancellation and use
+// the process lifetime instead. The gateway sets it together with the index; a
+// CLI leaves it nil and keeps request-scoped cancellation.
+func (s *Store) WithHashContext(ctx context.Context) *Store {
+	s.hashCtx = ctx
+	return s
+}
+
+func (s *Store) hashContext(ctx context.Context) context.Context {
+	if s.hashCtx != nil {
+		return s.hashCtx
+	}
+
+	return ctx
+}
+
 // Close releases the directory file descriptor.
 func (s *Store) Close() error {
 	if s.root == nil {
@@ -117,11 +161,13 @@ func (s *Store) Head(ctx context.Context, key string) (domain.ObjectMeta, error)
 	fi, err := s.root.Stat(rel)
 	if err != nil {
 		if isNotFound(err) {
+			s.forgetDigest(key, rel)
 			return domain.ObjectMeta{Key: key, Exists: false}, nil
 		}
 		return domain.ObjectMeta{}, fmt.Errorf("head %s: %w", key, err)
 	}
 	if !fi.Mode().IsRegular() {
+		s.forgetDigest(key, rel)
 		return domain.ObjectMeta{Key: key, Exists: false}, nil
 	}
 	meta := objectMeta(key, fi)
@@ -164,7 +210,8 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, meta domain.Pu
 			_ = s.root.Remove(tmp)
 		}
 	}()
-	if _, err := io.Copy(f, ctxReader{ctx: ctx, r: r}); err != nil {
+
+	if _, err := iocopy.Copy(f, ctxReader{ctx: ctx, r: r}); err != nil {
 		return fmt.Errorf("put %s: %w", key, err)
 	}
 	if err := f.Sync(); err != nil {
@@ -180,8 +227,15 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader, meta domain.Pu
 
 	if meta.PlaintextSHA256 != "" {
 		if fi, statErr := s.root.Stat(rel); statErr == nil {
-			s.rememberSHA(rel, fi, meta.PlaintextSHA256)
+			v := FileVersionOf(fi)
+			s.rememberSHA(rel, v, meta.PlaintextSHA256)
+			s.rememberDigest(key, v, meta.PlaintextSHA256)
 		}
+	} else {
+		// A container object carries its digest in S3VCTR01, and an undeclared
+		// containerless object will be hashed on first read. Either way an entry
+		// from the object this Put replaced must not survive.
+		s.forgetDigest(key, rel)
 	}
 
 	return nil
@@ -237,10 +291,62 @@ func (s *Store) digestFor(ctx context.Context, key, rel string, fi fs.FileInfo, 
 	}
 
 	if f != nil {
+		if sum, ok := s.lookupDigest(key, rel, fi); ok {
+			return sum, nil
+		}
 		return s.sha256ForFile(ctx, key, rel, fi, f)
 	}
 
 	return s.sha256For(ctx, key, rel, fi)
+}
+
+// lookupDigest asks the optional persistent index for a digest matching the
+// file's current version. A hit also populates the in-memory memo.
+func (s *Store) lookupDigest(key, rel string, fi fs.FileInfo) (string, bool) {
+	if s.digest == nil {
+		return "", false
+	}
+
+	v := FileVersionOf(fi)
+
+	sum, ok := s.digest.Lookup(key, v)
+	if !ok || sum == "" {
+		return "", false
+	}
+
+	s.rememberSHA(rel, v, sum)
+
+	return sum, true
+}
+
+// rememberDigest persists a freshly computed digest. It is best-effort: the
+// index is a cache, and a failed write only costs a future rehash.
+func (s *Store) rememberDigest(key string, v domain.FileVersion, sum string) {
+	if s.digest == nil || sum == "" {
+		return
+	}
+
+	s.digest.Store(key, v, sum)
+}
+
+// forgetDigest drops a stale index entry and its in-memory memo. It runs when
+// the object is deleted, disappears, stops being a regular file, or is replaced
+// by a container object whose digest lives in S3VCTR01. Delete is a no-op in
+// the index when the key is absent, so calling it for every miss is cheap.
+func (s *Store) forgetDigest(key, rel string) {
+	if s.digest != nil {
+		s.digest.Delete(key)
+	}
+
+	s.shaMu.Lock()
+	defer s.shaMu.Unlock()
+
+	if el, ok := s.shaElems[rel]; ok {
+		s.shaOrder.Remove(el)
+		delete(s.shaElems, rel)
+	}
+
+	delete(s.shaCache, rel)
 }
 
 // readHead returns the object's first HeaderSize bytes, shortened for a smaller
@@ -275,12 +381,50 @@ func (s *Store) sha256For(ctx context.Context, key, rel string, fi fs.FileInfo) 
 	if sum, ok := s.cachedSHA(rel, fi); ok {
 		return sum, nil
 	}
-	f, err := s.root.Open(rel)
-	if err != nil {
-		return "", fmt.Errorf("hash %s: %w", key, err)
+
+	if sum, ok := s.lookupDigest(key, rel, fi); ok {
+		return sum, nil
 	}
-	defer func() { _ = f.Close() }()
-	return s.sha256ForFile(ctx, key, rel, fi, f)
+
+	// One hash per key version, even when many HEADs arrive for the same cold
+	// file. The key version is part of the group key so a changed file never
+	// shares the previous version's digest.
+	ver := FileVersionOf(fi)
+	groupKey := key + "\x00" +
+		strconv.FormatInt(ver.Size, 10) + "\x00" +
+		strconv.FormatInt(ver.ModTime.UnixNano(), 10) + "\x00" +
+		strconv.FormatInt(ver.ChangeTime.UnixNano(), 10) + "\x00" +
+		strconv.FormatUint(ver.Inode, 10) + "\x00" +
+		strconv.FormatUint(ver.Device, 10)
+
+	v, err, _ := s.digestGroup.Do(groupKey, func() (any, error) {
+		if sum, ok := s.cachedSHA(rel, fi); ok {
+			return sum, nil
+		}
+
+		if sum, ok := s.lookupDigest(key, rel, fi); ok {
+			return sum, nil
+		}
+
+		f, openErr := s.root.Open(rel)
+		if openErr != nil {
+			return "", fmt.Errorf("hash %s: %w", key, openErr)
+		}
+
+		defer func() { _ = f.Close() }()
+
+		return s.sha256ForFile(ctx, key, rel, fi, f)
+	})
+	if err != nil {
+		return "", err
+	}
+
+	sum, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("hash %s: unexpected result", key)
+	}
+
+	return sum, nil
 }
 
 // sha256ForFile digests f and rewinds it, so the caller can still stream the
@@ -289,15 +433,30 @@ func (s *Store) sha256ForFile(ctx context.Context, key, rel string, fi fs.FileIn
 	if sum, ok := s.cachedSHA(rel, fi); ok {
 		return sum, nil
 	}
+
+	ver := FileVersionOf(fi)
+	ctx = s.hashContext(ctx)
 	h := sha256.New()
-	if _, err := io.Copy(h, ctxReader{ctx: ctx, r: f}); err != nil {
+	if _, err := iocopy.Copy(h, ctxReader{ctx: ctx, r: f}); err != nil {
 		return "", fmt.Errorf("hash %s: %w", key, err)
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "", fmt.Errorf("rewind %s: %w", key, err)
 	}
+	// A file modified while it is being read produces a digest of a byte stream
+	// that never existed as one version. Refuse to cache or return it.
+	after, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("hash %s: %w", key, err)
+	}
+
+	afterVer := FileVersionOf(after)
+	if !afterVer.Equal(ver) {
+		return "", fmt.Errorf("hash %s: file changed during read", key)
+	}
 	sum := hex.EncodeToString(h.Sum(nil))
-	s.rememberSHA(rel, fi, sum)
+	s.rememberSHA(rel, afterVer, sum)
+	s.rememberDigest(key, afterVer, sum)
 	return sum, nil
 }
 
@@ -305,7 +464,7 @@ func (s *Store) cachedSHA(rel string, fi fs.FileInfo) (string, bool) {
 	s.shaMu.Lock()
 	defer s.shaMu.Unlock()
 	e, ok := s.shaCache[rel]
-	if !ok || e.size != fi.Size() || e.mtime != fi.ModTime().UnixNano() {
+	if !ok || !e.version.Equal(FileVersionOf(fi)) {
 		return "", false
 	}
 
@@ -319,7 +478,7 @@ func (s *Store) cachedSHA(rel string, fi fs.FileInfo) (string, bool) {
 // rememberSHA records a digest as the most recently used entry. If the memo is
 // full the least-recently-used entry is evicted, so a hot object is never
 // dropped in favor of a cold one (problems.md P5).
-func (s *Store) rememberSHA(rel string, fi fs.FileInfo, sum string) {
+func (s *Store) rememberSHA(rel string, version domain.FileVersion, sum string) {
 	s.shaMu.Lock()
 	defer s.shaMu.Unlock()
 
@@ -328,7 +487,8 @@ func (s *Store) rememberSHA(rel string, fi fs.FileInfo, sum string) {
 	} else {
 		s.shaElems[rel] = s.shaOrder.PushBack(rel)
 	}
-	s.shaCache[rel] = shaEntry{size: fi.Size(), mtime: fi.ModTime().UnixNano(), sum: sum}
+
+	s.shaCache[rel] = shaEntry{version: version, sum: sum}
 	for s.shaOrder.Len() > s.shaCacheMax {
 		oldest := s.shaOrder.Front()
 		s.shaOrder.Remove(oldest)
@@ -376,6 +536,7 @@ func (s *Store) open(ctx context.Context, key string) (*os.File, fs.FileInfo, er
 	f, err := s.root.Open(rel)
 	if err != nil {
 		if isNotFound(err) {
+			s.forgetDigest(key, rel)
 			return nil, nil, domain.ErrNotFound
 		}
 		return nil, nil, fmt.Errorf("get %s: %w", key, err)
@@ -387,6 +548,8 @@ func (s *Store) open(ctx context.Context, key string) (*os.File, fs.FileInfo, er
 	}
 	if !fi.Mode().IsRegular() {
 		_ = f.Close()
+
+		s.forgetDigest(key, rel)
 		return nil, nil, domain.ErrNotFound
 	}
 	return f, fi, nil

@@ -44,13 +44,189 @@ docker build --build-arg VERSION=$(git describe --tags --always --dirty) -t s3va
 
 Что стоит знать перед запуском:
 
-- `server` по умолчанию слушает `127.0.0.1`, из контейнера это недостижимо, поэтому в образе задан `S3VAULT_SERVER_LISTEN=0.0.0.0:8080`. Сервер стартует только с ключами S3-фасада (`S3VAULT_SERVER_S3_ACCESS_KEY`/`S3VAULT_SERVER_S3_SECRET_KEY`), так что их придётся задать.
+- `server` по умолчанию слушает `127.0.0.1`, из контейнера это недостижимо, поэтому в образе задан `S3VAULT_SERVER_LISTEN=0.0.0.0:8080`. Сервер стартует либо с ключами S3-фасада (`S3VAULT_SERVER_S3_ACCESS_KEY`/`S3VAULT_SERVER_S3_SECRET_KEY`), либо с `S3VAULT_SERVER_AUTH_BACKEND=postgres` и DSN, так что один из источников identity придётся задать.
 - Кэш выключен по умолчанию (`cache.enabled: false`) и не переживает перезапуск контейнера. Чтобы plaintext не терялся, смонтируйте том на `/cache` (`S3VAULT_CACHE_DIR=/cache`) — и держите в нём `0700`.
-- `encryption.mode=command` из этого образа **не работает**: режим зовёт внешний `cryptcp`, которого в distroless нет. Берите `encryption.mode=native` либо свой образ с cryptcp.
 - `encryption.mode=command` из этого образа **не работает**: режим зовёт внешний `cryptcp`, которого в distroless нет. Берите `encryption.mode=native` либо свой образ с cryptcp.
 - Секреты в образ не запекаются: `.env`, `*.pem`, `kek.bin` перечислены в `.dockerignore`, конфигурация приходит через env или смонтированный файл.
 
-## Быстрый старт: шлюз + архив
+## Быстрый старт
+
+Минимальные команды для трёх сценариев: шлюз без PostgreSQL, шлюз с PostgreSQL и архив. Подробный сквозной разбор с проверкой слоёв, чтения и метрик — в разделе «Сквозной сценарий: шлюз + архив» ниже.
+
+Сначала соберите бинарь:
+
+```bash
+make build        # ./s3vault
+```
+
+### Хранилище
+
+Для локального стенда поднимите MinIO и PostgreSQL из репозитория. Для архива и static-шлюза PostgreSQL не нужен, но лишний контейнер не мешает:
+
+```bash
+docker compose -f compose.e2e.yaml up -d
+```
+
+MinIO будет на `127.0.0.1:9000`, бакет `s3vault`, креды `s3vault` / `s3vaulttest`. Дальше считаем, что хранилище — S3/MinIO. Если оно у вас уже есть, подставьте свои значения.
+
+```bash
+# доступ шлюза (или архива) к хранилищу
+export S3VAULT_S3_ENDPOINT=http://127.0.0.1:9000
+export S3VAULT_S3_REGION=us-east-1
+export S3VAULT_S3_BUCKET=s3vault
+export S3VAULT_S3_ACCESS_KEY=s3vault
+export S3VAULT_S3_SECRET_KEY=s3vaulttest
+export S3VAULT_S3_PATH_STYLE=true
+```
+
+`S3VAULT_S3_*` — это доступ **шлюза или клиента к хранилищу**; ключи, по которым клиенты входят в шлюз, задаются отдельно (`S3VAULT_SERVER_S3_*` или пользователями PostgreSQL).
+
+### Шлюз без PostgreSQL
+
+Одна статическая пара ключей на всех клиентов. Подходит для одного доверенного контура или для проверки стенда.
+
+```bash
+# слой шифрования шлюза; для минимума — none, см. «Шифрование»
+export S3VAULT_ENCRYPTION_MODE=none
+
+# frontend: по этой паре клиенты подписывают запросы к шлюзу
+export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
+export S3VAULT_SERVER_S3_SECRET_KEY=vaultsk
+export S3VAULT_SERVER_S3_BUCKET=s3vault   # виртуальный бакет фасада
+
+s3vault server --listen 127.0.0.1:8080 --s3-listen 127.0.0.1:8333
+```
+
+Проверка:
+
+```bash
+curl -fsS http://127.0.0.1:8080/health   # ok
+curl -fsS http://127.0.0.1:8080/ready    # ok
+
+AWS_ACCESS_KEY_ID=vaultak AWS_SECRET_ACCESS_KEY=vaultsk \
+  aws --endpoint-url http://127.0.0.1:8333 \
+  s3api list-objects-v2 --bucket s3vault --region us-east-1
+```
+
+Клиент обязан использовать то же имя виртуального бакета (`S3VAULT_SERVER_S3_BUCKET`), иначе первая же операция вернёт `403`. `--s3-listen` можно опустить — тогда S3-фасад мультиплексируется на `--listen`; `/health` и `/ready` остаются обычными HTTP-путями.
+
+Если вместо S3 нужен локальный каталог:
+
+```bash
+export S3VAULT_BACKEND_TYPE=local
+export S3VAULT_BACKEND_LOCAL_DIR=/srv/s3vault/objects
+export S3VAULT_S3_ENDPOINT= S3VAULT_S3_BUCKET=
+# ключи фасада те же; виртуальный бакет — S3VAULT_SERVER_S3_BUCKET или s3vault
+```
+
+### Шлюз с PostgreSQL
+
+То же хранилище, но identity берётся из БД: у каждого пользователя свой `access_key_id`/`secret_key`, прозрачный префикс и, опционально, общий профиль шифрования и своя S3-цель. Статические `S3VAULT_SERVER_S3_*` в этом режиме должны быть пустыми. Если static-шлюз из предыдущего варианта уже запущен, остановите его: порты те же.
+
+```bash
+# PostgreSQL из compose.e2e.yaml: 127.0.0.1:15432, s3vault/s3vaulttest, БД s3vault
+export S3VAULT_SERVER_AUTH_BACKEND=postgres
+export S3VAULT_SERVER_AUTH_DSN='postgres://s3vault:s3vaulttest@127.0.0.1:15432/s3vault?sslmode=disable'
+
+# мастер-ключ AES-256-GCM для секретов в БД: ровно 32 байта в base64.
+# Сгенерируйте один раз и сохраните: пересоздание сделает старые секреты нечитаемыми.
+umask 077
+mkdir -p "$HOME/.config/s3vault"
+head -c 32 /dev/urandom | base64 > "$HOME/.config/s3vault/master.key"
+export S3VAULT_SERVER_AUTH_MASTER_KEY="$(cat "$HOME/.config/s3vault/master.key")"
+# в бою: /etc/s3vault/master.key, владелец — пользователь s3vault, режим 0600
+
+unset S3VAULT_SERVER_S3_ACCESS_KEY S3VAULT_SERVER_S3_SECRET_KEY
+```
+
+Схема создастся автоматически при первой команде. Создайте пользователя; секрет показывается один раз:
+
+```bash
+s3vault user add --name alice --prefix tenant-a
+# access_key_id=S3V...
+# secret_key=...
+```
+
+Шифрование слоя шлюза задаётся тем же `S3VAULT_ENCRYPTION_MODE`; профиль, назначенный пользователю, переопределяет его для этого пользователя.
+
+Запуск шлюза:
+
+```bash
+s3vault server --listen 127.0.0.1:8080 --s3-listen 127.0.0.1:8333
+```
+
+Клиент на **другом хосте или в отдельном окружении** использует выданные ключи, а не креды MinIO:
+
+```bash
+export S3VAULT_S3_ENDPOINT=http://127.0.0.1:8333
+export S3VAULT_S3_BUCKET=s3vault
+export S3VAULT_S3_ACCESS_KEY=S3V...       # access_key_id из user add
+export S3VAULT_S3_SECRET_KEY=...          # secret_key из user add
+export S3VAULT_S3_PATH_STYLE=true
+```
+
+Опционально: общий профиль шифрования и общая цель S3 (форматы файлов — в разделах ниже).
+
+```bash
+s3vault profile add --name shared-native --file native.json
+s3vault target add --name archive-a --profile target.json
+s3vault user add --name bob --prefix tenant-b \
+  --encryption-profile shared-native --s3-target archive-a
+```
+
+Подробности: «Пользователи gateway в PostgreSQL» и «Конечный S3 пользователя» ниже.
+
+### Архив
+
+`archive` находит файлы старше `--older-than` и загружает их. Локальные файлы по умолчанию остаются на диске; удалить их после успешной загрузки можно через `--delete-after-upload`.
+
+Сначала создайте тестовые файлы:
+
+```bash
+D=/tmp/demo; mkdir -p "$D/logs"
+head -c 4096 /dev/urandom > "$D/logs/app.log"
+printf 'hello from s3vault\n' > "$D/logs/notes.txt"
+touch -d '10 days ago' "$D/logs/"*        # иначе archive не увидит файлы при --older-than 7d
+```
+
+#### Напрямую в хранилище
+
+Шлюза нет; клиент сам ходит в S3 и снимает свой слой при `download`. Если окружение хранилища уже экспортировано выше, блок `export` можно пропустить.
+
+```bash
+export S3VAULT_S3_ENDPOINT=http://127.0.0.1:9000
+export S3VAULT_S3_REGION=us-east-1
+export S3VAULT_S3_BUCKET=s3vault
+export S3VAULT_S3_ACCESS_KEY=s3vault
+export S3VAULT_S3_SECRET_KEY=s3vaulttest
+export S3VAULT_S3_PATH_STYLE=true
+export S3VAULT_ENCRYPTION_MODE=none        # или native/command, см. «Шифрование»
+
+s3vault archive "$D/logs" --older-than 7d --prefix demo --dry-run
+s3vault archive "$D/logs" --older-than 7d --prefix demo
+s3vault download demo/notes.txt "$D/back.txt"
+cmp "$D/logs/notes.txt" "$D/back.txt" && echo ok
+```
+
+#### Через шлюз
+
+Клиент указывает `s3.endpoint` на фасад и использует frontend-ключи шлюза (static) либо `access_key_id`/`secret_key` пользователя PostgreSQL:
+
+```bash
+export S3VAULT_S3_ENDPOINT=http://127.0.0.1:8333
+export S3VAULT_S3_BUCKET=s3vault
+export S3VAULT_S3_ACCESS_KEY=vaultak        # или access_key_id пользователя БД
+export S3VAULT_S3_SECRET_KEY=vaultsk        # или secret_key пользователя БД
+export S3VAULT_S3_PATH_STYLE=true
+export S3VAULT_ENCRYPTION_MODE=none         # слой шлюза добавляется отдельно
+
+s3vault archive "$D/logs" --older-than 7d --prefix demo
+s3vault download demo/notes.txt "$D/back-via-gw.txt"
+```
+
+Шлюз обязан быть и на пути чтения: `download` снимает слой клиента, шлюз — свой. Если читать объект напрямую из хранилища, останется слой шлюза; если читать через фасад сторонним S3-клиентом, останется клиентский слой. Подробнее — «Режимы работы» и «Сквозной сценарий» ниже.
+
+## Сквозной сценарий: шлюз + архив
 
 Сквозной сценарий целиком: файлы → клиент → шлюз → хранилище и обратно. Команды копируются как есть; порты по умолчанию — `8080` (`/health`, `/ready`), `8333` (S3-фасад), `9090` (метрики). Термины ниже — **хранилище**, **клиент**, **шлюз**, см. «Режимы работы».
 
@@ -103,6 +279,8 @@ s3vault server --s3-listen 127.0.0.1:8333
 | креды хранилища | `S3VAULT_S3_ACCESS_KEY` / `S3VAULT_S3_SECRET_KEY` у шлюза | MinIO: `s3vault` / `s3vaulttest` |
 | фронтенд шлюза | `S3VAULT_SERVER_S3_ACCESS_KEY` / `S3VAULT_SERVER_S3_SECRET_KEY` | свои; ими шлюз проверяет входящий SigV4 |
 | креды клиента | `S3VAULT_S3_ACCESS_KEY` / `S3VAULT_S3_SECRET_KEY` у клиента | копия фронтенд-пары шлюза: `vaultak` / `vaultsk` |
+
+В `server.auth.backend=postgres` фронтенд-пары нет: её место занимают пользователи БД, а `S3VAULT_SERVER_S3_*` должны оставаться пустыми.
 
 Правило: `S3VAULT_S3_*` — это всегда «кем я являюсь для своего хранилища», а `S3VAULT_SERVER_S3_*` — «кем я пускаю к себе». Проверить, что пары разные, нечем, и задать их одинаковыми можно — тогда шлюз держит и ключи от себя, и ключи, которыми ходит в хранилище. В шагах 4 и 5 клиент намеренно меняет `S3VAULT_S3_*` на креды MinIO: то же место конфигурации, другой адресат.
 
@@ -226,7 +404,7 @@ rm -rf "$D"
 
 Шлюз отдаёт наружу **один** фронтенд — **S3-фасад** (SigV4, для `aws-cli` и SDK). Обычный HTTP-слушатель несёт только `/health` и `/ready`. Bearer-фронтенд `HTTP /files` и режим `remote.url` удалены: и шлюз, и его клиенты говорят на одном протоколе — S3.
 
-Ровно так же расходятся и ключи: `S3VAULT_SERVER_S3_*` — фронтенд самого шлюза, те, кто входит в него; `S3VAULT_S3_*` — пара, которой шлюз сам представляется своему хранилищу (фронтенд-ключи следующего шлюза, если хранилище — шлюз, иначе креды S3). Это разные пары, задать их одинаковыми не мешает ничего, но тогда шлюз держит и ключи от себя, и ключи в хранилище. Наглядная разбивка — в «Быстрый старте», назначение полей по ролям — в [architecture.md](architecture.md#which-config-keys-each-role-reads).
+Ровно так же расходятся и ключи: `S3VAULT_SERVER_S3_*` — фронтенд самого шлюза, те, кто входит в него; `S3VAULT_S3_*` — пара, которой шлюз сам представляется своему хранилищу (фронтенд-ключи следующего шлюза, если хранилище — шлюз, иначе креды S3). Это разные пары, задать их одинаковыми не мешает ничего, но тогда шлюз держит и ключи от себя, и ключи в хранилище. Наглядная разбивка — в «Сквозном сценарии», назначение полей по ролям — в [architecture.md](architecture.md#which-config-keys-each-role-reads).
 
 ```text
 исходные файлы на диске
@@ -357,7 +535,14 @@ s3vault server --s3-listen 127.0.0.1:8333
 | `S3VAULT_ENCRYPTION_MODE` | `none`, `native`, `command` |
 | `S3VAULT_LOG_LEVEL` | `debug`, `info`, `warn`, `error` |
 | `S3VAULT_CACHE_ENABLED` | `true` — persistent plaintext disk cache for HTTP/S3 (default `false`) |
-| `S3VAULT_SERVER_S3_ACCESS_KEY` | Frontend SigV4 access key (обязателен вместе с secret) |
+| `S3VAULT_SERVER_AUTH_BACKEND` | `static` (по умолчанию) или `postgres` |
+| `S3VAULT_SERVER_AUTH_DSN` | PostgreSQL DSN для `backend=postgres` |
+| `S3VAULT_SERVER_AUTH_MAX_CONNS` | Размер пула pgx (default `8`) |
+| `S3VAULT_SERVER_AUTH_QUERY_TIMEOUT` | Таймаут одного auth-запроса (default `2s`) |
+| `S3VAULT_SERVER_AUTH_TARGET_POOL_MAX` | Максимум `ObjectStore` для целей пользователей (default `64`) |
+| `S3VAULT_SERVER_AUTH_TARGET_POOL_IDLE` | Простой цели до вытеснения из пула (default `15m`) |
+| `S3VAULT_SERVER_AUTH_MASTER_KEY` | Base64 ровно 32 байта; ключ AES-256-GCM для secret в БД. Env-only |
+| `S3VAULT_SERVER_S3_ACCESS_KEY` | Frontend SigV4 access key (обязателен вместе с secret в `static`) |
 | `S3VAULT_SERVER_S3_SECRET_KEY` | Frontend SigV4 secret |
 | `S3VAULT_SERVER_S3_LISTEN` | Отдельный bind для S3; пусто = multiplex на `server.listen` |
 | `S3VAULT_SERVER_S3_BUCKET` | Virtual bucket name (default = `s3.bucket`) |
@@ -394,15 +579,15 @@ s3vault download backups/app.log /tmp/app.log
 
 Как и для остальных настроек, приоритет прежний: флаги > `S3VAULT_*` > YAML > умолчания, так что `S3VAULT_BACKEND_TYPE=local` переопределяет `backend.type: s3` из файла.
 
-При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. Бэкенд хранит байты ровно как их отдали, поэтому при одном и том же `encryption.mode` формат объекта совпадает с S3, и шифрование, dedup по SHA-256, `download` и S3 SigV4-фасад работают одинаково на обоих. Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`).
+При `type: local` секция `s3:` не нужна (кроме `s3.prefix`, если хотите общий префикс ключей), а ключи объектов становятся путями внутри `dir`: `backups/logs/app.log` → `/srv/s3vault/objects/backups/logs/app.log`. Бэкенд хранит байты ровно как их отдали, поэтому при одном и том же `encryption.mode` формат объекта совпадает с S3, и шифрование, dedup по SHA-256, `download` и S3 SigV4-фасад работают одинаково на обоих. Директория создаётся с правами `0700`, файлы объектов — `0600`, запись атомарна (temp-файл в `.s3vault-tmp/` + `rename`). Внутри `dir` живёт служебная `.s3vault-index/` — кэш sha256 и версии файла (`size`, `mtime`, `ctime`, inode) для `HEAD` (по умолчанию 8 шардов, `S3VAULT_BACKEND_LOCAL_INDEX_SHARDS`); она не является объектом, при отсутствии прогревается автоматически двумя горутинами, а обслуживается по одному шарду раз в 12 часов. `ctime` нельзя откатить из userspace, поэтому синхронизация, которая перезаписала файл с сохранением размера и `mtime` (`rsync -t`, `cp -p`, распаковка архива), всё равно сбрасывает запись и хеш пересчитывается.
 
 `encryption.mode: none` пишет **голый payload без заголовка `S3VCTR01`** — в каталоге (и в бакете) получаются обычные файлы. Это удобно, если содержимое должны читать/писать другие инструменты или человек, и верно на любом бэкенде, включая S3.
 
-Что из этого следует: без заголовка хранить `enc` некуда, но и не нужно — режим `none` по определению ничего не шифрует, поэтому payload всегда plaintext. Идентичность объекта едет в S3 user-metadata (`s3vault-sha256`, `s3vault-size`), а на локальном бэкенде выводится хешированием файла, поэтому dedup по SHA, `--delete-if-exists` и `x-amz-checksum-sha256` продолжают работать. `ETag` локального бэкенда остаётся синтетическим (размер + mtime) и используется только как fallback.
+Что из этого следует: без заголовка хранить `enc` некуда, но и не нужно — режим `none` по определению ничего не шифрует, поэтому payload всегда plaintext. Идентичность объекта едет в S3 user-metadata (`s3vault-sha256`, `s3vault-size`), а на локальном бэкенде выводится хешированием файла, поэтому dedup по SHA, `--delete-if-exists` и `x-amz-checksum-sha256` продолжают работать. Внутренний `ETag` локального store остаётся синтетическим (размер + mtime) и используется только как fallback; в ответах S3-фасада и `GET`, и `HEAD` отдают `ETag` = plaintext SHA-256.
 
 Единственное место, где объект без контейнера читается «на глаз», — `decryptLegacy`: без заголовка нет `enc`, и остаётся magic/type-детекция. Она проверяет обе магии шифротекста (`S3VLT01` и конверт OpenSSL `Salted__`) и при совпадении **отказывается**, а не копирует мусор. Ложное срабатывание возможно только на 8-байтовом префиксе: plaintext-файл, начинающийся с `Salted__`, будет отвергнут с внятной ошибкой.
 
-Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); ETag синтетический (размер + mtime) и служит только fallback, а идентичность содержимого — plaintext SHA-256 из заголовка `S3VCTR01`, а для объекта без контейнера — SHA-256 самого файла, вычисляемый один раз на объект и мемоизируемый в процессе.
+Особенности локального бэкенда: `ListObjectsV2` обходит всё дерево (стоимость линейна по числу объектов); ключ не может одновременно быть файлом и каталогом (в S3 допустимы и `a`, и `a/b`); внутренний ETag store синтетический (размер + mtime), но в ответах фасада `GET` и `HEAD` отдают plaintext SHA-256, а `List` берёт SHA-256 из индекса, если версия файла там есть, и иначе оставляет синтетический валидатор — листинг никогда не хеширует объекты. Идентичность содержимого — SHA-256 из заголовка `S3VCTR01`, а для объекта без контейнера — SHA-256 самого файла, вычисляемый один раз на версию файла и мемоизируемый в процессе и в `.s3vault-index/`.
 
 Смена бэкенда меняет namespace дискового кэша, поэтому записи S3 и локального хранилища в кэше не пересекаются.
 
@@ -713,14 +898,14 @@ go test -tags=integration -count=1 -v ./internal/integration/
 
 ## E2E-стенд
 
-`make e2e` поднимает MinIO из `compose.e2e.yaml` (бакет создаётся через `minio-init`, сам код `CreateBucket` не вызывает) и прогоняет все фазы: `go test -race ./...`, integration-тесты, CLI (archive/upload/download, перезапись по ключу, delete-политики, симлинки), все режимы шифрования, HTTP-сервер (health/ready, Range, метрики, кэш), SigV4-фасад (включая multipart: клиент s3vault грузит 12 МиБ через фасад при заданной части в 5 МиБ и сверяет, что частей ровно три; отдельно проверяет дефолт — 4 МиБ-1 уходят одним `PutObject` без частей, 12 МиБ режутся на три, 32 МиБ на семь; плюс roundtrip побайтово, сверка sha256 multipart- и single-PUT-пути между собой и с прямым MinIO, проверка что `206` не объявляет чек-сумму всего объекта, настоящий `aws s3 cp` на 12 МиБ и пустой спул), локальный бэкенд и отказы.
+`make e2e` поднимает MinIO из `compose.e2e.yaml` (бакет создаётся через `minio-init`, сам код `CreateBucket` не вызывает) и прогоняет все фазы: `go test -race ./...`, integration-тесты, CLI (archive/upload/download, перезапись по ключу, delete-политики, симлинки), все режимы шифрования, HTTP-сервер (health/ready, Range, метрики, кэш), SigV4-фасад (включая multipart: клиент s3vault грузит 12 МиБ через фасад при заданной части в 5 МиБ и сверяет, что частей ровно три; отдельно проверяет дефолт — 4 МиБ-1 уходят одним `PutObject` без частей, 12 МиБ режутся на три, 32 МиБ на семь; плюс roundtrip побайтово, сверка sha256 multipart- и single-PUT-пути между собой и с прямым MinIO, проверка что `206` не объявляет чек-сумму всего объекта, настоящий `aws s3 cp` на 12 МиБ и пустой спул), локальный бэкенд, индекс дайджестов (warm/cold `List`, `ETag` `GET`=`HEAD`, внешняя перезапись с сохранением `mtime`) и отказы.
 
 ```bash
 make e2e            # всё
 make e2e-up         # только MinIO
 make e2e-down       # снести стенд
 make e2e-clean      # снести стенд и рабочий каталог
-./scripts/e2e.sh server   # одна фаза: go|cli|encrypt|server|facade|local|resilience
+./scripts/e2e.sh index    # одна фаза: go|cli|encrypt|server|facade|postgres|local|index|resilience
 ```
 
 Стенды детектора шифрования живут отдельно от `e2e.sh` (они проверяют не
@@ -762,7 +947,7 @@ S3VAULT_E2E_NO_COMPOSE=1 ./scripts/e2e.sh all
 
 Здесь `s3vault server` — это **шлюз** (см. «Режимы работы»): своего хранилища у него нет, он стоит перед хранилищем и сам ходит в него как клиент. Слушает `127.0.0.1:8080` по умолчанию. Единственный фронтенд данных — **S3-совместимый API** (SigV4, path-style): Get/Put/Delete/List через `Fetch`/`Archive` (и кэш, если включён). Список — только ListObjectsV2; запрос v1 (`list-type` ≠ 2 или `marker` без `list-type`) отклоняется с `501 NotImplemented`. Обычный HTTP-слушатель отдаёт только `/health` и `/ready`.
 
-S3-фасад **обязателен**: без пары `server.s3_access_key` / `server.s3_secret_key` процесс не стартует. Bearer-токен `server.token` и маршруты `HTTP /files` удалены — шлюз говорит с клиентами только по S3.
+S3-фасад **обязателен**: нужен либо `server.auth.backend=postgres` с DSN, либо пара `server.s3_access_key` / `server.s3_secret_key`. Bearer-токен `server.token` и маршруты `HTTP /files` удалены — шлюз говорит с клиентами только по S3.
 
 ```bash
 export S3VAULT_SERVER_S3_ACCESS_KEY=vaultak
@@ -778,11 +963,135 @@ aws --endpoint-url http://127.0.0.1:8080 s3 cp ./file s3://my-bucket/logs/file -
 
 ### Доступ извне
 
-Любой bind — и loopback, и внешний — требует ключей `server.s3_access_key` / `server.s3_secret_key` (env `S3VAULT_SERVER_S3_ACCESS_KEY` / `S3VAULT_SERVER_S3_SECRET_KEY`): это единственный фронтенд и единственный способ аутентификации. Без них старт падает с `S3 API credentials required`. Если внешний доступ не нужен, всё равно задайте пару ключей и ходите через reverse proxy / SSH-туннель. Если задан `server.s3_listen` (или `--s3-listen`) без ключей — старт тоже падает.
+Любой bind — и loopback, и внешний — требует одного источника identity: либо пары `server.s3_access_key` / `server.s3_secret_key` (env `S3VAULT_SERVER_S3_ACCESS_KEY` / `S3VAULT_SERVER_S3_SECRET_KEY`), либо `server.auth.backend=postgres` с DSN. Смешивать их нельзя: в `postgres`-режиме статические ключи должны быть пустыми, иначе старт падает. Если внешний доступ не нужен, всё равно задайте static-пару или Postgres и ходите через reverse proxy / SSH-туннель. Если задан `server.s3_listen` (или `--s3-listen`) без источника identity — старт падает.
 
 ### S3 API (aws-cli / SDK)
 
 Ключи `S3VAULT_SERVER_S3_*` — **frontend** (SigV4 к vault), не путать с `S3VAULT_S3_*` к backend storage. Virtual bucket: `server.s3_bucket` (по умолчанию = `s3.bucket`, а при локальном бэкенде без него — `s3vault`). При `server.s3_bucket_as_prefix` / `S3VAULT_SERVER_S3_BUCKET_AS_PREFIX=true` любое имя bucket в path-style URL допускается и становится префиксом ключа в backend (`s3://reports/a.log` → `{s3.prefix}/reports/a.log` в `s3.bucket`). Head/Get/Put отдают `x-amz-checksum-sha256` (base64 plaintext SHA-256) — но **только на целый объект**. Диапазонный GET (`206`) заголовка не несёт: он описывает байты в теле, а в `206` это диапазон. S3 отвечает на диапазон чек-суммой самого диапазона, считать её на каждый ranged-чтение слишком дорого, поэтому заголовок просто не отдаётся. Это не косметика: `aws s3 cp` качает крупные объекты диапазонами и проверяет чек-сумму, так что ложное значение роняет всю передачу. CreateBucket и virtual-host addressing в v1 нет.
+
+### Пользователи gateway в PostgreSQL
+
+Вместо одной статической пары шлюз может брать S3-креды из PostgreSQL. Каждому пользователю задаются прозрачный префикс и, опционально, ссылки на общий профиль шифрования слоя шлюза и общую цель S3.
+
+```bash
+export S3VAULT_SERVER_AUTH_BACKEND=postgres
+export S3VAULT_SERVER_AUTH_DSN='postgres://s3vault@127.0.0.1:5432/s3vault?sslmode=disable'
+export S3VAULT_SERVER_AUTH_MASTER_KEY="$(head -c 32 /dev/urandom | base64)"
+# server.s3_access_key / server.s3_secret_key в этом режиме должны быть пустыми
+```
+
+Схема создаётся автоматически при старте `server` и команд `user`/`target`/`profile`. Профили шифрования и цели — **общие сущности**: создаются один раз и назначаются пользователям по имени.
+
+```bash
+# общий профиль шифрования
+s3vault profile add --name shared-native --file native.json
+s3vault profile list
+
+# общая цель
+s3vault target add --name archive-a --profile target.json
+s3vault target list
+
+s3vault user add --name alice --prefix tenant-a \
+    --encryption-profile shared-native --s3-target archive-a
+# access_key_id=... secret_key=... — секрет показывается один раз
+s3vault user add --name bob --prefix tenant-b \
+    --encryption-profile shared-native --s3-target archive-a
+s3vault user list
+s3vault user rotate --access-key S3V...
+s3vault user disable --access-key S3V...
+s3vault user enable --access-key S3V...
+s3vault user update --access-key S3V... --prefix tenant-d --force
+s3vault user update --access-key S3V... --s3-target other-target --force
+s3vault user update --access-key S3V... --clear-s3-target --force
+
+# изменение сущности действует на всех привязанных пользователей
+s3vault target update --name archive-a --profile target2.json --force
+s3vault profile update --name shared-native --file native2.json --force
+
+# удалить можно только несвязанную сущность
+s3vault target remove --name archive-a
+s3vault profile remove --name shared-native
+```
+
+Префикс **прозрачный**: клиент делает `s3://bucket/report.pdf`, шлюз пишет `s3.prefix/tenant-a/report.pdf`, а `ListObjectsV2` возвращает `report.pdf`. Префиксы обязательны, уникальны и не должны пересекаться (`a` и `a/b` — ошибка). `server.s3_bucket_as_prefix` в Postgres-режиме запрещён.
+
+Профиль шифрования — строка `s3vault_encryption_profiles`; отсутствие ссылки означает глобальный `encryption` шлюза:
+
+```json
+{
+  "mode": "native",
+  "native": {
+    "wrap": "keyfile",
+    "key_file": "/etc/s3vault/users/alice/kek.bin",
+    "chunk_size": 65536
+  }
+}
+```
+
+`mode=none|native|command` обязателен. Для `native` нужен `private_key_path` (`rsa-oaep`) или `key_file`; для `command` — `encrypt`, `decrypt` argv и `thumbprint`. Пути к ключам — абсолютные. Один профиль можно назначить нескольким пользователям; изменение профиля действует на всех. При чтении объект выбирается по `enc` из `S3VCTR01`: сначала профиль пользователя, затем глобальный профиль шлюза, но только если алгоритм отличается. Одинаковый алгоритм с другими ключами fallback-ом не покрывается.
+
+Клиенты `archive`/`upload`/`download` не знают о БД: они указывают `s3.endpoint` на фасад и используют выданные `access_key_id`/`secret_key`. Перешифровки существующих объектов и ротации мастер-ключа нет: смена профиля может сделать старые объекты нечитаемыми.
+
+#### Конечный S3 пользователя
+
+Опционально пользователь БД может работать с собственным S3-хранилищем. Клиент этого не видит: у него по-прежнему один виртуальный bucket и относительные ключи. Цель задаётся полным профилем при `user add`/`user update`:
+
+```json
+{
+  "endpoint": "https://s3.example.com",
+  "region": "us-east-1",
+  "bucket": "alice-archive",
+  "prefix": "vault",
+  "path_style": true,
+  "access_key": "AKIA...",
+  "secret_key": "...",
+  "session_token": "",
+  "storage_class": "STANDARD_IA",
+  "sse_kms": {
+    "key_id": "arn:aws:kms:us-east-1:123456789012:key/abc",
+    "context": {"tenant": "alice"},
+    "bucket_key": true
+  }
+}
+```
+
+```bash
+chmod 600 alice-target.json
+s3vault target add --name archive-a --profile alice-target.json
+# одна цель назначается нескольким пользователям
+s3vault user add --name alice --prefix tenant-a --s3-target archive-a
+s3vault user add --name alice2 --prefix tenant-a2 --s3-target archive-a
+s3vault user update --access-key S3V... --s3-target archive-b --force
+s3vault user update --access-key S3V... --clear-s3-target --force
+s3vault target list         # имя, bucket/endpoint, prefix, SSE/класс, users
+s3vault target list --output json
+```
+
+- **Общая сущность, а не копия.** `s3vault_targets` хранит цель один раз; пользователь ссылается на неё через `s3_target_uid`. `target update` меняет цель у всех привязанных, `user update --s3-target` меняет ссылку у одного. Секрет цели хранится в строке цели, AAD — `s3.secret_key:<target_uid>`/`s3.session_token:<target_uid>`; переименование цели не требует перешифровки.
+- **Полная замена, без слияния.** Непустая цель задаёт endpoint, region, bucket, prefix, path-style и креды целиком. Глобальные `s3.*` креды и `s3.prefix` для такого пользователя не применяются: иначе отсутствующий `secret_key` молча отправил бы чужие креды на чужой endpoint. Отсутствующие обязательные поля — ошибка, а не «взять глобальное».
+- **SSE-KMS и класс хранения — необязательные write-side параметры цели.** `sse_kms` (в том числе `{}` = ключ KMS по умолчанию) включает `ServerSideEncryption: aws:kms` на `PutObject` и `CreateMultipartUpload`; можно задать `key_id`, `context` и `bucket_key`. Если `sse_kms` нет, шлюз не отправляет SSE-заголовки и конечный S3 применяет свои настройки. `storage_class` уходит как `x-amz-storage-class` **как есть**: список AWS не ограничивает значение, поэтому можно передать `ICE`, `COLD`, `COLDLINE` и другие классы совместимого провайдера (1..64 байта, без пробелов и управляющих символов); пустое значение означает «не передавать». Совместимость значения с конечным S3 — на операторе; AWS `GLACIER`/`DEEP_ARCHIVE` требуют restore перед GET.
+- **Отображение ключей:** `target.prefix / user.prefix / client_key`. При `NULL` — как раньше: `s3.prefix / user.prefix / client_key`. Клиент видит только свой ключ; `ListObjectsV2` срезает оба префикса.
+- **Пул store'ов.** В `postgres`-режиме шлюз держит ограниченный пул `ObjectStore` по отпечатку цели (`server.auth.target_pool_max`, `target_pool_idle`), а не создаёт store на каждый запрос. Сам store строится при первом запросе пользователя с этой целью; сетевых проверок на старте нет.
+- **Смена и сброс цели объекты не переносят.** Старые ключи остаются в старом хранилище и через шлюз больше не адресуются; `Delete`/`Put` действуют только на текущую цель. Вернуть доступ можно, только вернув прежнюю цель. `--force` — единственная защита.
+- **Секреты цели** (`secret_key`, `session_token`) шифруются тем же мастер-ключом AES-256-GCM в строке `s3vault_targets` и не попадают в `config jsonb`, `target list`/`user list`, логи и argv. `access_key` цели — не секрет, но в JSON-выводе не показывается. Файл `--profile` содержит секрет: права `0600` — ответственность оператора; `-` читает stdin.
+- **Удаление ограничено ссылками.** `target remove`/`profile remove` отказывают, пока сущность назначена пользователям (`ON DELETE RESTRICT`). Сначала `user update --clear-s3-target`/`--clear-encryption`.
+- **Отказы.** Ошибка/невалидность цели в реестре — `500` (испорченная строка), недоступность БД — `503`, ошибка целевого S3 (сеть, чужие 403) — `500`, а не `403`. `/ready` цели не проверяет: отказ одного бэкенда не выводит из ротации весь шлюз.
+- **Ограничения:** одна цель на пользователя, без выбора цели клиентом; `http://` отключает TLS до неё; своего CA/прокси/assume-role нет; временный `session_token` (STS) обновляется оператором вручную; `s3.multipart_part_size` остаётся глобальным.
+
+### Чтение: HEAD, range и спул запросов
+
+- **HEAD отвечает по метаданным.** `HeadObject` не скачивает тело: длина, ETag (plaintext SHA-256) и checksum берутся из заголовка `S3VCTR01` (HEAD + 128-байтный range). Раньше HEAD материализовал объект целиком — на 10 ГиБ это были 10 ГиБ трафика и расшифровки на каждый HEAD.
+- **Range не скачивает объект целиком.** `Fetch.Open` отдаёт `ServeContent` ленивый seekable-ридер: для `mode=none` plaintext-диапазон смещается на 128 байт контейнера, для `native` читаются и расшифровываются только нужные чанки (`stride = 4 + chunk + 16`, у каждого чанка свой nonce). Окно — 256 КиБ; `If-Range`/`If-None-Match` и 206 остаются на stdlib. Для `mode=command` (CryptoPro) случайного доступа нет — такие объекты по-прежнему материализуются в файл.
+- **Холодное чтение — один `Get`.** Идентичность берётся из заголовка того же потока, поэтому исчезли предварительные `HEAD` + 128-байтный range. Параллельные холодные GET одного ключа при выключенном кэше схлопываются в одну загрузку и один файл (refcount), последний читатель его удаляет.
+- **Изменение поведения:** на потоковом пути битый объект обнаруживается уже после отправки `200` — клиент видит оборванное тело и проваливает проверку ETag/checksum. С включённым кэшем и на fallback-путях поведение прежнее (чистая ошибка до ответа).
+
+| ключ | env | по умолчанию | что делает |
+| --- | --- | --- | --- |
+| `server.spool_dir` | `S3VAULT_SERVER_SPOOL_DIR` | `{cache.dir}-spool` | каталог request-спула: тело `PutObject` на время хэширования и plaintext для не-seekable чтений; `0700`, файлы `0600` |
+| `server.spool_ttl` | `S3VAULT_SERVER_SPOOL_TTL` | `1h` | возраст осиротевшего файла спула, после которого его удаляет сборщик фасада |
+| `server.put_max_bytes` | `S3VAULT_SERVER_PUT_MAX_BYTES` | `5368709120` (5 ГиБ) | лимит тела одного `PutObject`/`UploadPart`; превышение — `413 EntityTooLarge` |
+
+Каталог спула не пересекается с `cache.dir`, `server.multipart_dir` и `backend.local.dir` — пересечение отвергается на старте, как и у multipart.
 
 ### Multipart на фасаде
 
@@ -842,4 +1151,4 @@ CI настроен и живёт в `.github/workflows/`, всё на push/PR �
 
 
 ## Roadmap
-* +N конечных S3 бекендов (грузить )
+* Несколько `s3_target` на пользователя и выбор цели клиентом; сейчас у пользователя одна цель, но один и тот же профиль можно назначить нескольким пользователям.

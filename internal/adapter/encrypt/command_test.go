@@ -3,8 +3,6 @@ package encrypt
 import (
 	"bytes"
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,29 +11,22 @@ import (
 	"github.com/xMlex/s3vault/internal/config"
 )
 
-// writeThumbprintScript installs a script that echoes $CRYPTOPRO_THUMBPRINT.
-// The file is written to a temp name and renamed so the path handed to execve
-// is never still open for writing — otherwise a parallel test can hit ETXTBSY.
-func writeThumbprintScript(t *testing.T, dir string) string {
-	t.Helper()
-
-	script := filepath.Join(dir, "echo-tp.sh")
-	tmp := script + ".tmp"
-	require.NoError(t, os.WriteFile(tmp, []byte("#!/bin/sh\nprintf '%s' \"$CRYPTOPRO_THUMBPRINT\"\n"), 0o700)) //nolint:gosec // test fixture must be executable
-	require.NoError(t, os.Rename(tmp, script))
-
-	return script
+// thumbprintArgv runs a shell that prints CRYPTOPRO_THUMBPRINT. No executable
+// file is written: a freshly written script can hit ETXTBSY when a parallel
+// test forks while the file is still open for writing.
+func thumbprintArgv(extra ...string) []string {
+	argv := []string{"/bin/sh", "-c", `printf '%s' "$CRYPTOPRO_THUMBPRINT"`}
+	return append(argv, extra...)
 }
 
 func TestCommandDecryptUsesContextThumbprint(t *testing.T) {
 	t.Parallel()
-	script := writeThumbprintScript(t, t.TempDir())
 
 	cfgTP := "1111111111111111111111111111111111111111"
 	metaTP := "2222222222222222222222222222222222222222"
 	c, err := NewCommand(config.CommandEnc{
-		Encrypt:    []string{script},
-		Decrypt:    []string{script},
+		Encrypt:    thumbprintArgv(),
+		Decrypt:    thumbprintArgv(),
 		Thumbprint: cfgTP,
 	})
 	require.NoError(t, err)
@@ -51,12 +42,11 @@ func TestCommandDecryptUsesContextThumbprint(t *testing.T) {
 
 func TestCommandEncryptSetsConfigThumbprintEnv(t *testing.T) {
 	t.Parallel()
-	script := writeThumbprintScript(t, t.TempDir())
 
 	tp := "afa43c43975fbfc700f051fd62016e1571e7e025"
 	c, err := NewCommand(config.CommandEnc{
-		Encrypt: []string{script, tp},
-		Decrypt: []string{script},
+		Encrypt: thumbprintArgv(tp),
+		Decrypt: thumbprintArgv(),
 	})
 	require.NoError(t, err)
 	assert.Equal(t, tp, c.CryptoProThumbprint())

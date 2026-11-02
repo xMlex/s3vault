@@ -13,189 +13,20 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
 	"github.com/stretchr/testify/require"
+	sessions "github.com/xMlex/s3vault/internal/s3api/session"
 )
 
-// These are the white-box tests for the session registry. The black-box HTTP
-// suite (multipart_test.go, package s3api_test) proves the protocol; this one
-// reaches the state the protocol hides, so the sweeper's rules can be checked
-// against a clock the test controls instead of against real elapsed time.
-
-func newTestRegistry(t *testing.T) *mpRegistry {
+// newTestRegistry builds a registry in a temp spool for the tests below that
+// drive a session through the facade. The registry's own white-box tests live in
+// internal/s3api/session/registry_test.go, next to the package they inspect.
+func newTestRegistry(t *testing.T) *sessions.Registry {
 	t.Helper()
-	reg, err := newMPRegistry(MultipartConfig{Dir: t.TempDir()}, nil)
+	reg, err := sessions.New(MultipartConfig{Dir: t.TempDir()}, nil)
 	require.NoError(t, err)
 
 	return reg
-}
-
-func TestMPRegistryWipesStaleSpoolOnOpen(t *testing.T) {
-	t.Parallel()
-
-	dir := filepath.Join(t.TempDir(), "spool")
-	require.NoError(t, os.Mkdir(dir, 0o700))
-
-	leftover := filepath.Join(dir, "mput-from-a-previous-process")
-	require.NoError(t, os.MkdirAll(leftover, 0o700))
-	require.NoError(t, os.WriteFile(filepath.Join(leftover, "part-00001"), []byte("orphaned"), 0o600))
-
-	reg, err := newMPRegistry(MultipartConfig{Dir: dir}, nil)
-	require.NoError(t, err)
-
-	// A session belongs to the process that created it, so bytes left by another
-	// one are garbage. Wiping here is what keeps a restart from accumulating
-	// them forever.
-	require.NoDirExists(t, leftover)
-	assert.Equal(t, 0, reg.count())
-
-	info, err := os.Stat(dir)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(), "the spool root is 0700")
-}
-
-// The spool root is created 0700 when it does not exist; an existing directory
-// keeps its mode, exactly as backend.local.dir does. Session directories and part
-// files stay 0700/0600 regardless.
-func TestMPRegistryCreatesSpoolRoot0700(t *testing.T) {
-	t.Parallel()
-
-	dir := filepath.Join(t.TempDir(), "new-spool")
-	_, err := newMPRegistry(MultipartConfig{Dir: dir}, nil)
-	require.NoError(t, err)
-
-	info, err := os.Stat(dir)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm())
-}
-
-// The spool root is a directory the operator points at, so the startup wipe must
-// reach only session directories this facade creates. Removing the whole root
-// erased whatever else lived there: a spool inside backend.local.dir took the
-// objects with it, and nothing else in that directory had a say.
-func TestMPRegistryLeavesUnrelatedEntriesAlone(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	stale := filepath.Join(dir, "mput-from-a-previous-process")
-	require.NoError(t, os.MkdirAll(stale, 0o700))
-	require.NoError(t, os.WriteFile(filepath.Join(stale, "part-00001"), []byte("orphaned"), 0o600))
-
-	notOurs := filepath.Join(dir, "not-a-session")
-	require.NoError(t, os.MkdirAll(notOurs, 0o700))
-	require.NoError(t, os.WriteFile(filepath.Join(notOurs, "keep.txt"), []byte("keep"), 0o600))
-
-	notes := filepath.Join(dir, "notes.txt")
-	require.NoError(t, os.WriteFile(notes, []byte("operator data"), 0o600))
-
-	_, err := newMPRegistry(MultipartConfig{Dir: dir}, nil)
-	require.NoError(t, err)
-
-	require.NoDirExists(t, stale, "a session directory from a dead process is still garbage")
-	require.DirExists(t, notOurs, "a directory that is not a session must survive")
-	require.FileExists(t, filepath.Join(notOurs, "keep.txt"))
-	require.FileExists(t, notes)
-}
-
-func TestMPRegistryGetEnforcesOwnerAndKey(t *testing.T) {
-	t.Parallel()
-
-	reg := newTestRegistry(t)
-	s, err := reg.create("AKIAONE", "backups/a.bin")
-	require.NoError(t, err)
-
-	got, err := reg.get(s.uploadID, "AKIAONE", "backups/a.bin")
-	require.NoError(t, err)
-	assert.Same(t, s, got)
-
-	// A different principal, the same id: the id is a capability bound to its
-	// creator, so this must not resolve.
-	_, err = reg.get(s.uploadID, "AKIATWO", "backups/a.bin")
-	require.ErrorIs(t, err, errForeignUpload)
-
-	// The same principal, a different object: an upload id names one upload.
-	_, err = reg.get(s.uploadID, "AKIAONE", "backups/b.bin")
-	require.ErrorIs(t, err, errForeignUpload)
-
-	// The other way round, an unknown id is not "somebody else's".
-	_, err = reg.get("nope", "AKIAONE", "backups/a.bin")
-	require.ErrorIs(t, err, os.ErrNotExist)
-}
-
-func TestMPRegistryDropRemovesFiles(t *testing.T) {
-	t.Parallel()
-
-	reg := newTestRegistry(t)
-	s, err := reg.create("AKIAONE", "backups/a.bin")
-	require.NoError(t, err)
-
-	partPath := s.partPath(1)
-	require.NoError(t, os.WriteFile(partPath, []byte("x"), 0o600))
-
-	reg.drop(s)
-	assert.Equal(t, 0, reg.count())
-
-	_, err = os.Stat(s.dir)
-	require.ErrorIs(t, err, os.ErrNotExist)
-
-	// Dropping twice is not an error: Complete and a racing Abort can both get
-	// there, and the second one must not turn a success into a failure.
-	reg.drop(s)
-	assert.Equal(t, 0, reg.count())
-}
-
-func TestMPRegistrySweepExpiredAt(t *testing.T) {
-	t.Parallel()
-
-	const ttl = time.Hour
-
-	now := time.Now()
-
-	tests := []struct {
-		name        string
-		idle        []time.Duration // one per session, in creation order
-		maxSessions int
-		wantKept    int
-	}{
-		{name: "nothing is old enough", idle: []time.Duration{time.Minute, time.Minute}, maxSessions: 8, wantKept: 2},
-		{name: "the old one goes", idle: []time.Duration{2 * ttl, time.Minute}, maxSessions: 8, wantKept: 1},
-		{name: "all of them are old", idle: []time.Duration{2 * ttl, 3 * ttl}, maxSessions: 8, wantKept: 0},
-		{
-			// The limit protects spool space, so it evicts the least recently
-			// touched rather than an arbitrary one.
-			name: "over the session limit evicts the least recently used",
-			idle: []time.Duration{time.Hour, 30 * time.Minute, time.Minute}, maxSessions: 2, wantKept: 2,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			reg := newTestRegistry(t)
-
-			kept := make(map[string]struct{}, len(tc.idle))
-			for _, idle := range tc.idle {
-				s, err := reg.create("AKIA", "backups/a.bin")
-				require.NoError(t, err)
-				require.NoError(t, os.WriteFile(s.partPath(1), []byte("x"), 0o600))
-				s.touchedAt = now.Add(-idle)
-				kept[s.dir] = struct{}{}
-			}
-
-			swept := reg.sweepExpiredAt(ttl, tc.maxSessions, now)
-			assert.Equal(t, len(tc.idle)-tc.wantKept, swept)
-			assert.Equal(t, tc.wantKept, reg.count())
-
-			// Every session that stayed is intact, and every one that went took
-			// its files with it: this is the only thing that reclaims the disk.
-			dirs, err := os.ReadDir(reg.dir)
-			require.NoError(t, err)
-			require.Len(t, dirs, tc.wantKept)
-
-			for _, d := range dirs {
-				_, ok := kept[filepath.Join(reg.dir, d.Name())]
-				assert.True(t, ok, "unexpected directory %s: a leftover would be a disk leak", d.Name())
-			}
-		})
-	}
 }
 
 // The AWS SDK always serialises a well-formed CompleteMultipartUpload document,
@@ -204,7 +35,7 @@ func TestMPRegistrySweepExpiredAt(t *testing.T) {
 // Assembly must check the bytes it actually reads, not only the sizes and ETags
 // resolveParts validated.
 //
-// resolveParts reads s.parts under the session lock and validates sizes and
+// resolveParts reads s.Parts under the session lock and validates sizes and
 // ETags there; assembleParts then opens those same paths *outside* that lock. A
 // concurrent UploadPart for the same number re-opens the path with O_TRUNC and
 // rewrites it, so the validated record and the bytes on disk can disagree — and
@@ -258,7 +89,7 @@ func TestAssemblePartsRejectsBytesThatNoLongerMatchThePart(t *testing.T) {
 				etag = md5hex(tc.onDisk)
 			}
 
-			_, size, sum, err := assembleParts(dir, []part{{path: path, size: tc.recSize, etag: `"` + etag + `"`}})
+			_, size, sum, err := assembleParts(dir, []sessions.Part{{Path: path, Size: tc.recSize, ETag: `"` + etag + `"`}})
 			if tc.name == "intact" {
 				require.NoError(t, err)
 				assert.Equal(t, int64(len(tc.onDisk)), size)
@@ -283,7 +114,7 @@ func TestAssemblePartsRemovesOutputOnRejection(t *testing.T) {
 	path := filepath.Join(dir, "part-00001")
 	require.NoError(t, os.WriteFile(path, []byte("0123456789"), 0o600))
 
-	_, _, _, err := assembleParts(dir, []part{{path: path, size: 999, etag: `"` + md5hex("0123456789") + `"`}})
+	_, _, _, err := assembleParts(dir, []sessions.Part{{Path: path, Size: 999, ETag: `"` + md5hex("0123456789") + `"`}})
 	require.Error(t, err)
 
 	entries, err := os.ReadDir(dir)
@@ -295,16 +126,16 @@ func TestAssemblePartsRemovesOutputOnRejection(t *testing.T) {
 // intact. S3 replaces a number atomically: the previously accepted bytes survive
 // a re-upload that never completes. spoolPart used to open partPath with
 // O_TRUNC, so the old part was destroyed before the replacement's first byte
-// arrived, and the error path then removed the file altogether while s.parts
+// arrived, and the error path then removed the file altogether while s.Parts
 // still pointed at it — ListParts advertised a part that Complete could only
 // fail on.
 func TestFailedUploadPartKeepsPreviouslyAcceptedPart(t *testing.T) {
 	t.Parallel()
 
 	reg := newTestRegistry(t)
-	api := &API{mp: reg}
+	api := &API{mpSess: reg}
 
-	s, err := reg.create("AKIA", "k")
+	s, err := reg.Create("AKIA", "k")
 	require.NoError(t, err)
 
 	const good = "0123456789"
@@ -321,22 +152,22 @@ func TestFailedUploadPartKeepsPreviouslyAcceptedPart(t *testing.T) {
 
 	// The accepted part is still on disk, byte for byte, and still the record
 	// Complete will get.
-	p, ok := s.parts[1]
+	p, ok := s.Parts[1]
 	require.True(t, ok, "an accepted part must stay in the session")
-	assert.Equal(t, etag, p.etag)
-	assert.Equal(t, int64(len(good)), p.size)
+	assert.Equal(t, etag, p.ETag)
+	assert.Equal(t, int64(len(good)), p.Size)
 
-	body, err := os.ReadFile(s.partPath(1))
+	body, err := os.ReadFile(s.PartPath(1))
 	require.NoError(t, err)
 	assert.Equal(t, good, string(body))
 
 	// Nothing half-written is left beside it.
-	entries, err := os.ReadDir(s.dir)
+	entries, err := os.ReadDir(s.Dir)
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "a failed retry must leave no temp file, the old part only")
 	assert.Equal(t, "part-00001", entries[0].Name())
 
-	_, size, sum, err := assembleParts(s.dir, []part{p})
+	_, size, sum, err := assembleParts(s.Dir, []sessions.Part{p})
 	require.NoError(t, err, "Complete must still be able to assemble the accepted part")
 	assert.Equal(t, int64(len(good)), size)
 	assert.Equal(t, sha256hex(good), sum)
@@ -349,9 +180,9 @@ func TestPartRejectedByBudgetKeepsPreviouslyAcceptedPart(t *testing.T) {
 	t.Parallel()
 
 	reg := newTestRegistry(t)
-	api := &API{mp: reg, mpMaxBytes: 10}
+	api := &API{mpSess: reg, mpMaxBytes: 10}
 
-	s, err := reg.create("AKIA", "k")
+	s, err := reg.Create("AKIA", "k")
 	require.NoError(t, err)
 
 	const good = "0123456789"
@@ -362,16 +193,16 @@ func TestPartRejectedByBudgetKeepsPreviouslyAcceptedPart(t *testing.T) {
 	_, err = api.spoolPart(s, 1, strings.NewReader(good+"more"))
 	require.Error(t, err, "the session budget must reject the larger replacement")
 
-	p, ok := s.parts[1]
+	p, ok := s.Parts[1]
 	require.True(t, ok)
-	assert.Equal(t, etag, p.etag)
-	assert.Equal(t, int64(len(good)), p.size)
+	assert.Equal(t, etag, p.ETag)
+	assert.Equal(t, int64(len(good)), p.Size)
 
-	body, err := os.ReadFile(s.partPath(1))
+	body, err := os.ReadFile(s.PartPath(1))
 	require.NoError(t, err)
 	assert.Equal(t, good, string(body))
 
-	assert.Equal(t, int64(len(good)), s.bytes, "a rejected part must not change the session's byte total")
+	assert.Equal(t, int64(len(good)), s.Bytes, "a rejected part must not change the session's byte total")
 }
 
 var errConnectionReset = errors.New("connection reset by peer")
@@ -393,9 +224,9 @@ func TestInFlightUploadPartPinsTheSession(t *testing.T) {
 	const ttl = 300 * time.Millisecond
 
 	reg := newTestRegistry(t)
-	api := &API{mp: reg, mpTTL: ttl}
+	api := &API{mpSess: reg, mpTTL: ttl}
 
-	s, err := reg.create("AKIA", "k")
+	s, err := reg.Create("AKIA", "k")
 	require.NoError(t, err)
 
 	// The client opens a session and then sits on it for longer than the TTL.
@@ -426,9 +257,12 @@ func TestInFlightUploadPartPinsTheSession(t *testing.T) {
 
 	<-entered
 
-	removed := reg.sweepExpiredAt(ttl, 64, time.Now())
+	removed := reg.SweepExpired(ttl, 64)
 	assert.Zero(t, removed, "an upload in progress is not an idle session")
-	assert.NotNil(t, reg.sessions[s.uploadID], "the session must survive its own in-flight part")
+
+	live, err := reg.Get(s.UploadID, "AKIA", "k")
+	require.NoError(t, err, "the session must survive its own in-flight part")
+	assert.Same(t, s, live)
 
 	close(release)
 	require.NoError(t, <-done)
@@ -436,8 +270,10 @@ func TestInFlightUploadPartPinsTheSession(t *testing.T) {
 	// The pin is not a way to keep a dead session alive: once the write lands and
 	// the client stops, the same sweep reclaims it.
 	time.Sleep(2 * ttl)
-	assert.Positive(t, reg.sweepExpiredAt(ttl, 64, time.Now()))
-	assert.Nil(t, reg.sessions[s.uploadID], "an idle session must still be reclaimable")
+	assert.Positive(t, reg.SweepExpired(ttl, 64))
+
+	_, err = reg.Get(s.UploadID, "AKIA", "k")
+	require.ErrorIs(t, err, os.ErrNotExist, "an idle session must still be reclaimable")
 }
 
 // readerFunc adapts a func to io.Reader.
@@ -509,24 +345,6 @@ func TestParseCompleteBodyIsBounded(t *testing.T) {
 		strings.Repeat("a", maxCompleteBody+1) + "</ETag></Part></CompleteMultipartUpload>"
 	_, err := parseCompleteBody(strings.NewReader(huge))
 	require.Error(t, err, "a document past the cap must fail rather than be read whole")
-}
-
-func TestMPRegistryUploadIDIsUnpredictable(t *testing.T) {
-	t.Parallel()
-
-	reg := newTestRegistry(t)
-	seen := make(map[string]struct{}, 128)
-
-	for range 128 {
-		s, err := reg.create("AKIA", "backups/a.bin")
-		require.NoError(t, err)
-		assert.Len(t, s.uploadID, 64, "256 bits of hex, like a real S3 upload id")
-		_, dup := seen[s.uploadID]
-		require.False(t, dup, "upload ids must not repeat")
-
-		seen[s.uploadID] = struct{}{}
-		reg.drop(s)
-	}
 }
 
 func md5hex(s string) string {

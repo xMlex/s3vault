@@ -673,6 +673,7 @@ func TestMultipartPerSessionByteLimit(t *testing.T) {
 		Body: bytes.NewReader(patternBytes(partSize)),
 	})
 	require.Error(t, err, "the second part would take the session over its budget")
+	assert.Equal(t, "EntityTooLarge", apiErrCode(t, err))
 
 	entries, err := f.sessionPartFiles()
 	require.NoError(t, err)

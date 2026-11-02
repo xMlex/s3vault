@@ -18,6 +18,7 @@ func requireS3API(s3API bool) error {
 	}
 
 	return fmt.Errorf("%w: set both server.s3_access_key and server.s3_secret_key "+
-		"(env S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY); "+
+		"(env S3VAULT_SERVER_S3_ACCESS_KEY / S3VAULT_SERVER_S3_SECRET_KEY), "+
+		"or configure server.auth.backend=postgres with server.auth.dsn; "+
 		"the gateway serves clients only over the S3 protocol", ErrS3CredsRequired)
 }

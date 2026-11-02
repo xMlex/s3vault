@@ -74,7 +74,8 @@ func NewCommand(cfg config.CommandEnc) (*Command, error) {
 	}, nil
 }
 
-func (c *Command) Name() string { return "command" }
+// Name is the object-format name written into S3VCTR01.
+func (c *Command) Name() string { return NameCommand }
 
 // Provider is the command encryptor name written into S3VCTR01.
 func (c *Command) Provider() string { return c.provider }
