@@ -33,6 +33,11 @@ const (
 	EntityTooLarge   Code = "EntityTooLarge"
 	MalformedXML     Code = "MalformedXML"
 	InvalidRequest   Code = "InvalidRequest"
+	// BadDigest and InvalidDigest are the checksum failures of a request body.
+	// Once a trailing checksum is decoded, a mismatch has to look like S3's
+	// answer (400, actionable code), not like a server fault.
+	BadDigest     Code = "BadDigest"
+	InvalidDigest Code = "InvalidDigest"
 	// ServiceUnavailable marks a temporary identity-backend failure (for
 	// example, PostgreSQL is unreachable). It must not be collapsed into
 	// AccessDenied: clients retry 503, they do not retry 403.
@@ -65,6 +70,8 @@ var messages = map[Code]string{
 	EntityTooLarge:        "Your proposed upload exceeds the maximum allowed object size.",
 	MalformedXML:          "The XML you provided was not well-formed or did not validate against our published schema.",
 	InvalidRequest:        "The request is not valid.",
+	BadDigest:             "The Content-MD5 or checksum value that you specified did not match what the server received.",
+	InvalidDigest:         "The Content-MD5 or checksum value that you specified is not valid.",
 	ServiceUnavailable:    "The service is temporarily unavailable. Please retry.",
 }
 
@@ -85,6 +92,8 @@ var status = map[Code]int{
 	EntityTooLarge:        http.StatusRequestEntityTooLarge,
 	MalformedXML:          http.StatusBadRequest,
 	InvalidRequest:        http.StatusBadRequest,
+	BadDigest:             http.StatusBadRequest,
+	InvalidDigest:         http.StatusBadRequest,
 	ServiceUnavailable:    http.StatusServiceUnavailable,
 }
 

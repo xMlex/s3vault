@@ -50,6 +50,10 @@ func mapAuthError(err error) (s3err.Code, string) {
 		return s3err.SignatureDoesNotMatch, "bad_signature"
 	case errors.Is(err, awsig.ErrAccessDenied), errors.Is(err, port.ErrAccessDenied):
 		return s3err.AccessDenied, "denied"
+	case errors.Is(err, errMissingTrailingChecksum), errors.Is(err, errUnsupportedTrailingChecksum):
+		// The signature is fine; the body framing cannot be decoded as asked.
+		// 403 would tell an honest client to check its credentials.
+		return s3err.InvalidRequest, "bad_trailer"
 	default:
 		return s3err.AccessDenied, "denied"
 	}

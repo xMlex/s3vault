@@ -197,7 +197,7 @@ func (a *API) handleUploadPart(w http.ResponseWriter, r *http.Request, vr *awsig
 		return
 	}
 
-	body, err := vr.Reader()
+	body, err := requestBody(r, vr)
 	if err != nil {
 		a.writeAuthError(w, r, port.S3OpUploadPart, err)
 		return
@@ -217,6 +217,10 @@ func (a *API) handleUploadPart(w http.ResponseWriter, r *http.Request, vr *awsig
 			s3err.WriteError(w, r, s3err.EntityTooLarge, "")
 		case errors.Is(err, errTooManyParts):
 			s3err.WriteError(w, r, s3err.InvalidRequest, err.Error())
+		case errors.Is(err, awsig.ErrBadDigest):
+			s3err.WriteError(w, r, s3err.BadDigest, "")
+		case errors.Is(err, awsig.ErrInvalidDigest):
+			s3err.WriteError(w, r, s3err.InvalidDigest, "")
 		default:
 			s3err.WriteError(w, r, s3err.InternalError, "")
 		}
@@ -440,7 +444,7 @@ func (a *API) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	body, err := vr.Reader()
+	body, err := requestBody(r, vr)
 	if err != nil {
 		a.writeAuthError(w, r, port.S3OpCompleteMultipartUpload, err)
 		return
@@ -449,7 +453,15 @@ func (a *API) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Reque
 	listed, err := parseCompleteBody(body)
 	if err != nil {
 		a.metric(op, "error")
-		s3err.WriteError(w, r, s3err.MalformedXML, "could not parse CompleteMultipartUpload: "+err.Error())
+
+		switch {
+		case errors.Is(err, awsig.ErrBadDigest):
+			s3err.WriteError(w, r, s3err.BadDigest, "")
+		case errors.Is(err, awsig.ErrInvalidDigest):
+			s3err.WriteError(w, r, s3err.InvalidDigest, "")
+		default:
+			s3err.WriteError(w, r, s3err.MalformedXML, "could not parse CompleteMultipartUpload: "+err.Error())
+		}
 
 		return
 	}

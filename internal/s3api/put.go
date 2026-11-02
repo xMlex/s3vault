@@ -42,7 +42,7 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 		return
 	}
 
-	body, err := vr.Reader()
+	body, err := requestBody(r, vr)
 	if err != nil {
 		a.writeAuthError(w, r, port.S3OpPut, err)
 		return
@@ -65,11 +65,16 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 			slog.String("err", err.Error()),
 		)
 
-		if bodyTooLarge(err) {
+		switch {
+		case bodyTooLarge(err):
 			s3err.WriteError(w, r, s3err.EntityTooLarge, "")
-			return
+		case errors.Is(err, awsig.ErrBadDigest):
+			s3err.WriteError(w, r, s3err.BadDigest, "")
+		case errors.Is(err, awsig.ErrInvalidDigest):
+			s3err.WriteError(w, r, s3err.InvalidDigest, "")
+		default:
+			s3err.WriteError(w, r, s3err.InternalError, "")
 		}
-		s3err.WriteError(w, r, s3err.InternalError, "")
 		return
 	}
 	defer func() { _ = os.Remove(tmp) }()
