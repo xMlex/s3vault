@@ -65,16 +65,8 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 			slog.String("err", err.Error()),
 		)
 
-		switch {
-		case bodyTooLarge(err):
-			s3err.WriteError(w, r, s3err.EntityTooLarge, "")
-		case errors.Is(err, awsig.ErrBadDigest):
-			s3err.WriteError(w, r, s3err.BadDigest, "")
-		case errors.Is(err, awsig.ErrInvalidDigest):
-			s3err.WriteError(w, r, s3err.InvalidDigest, "")
-		default:
-			s3err.WriteError(w, r, s3err.InternalError, "")
-		}
+		writePutBodyError(w, r, err)
+
 		return
 	}
 	defer func() { _ = os.Remove(tmp) }()
@@ -131,6 +123,22 @@ func (a *API) handlePut(w http.ResponseWriter, r *http.Request, vr *awsig.V4Veri
 		a.metric("put", "ok")
 	default:
 		a.metric("put", "error")
+		s3err.WriteError(w, r, s3err.InternalError, "")
+	}
+}
+
+// writePutBodyError maps a failed body read to S3's answer. A checksum mismatch
+// comes from the client's own trailing checksum, so it is a 400 BadDigest, not a
+// server fault; awsig verifies the trailer while decoding the aws-chunked body.
+func writePutBodyError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case bodyTooLarge(err):
+		s3err.WriteError(w, r, s3err.EntityTooLarge, "")
+	case errors.Is(err, awsig.ErrBadDigest):
+		s3err.WriteError(w, r, s3err.BadDigest, "")
+	case errors.Is(err, awsig.ErrInvalidDigest):
+		s3err.WriteError(w, r, s3err.InvalidDigest, "")
+	default:
 		s3err.WriteError(w, r, s3err.InternalError, "")
 	}
 }
