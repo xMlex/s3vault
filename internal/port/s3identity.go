@@ -78,6 +78,9 @@ type UserPolicy struct {
 	// Encryption is the user's full encryption profile as stored in the
 	// database. Nil or an empty mode means "use the gateway default".
 	Encryption json.RawMessage
+	// EncryptionKEK is a sealed native key opened by the identity backend. Nil
+	// means the profile resolves its key from key_file/key_env.
+	EncryptionKEK []byte
 	// Target is the user's destination storage. Nil means the gateway's
 	// global s3.* backend.
 	Target *S3Target

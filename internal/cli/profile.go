@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/xMlex/s3vault/internal/adapter/encrypt"
 	postgresauth "github.com/xMlex/s3vault/internal/adapter/s3auth/postgres"
 )
 
@@ -28,7 +31,7 @@ func newProfileCmd(state *runState) *cobra.Command {
 }
 
 func newProfileAddCmd(state *runState) *cobra.Command {
-	var name, file string
+	var name, file, nativeKeyEnv string
 
 	cmd := &cobra.Command{
 		Use:   "add",
@@ -44,13 +47,18 @@ func newProfileAddCmd(state *runState) *cobra.Command {
 				return errors.New("--file is required and must contain a non-empty mode")
 			}
 
+			kek, err := readProfileKEK(nativeKeyEnv, config)
+			if err != nil {
+				return err
+			}
+
 			id, err := openUserAuth(cmd.Context(), state.cfg)
 			if err != nil {
 				return err
 			}
 			defer id.Close()
 
-			p, err := id.AddEncryptionProfile(cmd.Context(), name, config)
+			p, err := id.AddEncryptionProfile(cmd.Context(), name, config, kek)
 			if err != nil {
 				return err
 			}
@@ -64,6 +72,8 @@ func newProfileAddCmd(state *runState) *cobra.Command {
 
 	cmd.Flags().StringVar(&name, "name", "", "profile name (required)")
 	cmd.Flags().StringVar(&file, "file", "", "JSON encryption profile file, or - for stdin (required)")
+	cmd.Flags().StringVar(&nativeKeyEnv, "native-key-env", "",
+		"seal a native KEK read from this environment variable into the database")
 	_ = cmd.MarkFlagRequired("name")
 	_ = cmd.MarkFlagRequired("file")
 
@@ -107,7 +117,7 @@ func newProfileListCmd(state *runState) *cobra.Command {
 }
 
 func newProfileUpdateCmd(state *runState) *cobra.Command {
-	var name, file, newName string
+	var name, file, newName, nativeKeyEnv string
 
 	var force bool
 
@@ -129,13 +139,18 @@ func newProfileUpdateCmd(state *runState) *cobra.Command {
 				return errors.New("--file is required and must contain a non-empty mode")
 			}
 
+			kek, err := readProfileKEK(nativeKeyEnv, config)
+			if err != nil {
+				return err
+			}
+
 			id, err := openUserAuth(cmd.Context(), state.cfg)
 			if err != nil {
 				return err
 			}
 			defer id.Close()
 
-			p, err := id.UpdateEncryptionProfile(cmd.Context(), name, config, newName)
+			p, err := id.UpdateEncryptionProfile(cmd.Context(), name, config, newName, kek)
 			if err != nil {
 				return err
 			}
@@ -150,6 +165,8 @@ func newProfileUpdateCmd(state *runState) *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "", "profile name (required)")
 	cmd.Flags().StringVar(&file, "file", "", "JSON encryption profile file, or - for stdin (required)")
 	cmd.Flags().StringVar(&newName, "new-name", "", "rename the profile")
+	cmd.Flags().StringVar(&nativeKeyEnv, "native-key-env", "",
+		"seal a native KEK read from this environment variable; omit to clear a previously sealed key")
 	cmd.Flags().BoolVar(&force, "force", false, "confirm a change that affects every assigned user")
 	_ = cmd.MarkFlagRequired("name")
 	_ = cmd.MarkFlagRequired("file")
@@ -230,4 +247,46 @@ func writeProfilesJSON(w io.Writer, profiles []postgresauth.EncryptionProfile) e
 	enc.SetIndent("", "  ")
 
 	return enc.Encode(out)
+}
+
+// readProfileKEK seals a KEK for a native/keyfile profile. The value comes from
+// the environment, never from argv, so it does not leak into shell history or
+// the process list.
+func readProfileKEK(envName string, config json.RawMessage) ([]byte, error) {
+	if envName == "" {
+		return nil, nil
+	}
+
+	var p struct {
+		Mode   string `json:"mode"`
+		Native struct {
+			Wrap    string `json:"wrap"`
+			KeyFile string `json:"key_file"`
+			KeyEnv  string `json:"key_env"`
+		} `json:"native"`
+	}
+
+	if err := json.Unmarshal(config, &p); err != nil {
+		return nil, fmt.Errorf("parse encryption profile: %w", err)
+	}
+
+	if !strings.EqualFold(strings.TrimSpace(p.Mode), "native") {
+		return nil, errors.New("--native-key-env requires mode=native")
+	}
+
+	wrap := strings.ToLower(strings.TrimSpace(p.Native.Wrap))
+	if wrap != "" && wrap != "keyfile" {
+		return nil, fmt.Errorf("--native-key-env requires native.wrap=keyfile, got %q", wrap)
+	}
+
+	if p.Native.KeyFile != "" || p.Native.KeyEnv != "" {
+		return nil, errors.New("--native-key-env is exclusive with native.key_file and native.key_env")
+	}
+
+	raw, ok := os.LookupEnv(envName)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("environment variable %s is not set", envName)
+	}
+
+	return encrypt.ParseKEKEnv(raw)
 }

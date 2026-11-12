@@ -8,13 +8,16 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/port"
@@ -95,10 +98,8 @@ func NewNative(cfg config.NativeEnc) (*Native, error) {
 		}
 	case WrapKeyfile:
 		n.wrap = wrapKEK
-		if cfg.KeyFile == "" {
-			return nil, fmt.Errorf("native keyfile wrap requires key_file")
-		}
-		kek, err := loadKEK(cfg.KeyFile)
+
+		kek, err := loadKEK(cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -468,16 +469,91 @@ func (n *Native) unwrapDEK(hdr headerV1) ([]byte, error) {
 	}
 }
 
-func loadKEK(path string) ([]byte, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read key file: %w", err)
+// loadKEK resolves the KEK for native keyfile wrap. Precedence:
+//
+//  1. a sealed key injected by the database-backed profile (cfg.Key);
+//  2. a readable key_file;
+//  3. the environment variable named by key_env, or DefaultNativeKeyEnv if unset.
+//
+// A key file that exists but cannot be read falls back to the env var: that is
+// what makes a read-only deployment work when the file was mounted only on an
+// older replica. The file still wins when it is readable, so existing
+// deployments keep the same key after the upgrade.
+func loadKEK(cfg config.NativeEnc) ([]byte, error) {
+	if len(cfg.Key) > 0 {
+		if len(cfg.Key) != dekSize {
+			return nil, fmt.Errorf("sealed native key must be %d bytes, got %d", dekSize, len(cfg.Key))
+		}
+
+		return append([]byte(nil), cfg.Key...), nil
 	}
+
+	var fileErr error
+
+	if cfg.KeyFile != "" {
+		b, err := os.ReadFile(cfg.KeyFile)
+		if err == nil {
+			return kekFromBytes(b), nil
+		}
+
+		fileErr = err
+	}
+
+	envName := cfg.KeyEnv
+	if envName == "" {
+		envName = config.DefaultNativeKeyEnv
+	}
+
+	if raw, ok := os.LookupEnv(envName); ok && strings.TrimSpace(raw) != "" {
+		return ParseKEKEnv(raw)
+	}
+
+	if fileErr != nil {
+		return nil, fmt.Errorf("read key file %s: %w; environment variable %s is not set",
+			cfg.KeyFile, fileErr, envName)
+	}
+
+	return nil, fmt.Errorf("native keyfile wrap requires key_file or environment variable %s", envName)
+}
+
+// kekFromBytes keeps the historical key_file contract: exactly 32 bytes are the
+// key; any other content is hashed to 32 bytes. That is how a file produced by
+// `openssl rand -hex 32` works without a decoder.
+func kekFromBytes(b []byte) []byte {
 	if len(b) == dekSize {
-		return b, nil
+		return b
 	}
+
 	sum := sha256.Sum256(b)
-	return sum[:], nil
+
+	return sum[:]
+}
+
+// ParseKEKEnv accepts the two common shell forms, `openssl rand -hex 32` and
+// `openssl rand -base64 32`, and nothing else: a wrong length must fail here
+// rather than silently hashing a typo into a different key.
+func ParseKEKEnv(raw string) ([]byte, error) {
+	s := strings.TrimSpace(raw)
+
+	if len(s) == hex.EncodedLen(dekSize) {
+		if b, err := hex.DecodeString(s); err == nil {
+			return b, nil
+		}
+	}
+
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil && len(b) == dekSize {
+			return b, nil
+		}
+	}
+
+	return nil, fmt.Errorf("native KEK environment variable must be %d bytes in base64 or %d hex characters",
+		dekSize, hex.EncodedLen(dekSize))
 }
 
 func loadRSAPublic(path string) (*rsa.PublicKey, error) {

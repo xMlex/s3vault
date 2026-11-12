@@ -1421,6 +1421,27 @@ phase_local() {
 		download "$PREFIX/loc/a.txt" "$WORK/local-enc.out"
 	assert_same_bytes "local native roundtrip" "$src/loc/a.txt" "$WORK/local-enc.out"
 
+	# KEK из env: файла нет, key_file указывает на несуществующий путь, поэтому
+	# должен сработать fallback на S3VAULT_ENCRYPTION_NATIVE_KEY_ENV.
+	local envstore="$WORK/store-env" envkey
+	rm -rf "$envstore"
+	envkey=$(base64 -w0 "$WORK/kek-local.bin")
+	out=$(vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$envstore" \
+		S3VAULT_ENCRYPTION_MODE=native S3VAULT_ENCRYPTION_NATIVE_WRAP=keyfile \
+		S3VAULT_ENCRYPTION_NATIVE_KEY_FILE="$WORK/missing-kek.bin" \
+		S3VAULT_ENCRYPTION_NATIVE_KEY_ENV=S3VAULT_E2E_NATIVE_KEK \
+		S3VAULT_E2E_NATIVE_KEK="$envkey" \
+		upload "$src/loc/a.txt" --key loc/a.txt --output json 2>/dev/null)
+	assert_eq "local native env KEK: uploaded=1" "$(stat_field "$out" uploaded)" "1"
+
+	vault "${base[@]}" S3VAULT_BACKEND_LOCAL_DIR="$envstore" \
+		S3VAULT_ENCRYPTION_MODE=native S3VAULT_ENCRYPTION_NATIVE_WRAP=keyfile \
+		S3VAULT_ENCRYPTION_NATIVE_KEY_FILE="$WORK/missing-kek.bin" \
+		S3VAULT_ENCRYPTION_NATIVE_KEY_ENV=S3VAULT_E2E_NATIVE_KEK \
+		S3VAULT_E2E_NATIVE_KEK="$envkey" \
+		download "$PREFIX/loc/a.txt" "$WORK/local-env.out"
+	assert_same_bytes "local native env KEK roundtrip" "$src/loc/a.txt" "$WORK/local-env.out"
+
 	# Устаревший backend.local.layout отвергается на старте: viper молча игнорирует
 	# неизвестные ключи, и оператор получил бы не ту форму объекта, чем просил.
 	rc=0

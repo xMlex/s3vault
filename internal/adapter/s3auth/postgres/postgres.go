@@ -50,7 +50,7 @@ type Config struct {
 	MasterKey          []byte
 	Bucket             string
 	Logger             *slog.Logger
-	ValidateEncryption func(json.RawMessage) error
+	ValidateEncryption func(json.RawMessage, []byte) error
 	// SkipValidation disables the startup pass over existing rows. The server
 	// must leave it false; admin commands use it so one corrupt user, profile or
 	// target cannot lock the operator out of listing or removing it.
@@ -64,7 +64,7 @@ type Identity struct {
 	timeout     time.Duration
 	masterKey   []byte
 	log         *slog.Logger
-	validateEnc func(json.RawMessage) error
+	validateEnc func(json.RawMessage, []byte) error
 }
 
 // Open connects, migrates, and validates every existing user. Any failure is
@@ -296,7 +296,8 @@ func (i *Identity) validateAll(ctx context.Context) error {
 
 func (i *Identity) validateProfiles(ctx context.Context, conn *pgxpool.Conn) error {
 	rows, err := conn.Query(ctx,
-		`SELECT name, config FROM s3vault_encryption_profiles ORDER BY name`)
+		`SELECT uid, name, config, kek_nonce, kek_ciphertext
+		   FROM s3vault_encryption_profiles ORDER BY name`)
 	if err != nil {
 		return fmt.Errorf("postgres auth: validate profiles: %w", err)
 	}
@@ -304,10 +305,11 @@ func (i *Identity) validateProfiles(ctx context.Context, conn *pgxpool.Conn) err
 
 	for rows.Next() {
 		var (
-			name   string
-			config []byte
+			uid, name  string
+			config     []byte
+			kekN, kekC []byte
 		)
-		if err := rows.Scan(&name, &config); err != nil {
+		if err := rows.Scan(&uid, &name, &config, &kekN, &kekC); err != nil {
 			return fmt.Errorf("postgres auth: validate profile scan: %w", err)
 		}
 
@@ -315,8 +317,13 @@ func (i *Identity) validateProfiles(ctx context.Context, conn *pgxpool.Conn) err
 			return fmt.Errorf("postgres auth: encryption profile %s has an empty config", name)
 		}
 
+		kek, err := i.openProfileKEK(uid, kekN, kekC)
+		if err != nil {
+			return fmt.Errorf("postgres auth: encryption profile %s: %w", name, err)
+		}
+
 		if i.validateEnc != nil {
-			if err := i.validateEnc(json.RawMessage(config)); err != nil {
+			if err := i.validateEnc(json.RawMessage(config), kek); err != nil {
 				return fmt.Errorf("postgres auth: encryption profile %s: %w", name, err)
 			}
 		}
@@ -442,6 +449,33 @@ func targetSecretAAD(targetUID string) string {
 
 func targetSessionAAD(targetUID string) string {
 	return "s3.session_token:" + targetUID
+}
+
+// profileKEKAAD binds the sealed native KEK to the profile's immutable uid:
+// copying the ciphertext to another profile cannot decrypt, and renaming the
+// profile does not require re-sealing.
+func profileKEKAAD(profileUID string) string {
+	return "encryption.kek:" + profileUID
+}
+
+func (i *Identity) sealProfileKEK(profileUID string, kek []byte) (nonce, ciphertext []byte, err error) {
+	if len(kek) == 0 {
+		return nil, nil, nil
+	}
+
+	return secretbox.Seal(i.masterKey, kek, profileKEKAAD(profileUID))
+}
+
+func (i *Identity) openProfileKEK(profileUID string, nonce, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) == 0 {
+		return nil, nil
+	}
+
+	if len(nonce) == 0 {
+		return nil, errors.New("profile has a KEK ciphertext but no nonce")
+	}
+
+	return secretbox.Open(i.masterKey, nonce, ciphertext, profileKEKAAD(profileUID))
 }
 
 func (i *Identity) sealTargetSecret(targetUID, secret string) (nonce, ciphertext []byte, err error) {

@@ -48,6 +48,9 @@ encryption:
   #   public_key_path: /etc/s3vault/public.pem
   #   private_key_path: /etc/s3vault/private.pem   # wrap: rsa-oaep
   #   key_file: /etc/s3vault/kek.bin              # wrap: keyfile; 32 raw bytes or SHA-256 of the file
+  #   key_env: S3VAULT_ENCRYPTION_NATIVE_KEY       # wrap: keyfile; env fallback when key_file is absent/unreadable;
+  #                                                # value is 32-byte base64 or 64 hex chars
+  #                                                # (default env name if key_file and key_env are both empty)
   #   chunk_size: 65536                          # 4 KiB..8 MiB; пишется в заголовок каждого объекта
   # CryptoPro CSP (ГОСТ): provider + SHA-1 thumbprint → S3VCTR01 header;
   # download uses header (CRYPTOPRO_THUMBPRINT) so old objects stay decryptable after key rotation.

@@ -731,8 +731,8 @@ func openPostgresAuth(ctx context.Context, cfg config.Config, log *slog.Logger, 
 		MasterKey:    masterKey,
 		Bucket:       bucket,
 		Logger:       log,
-		ValidateEncryption: func(raw json.RawMessage) error {
-			_, err := profiles.ResolveRaw(raw)
+		ValidateEncryption: func(raw json.RawMessage, kek []byte) error {
+			_, err := profiles.Resolve(raw, kek)
 
 			return err
 		},

@@ -33,6 +33,8 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 		profileUID    *string
 		profileName   *string
 		profileConfig []byte
+		profileKekN   []byte
+		profileKekC   []byte
 
 		targetUID    *string
 		targetName   *string
@@ -46,7 +48,7 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 	err := i.pool.QueryRow(ctx,
 		`SELECT u.id, u.access_key_id, u.prefix, u.enabled,
 		        u.secret_key_nonce, u.secret_key_ciphertext,
-		        p.uid, p.name, p.config,
+		        p.uid, p.name, p.config, p.kek_nonce, p.kek_ciphertext,
 		        t.uid, t.name, t.config,
 		        t.secret_nonce, t.secret_ciphertext,
 		        t.session_nonce, t.session_ciphertext
@@ -55,7 +57,7 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 		   LEFT JOIN s3vault_targets t ON t.uid = u.s3_target_uid
 		  WHERE u.access_key_id = $1`, accessKeyID,
 	).Scan(&id, &key, &prefix, &enabled, &nonce, &ciphertext,
-		&profileUID, &profileName, &profileConfig,
+		&profileUID, &profileName, &profileConfig, &profileKekN, &profileKekC,
 		&targetUID, &targetName, &targetConfig,
 		&tSecretN, &tSecretC, &tSessionN, &tSessionC)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -79,7 +81,10 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 		return port.Principal{}, false, fmt.Errorf("%w: decrypt secret for %s: %w", port.ErrAuthInternal, key, err)
 	}
 
-	var profile json.RawMessage
+	var (
+		profile json.RawMessage
+		kek     []byte
+	)
 
 	if profileUID != nil && len(profileConfig) == 0 {
 		return port.Principal{}, false, fmt.Errorf("%w: profile for %s has no config", port.ErrAuthInternal, key)
@@ -87,6 +92,11 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 
 	if profileUID != nil {
 		profile = append(json.RawMessage(nil), profileConfig...)
+
+		kek, err = i.openProfileKEK(*profileUID, profileKekN, profileKekC)
+		if err != nil {
+			return port.Principal{}, false, fmt.Errorf("%w: decrypt profile KEK for %s: %w", port.ErrAuthInternal, key, err)
+		}
 	}
 
 	s3Target, err := i.principalTarget(targetUID, targetName, targetConfig, tSecretN, tSecretC, tSessionN, tSessionC)
@@ -99,10 +109,11 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 		SecretKey:      secret,
 		AllowedBuckets: []string{i.bucket},
 		User: port.UserPolicy{
-			ID:         id,
-			Prefix:     prefix,
-			Encryption: profile,
-			Target:     s3Target,
+			ID:            id,
+			Prefix:        prefix,
+			Encryption:    profile,
+			EncryptionKEK: kek,
+			Target:        s3Target,
 		},
 	}, true, nil
 }

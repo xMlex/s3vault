@@ -126,7 +126,7 @@ func (s *scope) profileFor(_ context.Context) (*encrypt.Profile, error) {
 		return nil, errors.New("encryption profile resolver is not configured")
 	}
 
-	p, err := s.api.profiles.ResolveRaw(s.principal.User.Encryption)
+	p, err := s.api.profiles.Resolve(s.principal.User.Encryption, s.principal.User.EncryptionKEK)
 	if err != nil {
 		return nil, fmt.Errorf("user %d encryption: %w", s.principal.User.ID, err)
 	}

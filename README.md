@@ -701,6 +701,52 @@ encryption:
 
 Проще в эксплуатации (один секрет). Кто читает `kek.bin`, читает все объекты. Права на файл — `0600`, каталог — `0700`.
 
+#### KEK из окружения, без файла
+
+Для stateless-развёртываний ключ можно держать только в env. Имя переменной задаёт `key_env`; если оно пустое, читается `S3VAULT_ENCRYPTION_NATIVE_KEY`. Значение — 32 байта в base64 или 64 hex-символа, то есть результат `openssl rand -hex 32` или `openssl rand -base64 32`.
+
+```bash
+export S3VAULT_ENCRYPTION_NATIVE_KEY="$(openssl rand -hex 32)"
+```
+
+```yaml
+encryption:
+  mode: native
+  native:
+    wrap: keyfile
+    key_env: S3VAULT_ENCRYPTION_NATIVE_KEY   # можно не указывать: это значение по умолчанию
+```
+
+Если заданы и `key_file`, и `key_env`, читаемый файл выигрывает. Env используется как fallback, когда файл отсутствует или не читается. Так можно перевести существующий стенд на env без смены ключа: положите тот же KEK в переменную и уберите файл.
+
+При переходе с `key_file` **не генерируйте новый ключ** — старые объекты им не расшифруются. Для raw-файла из 32 байт:
+
+```bash
+export S3VAULT_ENCRYPTION_NATIVE_KEY="$(base64 -w0 /etc/s3vault/kek.bin)"
+```
+
+Для файла с hex-текстом старый `loadKEK` брал SHA-256 от содержимого файла, поэтому в env нужно положить именно этот дайджест:
+
+```bash
+export S3VAULT_ENCRYPTION_NATIVE_KEY="$(sha256sum /etc/s3vault/kek.hex | cut -d' ' -f1)"
+```
+
+Для shared-профиля PostgreSQL KEK не хранится в JSON и не читается из env на каждом запросе: `profile add`/`profile update` берут его из env и запечатывают мастер-ключом БД.
+
+```bash
+export PROFILE_KEK="$(openssl rand -hex 32)"
+s3vault profile add --name shared-native --file native.json \
+  --native-key-env PROFILE_KEK
+```
+
+`native.json` в этом случае не содержит `key_file`/`key_env`:
+
+```json
+{"mode":"native","native":{"wrap":"keyfile","chunk_size":65536}}
+```
+
+Запечатанный KEK привязан к `uid` профиля в БД; файл на диске и переменная окружения после `profile add` больше не нужны. `profile update` без `--native-key-env` очищает запечатанный ключ — это полная замена профиля.
+
 ### `native` + `rsa-oaep` — RSA только для ключа
 
 Файл снова AES-256-GCM. DEK шифруется RSA-OAEP (SHA-256). Для upload достаточно публичного ключа; для download — закрытого.
@@ -1021,7 +1067,7 @@ s3vault profile remove --name shared-native
 
 Префикс **прозрачный**: клиент делает `s3://bucket/report.pdf`, шлюз пишет `s3.prefix/tenant-a/report.pdf`, а `ListObjectsV2` возвращает `report.pdf`. Префиксы обязательны, уникальны и не должны пересекаться (`a` и `a/b` — ошибка). `server.s3_bucket_as_prefix` в Postgres-режиме запрещён.
 
-Профиль шифрования — строка `s3vault_encryption_profiles`; отсутствие ссылки означает глобальный `encryption` шлюза:
+Профиль шифрования — строка `s3vault_encryption_profiles`; отсутствие ссылки означает глобальный `encryption` шлюза. Ключ можно держать в файле (legacy), в env или запечатать в БД:
 
 ```json
 {
@@ -1034,7 +1080,21 @@ s3vault profile remove --name shared-native
 }
 ```
 
-`mode=none|native|command` обязателен. Для `native` нужен `private_key_path` (`rsa-oaep`) или `key_file`; для `command` — `encrypt`, `decrypt` argv и `thumbprint`. Пути к ключам — абсолютные. Один профиль можно назначить нескольким пользователям; изменение профиля действует на всех. При чтении объект выбирается по `enc` из `S3VCTR01`: сначала профиль пользователя, затем глобальный профиль шлюза, но только если алгоритм отличается. Одинаковый алгоритм с другими ключами fallback-ом не покрывается.
+Stateless-вариант — без `key_file`/`key_env` в JSON, ключ запечатывается мастер-ключом БД:
+
+```bash
+export PROFILE_KEK="$(openssl rand -hex 32)"
+s3vault profile add --name shared-native --file native2.json \
+  --native-key-env PROFILE_KEK
+```
+
+```json
+{"mode":"native","native":{"wrap":"keyfile","chunk_size":65536}}
+```
+
+В БД `config` не содержит ключа: рядом лежат `kek_nonce`/`kek_ciphertext`, привязанные к `uid` профиля. `profile update --native-key-env VAR` перезапечатывает ключ, `profile update` без флага очищает его. Env-вариант без запечатывания тоже возможен: `"key_env": "S3VAULT_ENCRYPTION_NATIVE_KEY"`; значение читается процессом шлюза.
+
+`mode=none|native|command` обязателен. Для `native` нужен `private_key_path` (`rsa-oaep`), `key_file`/`key_env` или запечатанный KEK в БД; для `command` — `encrypt`, `decrypt` argv и `thumbprint`. Пути к ключам — абсолютные. Один профиль можно назначить нескольким пользователям; изменение профиля действует на всех. При чтении объект выбирается по `enc` из `S3VCTR01`: сначала профиль пользователя, затем глобальный профиль шлюза, но только если алгоритм отличается. Одинаковый алгоритм с другими ключами fallback-ом не покрывается.
 
 Клиенты `archive`/`upload`/`download` не знают о БД: они указывают `s3.endpoint` на фасад и используют выданные `access_key_id`/`secret_key`. Перешифровки существующих объектов и ротации мастер-ключа нет: смена профиля может сделать старые объекты нечитаемыми.
 
@@ -1087,7 +1147,7 @@ s3vault target list --output json
 ### Чтение: HEAD, range и спул запросов
 
 - **HEAD отвечает по метаданным.** `HeadObject` не скачивает тело: длина, ETag (plaintext SHA-256) и checksum берутся из заголовка `S3VCTR01` (HEAD + 128-байтный range). Раньше HEAD материализовал объект целиком — на 10 ГиБ это были 10 ГиБ трафика и расшифровки на каждый HEAD.
-- **Range не скачивает объект целиком.** `Fetch.Open` отдаёт `ServeContent` ленивый seekable-ридер: для `mode=none` plaintext-диапазон смещается на 128 байт контейнера, для `native` читаются и расшифровываются только нужные чанки (`stride = 4 + chunk + 16`, у каждого чанка свой nonce). Окно — 256 КиБ; `If-Range`/`If-None-Match` и 206 остаются на stdlib. Для `mode=command` (CryptoPro) случайного доступа нет — такие объекты по-прежнему материализуются в файл.
+- **Range не скачивает объект целиком.** `Fetch.Open` отдаёт `ServeContent` ленивый seekable-ридер: для `mode=none` plaintext-диапазон смещается на 128 байт контейнера, для `native` читаются и расшифровываются только нужные чанки (`stride = 4 + chunk + 16`, у каждого чанка свой nonce). Первое окно — 256 КиБ; при последовательном чтении оно удваивается до 4 МиБ, поэтому полный GET 256 МиБ стоит ~64 запроса к бэкенду вместо 1024, а seek сбрасывает окно, и случайный доступ по-прежнему читает по 256 КиБ. `If-Range`/`If-None-Match` и 206 остаются на stdlib. Для `mode=command` (CryptoPro) случайного доступа нет — такие объекты по-прежнему материализуются в файл.
 - **Холодное чтение — один `Get`.** Идентичность берётся из заголовка того же потока, поэтому исчезли предварительные `HEAD` + 128-байтный range. Параллельные холодные GET одного ключа при выключенном кэше схлопываются в одну загрузку и один файл (refcount), последний читатель его удаляет.
 - **Изменение поведения:** на потоковом пути битый объект обнаруживается уже после отправки `200` — клиент видит оборванное тело и проваливает проверку ETag/checksum. С включённым кэшем и на fallback-путях поведение прежнее (чистая ошибка до ответа).
 

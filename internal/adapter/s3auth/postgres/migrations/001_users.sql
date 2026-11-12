@@ -1,9 +1,11 @@
 CREATE TABLE s3vault_encryption_profiles (
-    uid        text        PRIMARY KEY,
-    name       text        NOT NULL,
-    config     jsonb       NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
+    uid            text        PRIMARY KEY,
+    name           text        NOT NULL,
+    config         jsonb       NOT NULL,
+    kek_nonce      bytea,
+    kek_ciphertext bytea,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
 
     CONSTRAINT s3vault_encryption_profiles_name_key UNIQUE (name),
     CONSTRAINT s3vault_encryption_profiles_uid_len
@@ -11,7 +13,13 @@ CREATE TABLE s3vault_encryption_profiles (
     CONSTRAINT s3vault_encryption_profiles_name_nonempty
         CHECK (name <> ''),
     CONSTRAINT s3vault_encryption_profiles_config_object
-        CHECK (jsonb_typeof(config) = 'object')
+        CHECK (jsonb_typeof(config) = 'object'),
+    CONSTRAINT s3vault_encryption_profiles_kek_pair
+        CHECK ((kek_nonce IS NULL) = (kek_ciphertext IS NULL)),
+    CONSTRAINT s3vault_encryption_profiles_kek_nonce_len
+        CHECK (kek_nonce IS NULL OR octet_length(kek_nonce) = 12),
+    CONSTRAINT s3vault_encryption_profiles_kek_ciphertext_len
+        CHECK (kek_ciphertext IS NULL OR octet_length(kek_ciphertext) > 16)
 );
 
 CREATE TABLE s3vault_targets (

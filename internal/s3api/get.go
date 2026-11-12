@@ -1,6 +1,7 @@
 package s3api
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -84,6 +85,14 @@ func (a *API) handleHead(w http.ResponseWriter, r *http.Request, fetch *service.
 		return
 	}
 	if err != nil {
+		// A client that goes away mid-request surfaces here as a cancelled
+		// context. That is not a server-side failure: do not log it as an
+		// error nor answer a 500 on a connection that is already gone.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			a.metric("head", "canceled")
+			return
+		}
+
 		a.metric("head", "error")
 
 		if errors.Is(err, domain.ErrInvalidPath) {

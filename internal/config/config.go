@@ -118,6 +118,10 @@ const (
 	MaxNativeChunkSize = 8 << 20
 	// DefaultNativeChunkSize matches the historical 64 KiB default.
 	DefaultNativeChunkSize = 65536
+	// DefaultNativeKeyEnv is read when native.wrap=keyfile and neither key_file
+	// nor key_env is configured. Its value is the KEK itself: 32 raw bytes in
+	// base64 or 64 hex characters.
+	DefaultNativeKeyEnv = "S3VAULT_ENCRYPTION_NATIVE_KEY"
 )
 
 type EncryptionConfig struct {
@@ -131,7 +135,15 @@ type NativeEnc struct {
 	PublicKeyPath  string `mapstructure:"public_key_path"`
 	PrivateKeyPath string `mapstructure:"private_key_path"`
 	KeyFile        string `mapstructure:"key_file"`
-	ChunkSize      int    `mapstructure:"chunk_size"`
+	// KeyEnv names the environment variable holding the KEK. It is an
+	// alternative to key_file, not a replacement: a readable key_file wins, and
+	// the env var is the fallback when the file is absent or unreadable.
+	KeyEnv string `mapstructure:"key_env"`
+	// Key is a runtime-only KEK injected from a sealed PostgreSQL profile. It is
+	// never read from YAML or profile JSON.
+	Key []byte `mapstructure:"-"`
+	// ChunkSize is written into every object header.
+	ChunkSize int `mapstructure:"chunk_size"`
 }
 
 type CommandEnc struct {
@@ -287,6 +299,7 @@ var envKeys = []string{
 	"encryption.native.public_key_path",
 	"encryption.native.private_key_path",
 	"encryption.native.key_file",
+	"encryption.native.key_env",
 	"encryption.native.chunk_size",
 	"encryption.command.provider",
 	"encryption.command.thumbprint",
@@ -458,6 +471,8 @@ func (c *Config) Normalize() error {
 	if c.Encryption.Native.ChunkSize == 0 {
 		c.Encryption.Native.ChunkSize = DefaultNativeChunkSize
 	}
+
+	c.Encryption.Native.KeyEnv = strings.TrimSpace(c.Encryption.Native.KeyEnv)
 	// Checked here as well as in the reader: the value is written into every
 	// object header, and a reader must reject an out-of-range chunk before it
 	// allocates a buffer of that size (see encrypt.maxChunkSize).

@@ -327,8 +327,8 @@ func openUserAuthWith(ctx context.Context, cfg config.Config, skipValidation boo
 			return nil, err
 		}
 
-		pgCfg.ValidateEncryption = func(raw json.RawMessage) error {
-			_, err := profiles.ResolveRaw(raw)
+		pgCfg.ValidateEncryption = func(raw json.RawMessage, kek []byte) error {
+			_, err := profiles.Resolve(raw, kek)
 
 			return err
 		}

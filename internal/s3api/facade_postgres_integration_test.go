@@ -62,8 +62,8 @@ func TestFacadePostgresUsers(t *testing.T) {
 		QueryTimeout: 2 * time.Second,
 		MasterKey:    key,
 		Bucket:       "s3vault",
-		ValidateEncryption: func(raw json.RawMessage) error {
-			_, err := resolver.ResolveRaw(raw)
+		ValidateEncryption: func(raw json.RawMessage, kek []byte) error {
+			_, err := resolver.Resolve(raw, kek)
 			return err
 		},
 	})
@@ -86,7 +86,7 @@ func TestFacadePostgresUsers(t *testing.T) {
 	nativeConfig := json.RawMessage(fmt.Sprintf(
 		`{"mode":"native","native":{"wrap":"keyfile","key_file":%q}}`, kekPath,
 	))
-	nativeProfile, err := id.AddEncryptionProfile(ctx, "shared-native", nativeConfig)
+	nativeProfile, err := id.AddEncryptionProfile(ctx, "shared-native", nativeConfig, nil)
 	require.NoError(t, err)
 
 	carol, carolSecret, err := id.AddUser(ctx, postgresauth.AddParams{
@@ -234,8 +234,8 @@ func TestFacadePostgresTarget(t *testing.T) {
 		QueryTimeout: 2 * time.Second,
 		MasterKey:    key,
 		Bucket:       "s3vault",
-		ValidateEncryption: func(raw json.RawMessage) error {
-			_, err := resolver.ResolveRaw(raw)
+		ValidateEncryption: func(raw json.RawMessage, kek []byte) error {
+			_, err := resolver.Resolve(raw, kek)
 			return err
 		},
 	})

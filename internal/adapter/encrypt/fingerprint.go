@@ -18,7 +18,13 @@ func Fingerprint(cfg config.EncryptionConfig) string {
 	_, _ = h.Write([]byte{0})
 	hashNamed(h, "pub", cfg.Native.PublicKeyPath)
 	hashNamed(h, "priv", cfg.Native.PrivateKeyPath)
-	hashNamed(h, "kek", cfg.Native.KeyFile)
+	hashNamed(h, "kek-file", cfg.Native.KeyFile)
+	hashEnv(h, "kek-env", cfg.Native.KeyEnv)
+
+	if len(cfg.Native.Key) > 0 {
+		_, _ = h.Write(cfg.Native.Key)
+		_, _ = h.Write([]byte{0})
+	}
 	for _, a := range cfg.Command.Decrypt {
 		_, _ = io.WriteString(h, a)
 		_, _ = h.Write([]byte{0})
@@ -42,4 +48,21 @@ func hashNamed(h io.Writer, label, path string) {
 	}
 	defer f.Close()
 	_, _ = io.Copy(h, f)
+}
+
+// hashEnv includes both the variable name and its current value: a rotated KEK
+// must change the cache fingerprint even though the config text did not.
+func hashEnv(h io.Writer, label, name string) {
+	if name == "" {
+		name = config.DefaultNativeKeyEnv
+	}
+
+	_, _ = io.WriteString(h, label)
+	_, _ = io.WriteString(h, name)
+	_, _ = h.Write([]byte{0})
+
+	if value, ok := os.LookupEnv(name); ok {
+		_, _ = io.WriteString(h, value)
+		_, _ = h.Write([]byte{0})
+	}
 }

@@ -204,14 +204,20 @@ func (i *Identity) RemoveTarget(ctx context.Context, name string) error {
 	})
 }
 
-// AddEncryptionProfile creates a shared encryption profile.
-func (i *Identity) AddEncryptionProfile(ctx context.Context, name string, config json.RawMessage) (EncryptionProfile, error) {
+// AddEncryptionProfile creates a shared encryption profile. A non-empty kek is
+// sealed under the master key and stored beside the profile; it is never kept in
+// the config JSON.
+func (i *Identity) AddEncryptionProfile(ctx context.Context, name string, config json.RawMessage, kek []byte) (EncryptionProfile, error) {
 	name, err := normalizeEntityName(name)
 	if err != nil {
 		return EncryptionProfile{}, err
 	}
 
-	config, err = i.normalizeProfileConfig(config)
+	if err := validateProfileKEK(kek); err != nil {
+		return EncryptionProfile{}, err
+	}
+
+	config, err = i.normalizeProfileConfig(config, kek)
 	if err != nil {
 		return EncryptionProfile{}, err
 	}
@@ -221,11 +227,16 @@ func (i *Identity) AddEncryptionProfile(ctx context.Context, name string, config
 		return EncryptionProfile{}, err
 	}
 
+	kekN, kekC, err := i.sealProfileKEK(uid, kek)
+	if err != nil {
+		return EncryptionProfile{}, fmt.Errorf("postgres auth: seal profile KEK: %w", err)
+	}
+
 	row := i.pool.QueryRow(ctx,
-		`INSERT INTO s3vault_encryption_profiles (uid, name, config)
-		 VALUES ($1, $2, $3::jsonb)
+		`INSERT INTO s3vault_encryption_profiles (uid, name, config, kek_nonce, kek_ciphertext)
+		 VALUES ($1, $2, $3::jsonb, $4, $5)
 		 RETURNING uid, name, config, created_at, updated_at`,
-		uid, name, string(config),
+		uid, name, string(config), kekN, kekC,
 	)
 
 	p, err := scanProfile(row)
@@ -270,20 +281,20 @@ func (i *Identity) ListEncryptionProfiles(ctx context.Context) ([]EncryptionProf
 	return profiles, nil
 }
 
-// UpdateEncryptionProfile fully replaces a profile under the same uid.
-func (i *Identity) UpdateEncryptionProfile(ctx context.Context, name string, config json.RawMessage, newName string) (EncryptionProfile, error) {
-	name, err := normalizeEntityName(name)
+// UpdateEncryptionProfile fully replaces a profile under the same uid. A non-nil
+// kek replaces the sealed key; nil clears it, matching the full-replacement
+// contract of the config JSON.
+func (i *Identity) UpdateEncryptionProfile(ctx context.Context, name string, config json.RawMessage, newName string, kek []byte) (EncryptionProfile, error) {
+	name, newName, err := normalizeProfileNames(name, newName)
 	if err != nil {
 		return EncryptionProfile{}, err
 	}
 
-	if newName == "" {
-		newName = name
-	} else if newName, err = normalizeEntityName(newName); err != nil {
+	if err := validateProfileKEK(kek); err != nil {
 		return EncryptionProfile{}, err
 	}
 
-	config, err = i.normalizeProfileConfig(config)
+	config, err = i.normalizeProfileConfig(config, kek)
 	if err != nil {
 		return EncryptionProfile{}, err
 	}
@@ -307,12 +318,17 @@ func (i *Identity) UpdateEncryptionProfile(ctx context.Context, name string, con
 		return EncryptionProfile{}, fmt.Errorf("postgres auth: load profile: %w", err)
 	}
 
+	kekN, kekC, err := i.sealProfileKEK(uid, kek)
+	if err != nil {
+		return EncryptionProfile{}, fmt.Errorf("postgres auth: seal profile KEK: %w", err)
+	}
+
 	row := tx.QueryRow(ctx,
 		`UPDATE s3vault_encryption_profiles
-		    SET name = $2, config = $3::jsonb, updated_at = now()
+		    SET name = $2, config = $3::jsonb, kek_nonce = $4, kek_ciphertext = $5, updated_at = now()
 		  WHERE uid = $1
 		 RETURNING uid, name, config, created_at, updated_at`,
-		uid, newName, string(config),
+		uid, newName, string(config), kekN, kekC,
 	)
 
 	p, err := scanProfile(row)
@@ -401,7 +417,7 @@ func (i *Identity) removeSharedEntity(ctx context.Context, name string, e shared
 	return nil
 }
 
-func (i *Identity) normalizeProfileConfig(raw json.RawMessage) (json.RawMessage, error) {
+func (i *Identity) normalizeProfileConfig(raw json.RawMessage, kek []byte) (json.RawMessage, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || isGlobalEncryption(trimmed) {
 		return nil, errors.New("postgres auth: encryption profile must have a non-empty mode")
@@ -419,12 +435,38 @@ func (i *Identity) normalizeProfileConfig(raw json.RawMessage) (json.RawMessage,
 	}
 
 	if i.validateEnc != nil {
-		if err := i.validateEnc(trimmed); err != nil {
+		if err := i.validateEnc(trimmed, kek); err != nil {
 			return nil, err
 		}
 	}
 
 	return append(json.RawMessage(nil), trimmed...), nil
+}
+
+func normalizeProfileNames(name, newName string) (string, string, error) {
+	name, err := normalizeEntityName(name)
+	if err != nil {
+		return "", "", err
+	}
+
+	if newName == "" {
+		return name, name, nil
+	}
+
+	newName, err = normalizeEntityName(newName)
+	if err != nil {
+		return "", "", err
+	}
+
+	return name, newName, nil
+}
+
+func validateProfileKEK(kek []byte) error {
+	if len(kek) != 0 && len(kek) != 32 {
+		return fmt.Errorf("postgres auth: native KEK must be 32 bytes, got %d", len(kek))
+	}
+
+	return nil
 }
 
 func resolveEncryptionProfileUID(ctx context.Context, tx pgx.Tx, name string) (string, error) {

@@ -36,6 +36,8 @@ go.work.sum
 s3vault.yaml
 /kek.bin
 /s3vault-local.yaml
+/target.json
+/native.json
 
 # Build artifacts
 /tmp/

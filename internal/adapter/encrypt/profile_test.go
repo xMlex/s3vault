@@ -1,6 +1,8 @@
 package encrypt
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -66,6 +68,41 @@ func TestResolverNativeKeyfile(t *testing.T) {
 	assert.NotEqual(t, fp, profile.Fingerprint)
 }
 
+func TestResolverNativeFromEnv(t *testing.T) {
+	t.Setenv("S3VAULT_TEST_PROFILE_KEK", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+
+	resolver, fp := testResolver(t, config.EncryptionConfig{Mode: NameNone})
+
+	profile, err := resolver.ResolveRaw(json.RawMessage(`{
+		"mode": "native",
+		"native": {"wrap": "keyfile", "key_env": "S3VAULT_TEST_PROFILE_KEK"}
+	}`))
+	require.NoError(t, err)
+	assert.Equal(t, NameNative, Name(profile.Primary))
+	assert.NotEqual(t, fp, profile.Fingerprint)
+}
+
+func TestResolverNativeFromSealedKEK(t *testing.T) {
+	t.Parallel()
+
+	resolver, fp := testResolver(t, config.EncryptionConfig{Mode: NameNone})
+	raw := json.RawMessage(`{"mode":"native","native":{"wrap":"keyfile"}}`)
+	kek := []byte("abcdef0123456789abcdef0123456789")
+
+	profile, err := resolver.Resolve(raw, kek)
+	require.NoError(t, err)
+	assert.Equal(t, NameNative, Name(profile.Primary))
+	assert.NotEqual(t, fp, profile.Fingerprint)
+
+	payload := []byte("sealed kek roundtrip")
+
+	var ciphertext, plaintext bytes.Buffer
+
+	require.NoError(t, profile.Primary.Encrypt(context.Background(), &ciphertext, bytes.NewReader(payload)))
+	require.NoError(t, profile.Primary.Decrypt(context.Background(), &plaintext, &ciphertext))
+	assert.Equal(t, payload, plaintext.Bytes())
+}
+
 func TestResolverSameModeHasNoFallback(t *testing.T) {
 	t.Parallel()
 
@@ -119,7 +156,7 @@ func TestResolverRejectsInvalidProfiles(t *testing.T) {
 	}{
 		{name: "unknown field", raw: `{"mode":"none","extra":1}`},
 		{name: "unknown mode", raw: `{"mode":"aes"}`},
-		{name: "native without key", raw: `{"mode":"native","native":{"wrap":"keyfile"}}`},
+		{name: "native without key", raw: `{"mode":"native","native":{"wrap":"keyfile","key_env":"S3VAULT_TEST_MISSING_KEK"}}`},
 		{name: "command without argv", raw: `{"mode":"command","command":{"thumbprint":"afa43c43975fbfc700f051fd62016e1571e7e025"}}`},
 		{name: "command without thumbprint", raw: `{"mode":"command","command":{"encrypt":["/bin/true"],"decrypt":["/bin/true"]}}`},
 		{name: "bad timeout", raw: `{"mode":"command","command":{"encrypt":["/bin/true"],"decrypt":["/bin/true"],"thumbprint":"afa43c43975fbfc700f051fd62016e1571e7e025","timeout":"soon"}}`},

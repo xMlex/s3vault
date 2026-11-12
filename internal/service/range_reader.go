@@ -17,6 +17,12 @@ const (
 	// enough to amortize a round trip, small enough that a client asking for a
 	// few bytes does not pull a megabyte it will never use.
 	rangeWindow = 256 << 10
+	// rangeWindowMax caps the window of a reader that consumes its data
+	// sequentially. Without growth a full-object GET costs one backend request
+	// per rangeWindow; with a remote store that is latency-bound: 256 MiB needs
+	// 1024 round trips of 256 KiB. Doubling up to this cap reduces it to ~64,
+	// while a random reader keeps the small first window.
+	rangeWindowMax = 4 << 20
 	// rangePrefix is what Open reads first: the 128-byte S3VCTR01 header and, for
 	// a native payload, its S3VLT01 header (an RSA-4096 wrapped key is well under
 	// a kilobyte).
@@ -31,21 +37,22 @@ type fetchFunc func(dst []byte, start int64) error
 // drives ranged reads and the backend is asked for the bytes actually used.
 type objectReader struct {
 	//nolint:containedctx // io.Reader has no context parameter and this reader is request-scoped.
-	ctx    context.Context
-	size   int64
-	off    int64
-	window []byte
-	start  int64 // plaintext offset of window[0]
-	fetch  fetchFunc
-	n      int64
-	err    error
-	closed bool
+	ctx       context.Context
+	size      int64
+	off       int64
+	window    []byte
+	windowLen int64 // size of the next fill; grows while the reads are sequential
+	start     int64 // plaintext offset of window[0]
+	fetch     fetchFunc
+	n         int64
+	err       error
+	closed    bool
 
 	onClose func(n int64, err error)
 }
 
 func newObjectReader(ctx context.Context, size int64, fetch fetchFunc) *objectReader {
-	return &objectReader{ctx: ctx, size: size, fetch: fetch}
+	return &objectReader{ctx: ctx, size: size, windowLen: rangeWindow, fetch: fetch}
 }
 
 func (r *objectReader) Read(p []byte) (int, error) {
@@ -73,7 +80,15 @@ func (r *objectReader) Read(p []byte) (int, error) {
 }
 
 func (r *objectReader) fill() error {
-	length := int64(rangeWindow)
+	// A reader that consumed the whole previous window is streaming, not
+	// seeking, so it can afford a bigger request: the bytes saved on round trips
+	// outweigh the tail of a window a client might abandon. A seek resets
+	// windowLen, so a short range never pays for the growth.
+	if r.window != nil && r.off == r.start+int64(len(r.window)) {
+		r.windowLen = min(r.windowLen*2, rangeWindowMax)
+	}
+
+	length := r.windowLen
 	if rem := r.size - r.off; rem < length {
 		length = rem
 	}
@@ -118,6 +133,10 @@ func (r *objectReader) Seek(offset int64, whence int) (int64, error) {
 	}
 
 	r.off = abs
+	// A seek may be the start of a new range request (ServeContent seeks to the
+	// range start before reading), so the growth earned by the previous
+	// sequential read must not leak into it.
+	r.windowLen = rangeWindow
 
 	return abs, nil
 }

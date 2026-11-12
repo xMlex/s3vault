@@ -57,6 +57,12 @@ func (r *Resolver) Default() Profile {
 // all mean "use the gateway default". A non-empty profile is complete: there is
 // no field-by-field merge with the global config.
 func (r *Resolver) ResolveRaw(raw json.RawMessage) (Profile, error) {
+	return r.Resolve(raw, nil)
+}
+
+// Resolve is ResolveRaw plus a sealed KEK injected by a database-backed profile.
+// The key is used only by native keyfile wrap and overrides key_file/key_env.
+func (r *Resolver) Resolve(raw json.RawMessage, kek []byte) (Profile, error) {
 	if isGlobalProfile(raw) {
 		return r.Default(), nil
 	}
@@ -70,7 +76,7 @@ func (r *Resolver) ResolveRaw(raw json.RawMessage) (Profile, error) {
 		return r.Default(), nil
 	}
 
-	cfg, err := profileConfig(p)
+	cfg, err := profileConfig(p, kek)
 	if err != nil {
 		return Profile{}, err
 	}
@@ -110,6 +116,7 @@ type nativeJSON struct {
 	PublicKeyPath  string `json:"public_key_path"`
 	PrivateKeyPath string `json:"private_key_path"`
 	KeyFile        string `json:"key_file"`
+	KeyEnv         string `json:"key_env"`
 	ChunkSize      int    `json:"chunk_size"`
 }
 
@@ -138,7 +145,7 @@ func decodeProfile(raw json.RawMessage) (profileJSON, error) {
 	return p, nil
 }
 
-func profileConfig(p profileJSON) (config.EncryptionConfig, error) {
+func profileConfig(p profileJSON, kek []byte) (config.EncryptionConfig, error) {
 	cfg := config.EncryptionConfig{
 		Mode: strings.ToLower(strings.TrimSpace(p.Mode)),
 		Native: config.NativeEnc{
@@ -146,6 +153,8 @@ func profileConfig(p profileJSON) (config.EncryptionConfig, error) {
 			PublicKeyPath:  p.Native.PublicKeyPath,
 			PrivateKeyPath: p.Native.PrivateKeyPath,
 			KeyFile:        p.Native.KeyFile,
+			KeyEnv:         strings.TrimSpace(p.Native.KeyEnv),
+			Key:            append([]byte(nil), kek...),
 			ChunkSize:      p.Native.ChunkSize,
 		},
 		Command: config.CommandEnc{
@@ -217,9 +226,9 @@ func normalizeNative(cfg config.EncryptionConfig) (config.EncryptionConfig, erro
 			return config.EncryptionConfig{}, errors.New("user encryption: native rsa-oaep requires private_key_path for reads")
 		}
 	case WrapKeyfile:
-		if cfg.Native.KeyFile == "" {
-			return config.EncryptionConfig{}, errors.New("user encryption: native keyfile requires key_file")
-		}
+		// A KEK may come from key_file, key_env, or a sealed database profile
+		// (cfg.Native.Key). Without any of them NewNative falls back to
+		// config.DefaultNativeKeyEnv, so absence is not a parse error.
 	default:
 		return config.EncryptionConfig{}, fmt.Errorf("user encryption: unknown native.wrap %q", cfg.Native.Wrap)
 	}

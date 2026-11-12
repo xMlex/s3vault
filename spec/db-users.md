@@ -11,7 +11,7 @@
 - Профиль шифрования и конечный S3 — самостоятельные сущности с именами и неизменяемыми `uid`; пользователь ссылается на них, а не хранит копию.
 - Один профиль/одна цель назначаются нескольким пользователям; изменение сущности действует на всех привязанных.
 - Секрет цели хранится один раз в строке цели; AAD — `s3.secret_key:<target_uid>` / `s3.session_token:<target_uid>`.
-- Одна миграция `001_users.sql` создаёт финальную схему: реестры профилей/целей и таблицу пользователей с FK. Backfill и legacy-колонки не нужны: схема ещё не накатывалась на стенды.
+- Одна миграция `001_users.sql` создаёт финальную схему: реестры профилей/целей, таблицу пользователей с FK и запечатанный native KEK профиля. Backfill и legacy-колонки не нужны: схема ещё не накатывалась на стенды.
 - CLI: `s3vault target ...`, `s3vault profile ...`; у `user` — `--s3-target`/`--encryption-profile`.
 - `sse_kms` и `storage_class` остаются write-side параметрами цели.
 
@@ -75,7 +75,7 @@
 | Файл/пакет | Изменение |
 |---|---|
 | `internal/port/s3identity.go` | `Principal` получает `User UserPolicy`; `UserPolicy.Target *S3Target`; новые sentinel-ошибки `ErrAuthUnavailable`, `ErrAuthInternal`. |
-| `internal/adapter/s3auth/postgres/` | Адаптер `port.S3Identity`: `postgres.go` (пул, миграция, стартовая валидация, `Ping`, `Close`), `identity.go` (`Lookup`, `Allow` по JOIN с реестрами), `admin.go` (`user ...`, ссылки на профиль/цель), `registry.go` (`target ...`, `profile ...`), `migrations/001_users.sql` (финальная схема). |
+| `internal/adapter/s3auth/postgres/` | Адаптер `port.S3Identity`: `postgres.go` (пул, миграция, стартовая валидация, `Ping`, `Close`), `identity.go` (`Lookup`, `Allow` по JOIN с реестрами), `admin.go` (`user ...`, ссылки на профиль/цель), `registry.go` (`target ...`, `profile ...`), `migrations/001_users.sql` (финальная схема, включая запечатанный KEK профиля). |
 | `internal/adapter/s3target/` | Разбор и валидация профиля цели, `sse_kms`/`storage_class`, `Namespace`/`Fingerprint`, пул `ObjectStore` по fingerprint. |
 | `internal/adapter/s3/store.go` | `NewWithOptions`: SSE-KMS и `x-amz-storage-class` только при заданных опциях цели. |
 | `internal/adapter/s3auth/secretbox/` | AES-256-GCM для `secret_key` в БД; `ParseKey`/`Seal`/`Open`/`GenerateSecret`. |
@@ -198,7 +198,7 @@ CREATE TABLE s3vault_users (
 
 ### 3.1.1 Миграция
 
-Схема создаётся одной миграцией `001_users.sql`: реестры профилей/целей и таблица пользователей с FK. Ранее существовавшие legacy-колонки (`encryption`, `s3_target`, `s3_secret_*`, `s3_session_*`) в этой ветке не создаются, поэтому backfill не нужен: миграции ещё не накатывались на стенды. Если схема уже была создана старой веткой, её нужно пересоздать (вне scope мигратора).
+Схема создаётся одной миграцией `001_users.sql`: реестры профилей/целей, таблица пользователей с FK и запечатанный native KEK профиля. Ранее существовавшие legacy-колонки (`encryption`, `s3_target`, `s3_secret_*`, `s3_session_*`) в этой ветке не создаются, поэтому backfill не нужен: миграции ещё не накатывались на стенды. Если схема уже была создана старой веткой, её нужно пересоздать (вне scope мигратора).
 
 ### 3.2 JSON профиля шифрования
 
@@ -212,6 +212,7 @@ CREATE TABLE s3vault_users (
     "public_key_path": "/etc/s3vault/users/alice/public.pem",
     "private_key_path": "/etc/s3vault/users/alice/private.pem",
     "key_file": "",
+    "key_env": "",
     "chunk_size": 65536
   },
   "command": {
@@ -230,12 +231,14 @@ CREATE TABLE s3vault_users (
 - Неизвестные поля отвергаются (`DisallowUnknownFields`).
 - `native.wrap`: `rsa-oaep` (по умолчанию) или `keyfile`.
   - `rsa-oaep`: обязателен `private_key_path` (для чтения); `public_key_path` опционален, потому что публичная часть выводится из приватной.
-  - `keyfile`: обязателен `key_file`.
+  - `keyfile`: ключ берётся из запечатанных `kek_nonce`/`kek_ciphertext` профиля, иначе из `key_file`, иначе из `key_env` (по умолчанию `S3VAULT_ENCRYPTION_NATIVE_KEY`). Значение env — 32 байта в base64 или 64 hex-символа.
   - `chunk_size`: по умолчанию `65536`; допустимый диапазон — `config.MinNativeChunkSize`..`config.MaxNativeChunkSize`.
 - `command`: обязательны непустые `encrypt` и `decrypt`; первый элемент argv непустой; `provider` по умолчанию `cryptopro`; `thumbprint` обязателен и нормализуется; `timeout` — строка Go duration, по умолчанию `30m`.
 - Для `mode=none` ключевые поля игнорируются.
 - Пути к ключам — абсолютные, указывают на обычные файлы; приватный ключ/`key_file` должны быть доступны процессу шлюза. Секреты (PIN, пароли) в `encrypt`/`decrypt` argv не допускаются — только через env, как и в существующем `command`-режиме.
 - Сборка профиля выполняется тем же `encrypt.New`, что и глобальный конфиг, поэтому формат и ограничения ключей не дублируются.
+
+Запечатанный KEK создаётся администратором из env и хранится только как `kek_nonce`/`kek_ciphertext` (AES-256-GCM под мастер-ключом, AAD `encryption.kek:<profile uid>`). В `config` ключа нет. `profile add/update --native-key-env VAR` читает переменную, требует `mode=native` и `wrap=keyfile` (или пустой wrap) и несовместим с `key_file`/`key_env` в JSON. `profile update` без флага очищает запечатанный ключ: профиль заменяется целиком.
 
 ### 3.3 Миграции
 
@@ -244,7 +247,7 @@ CREATE TABLE s3vault_users (
 - Миграции применяются автоматически при открытии БД в `server` и в `s3vault user/target/profile ...`.
 - `Open` держит `pg_advisory_lock` на всё время применения миграций; это защищает от гонки нескольких реплик/CLI.
 - Миграции только `up`; отката в v1 нет.
-- Внешняя библиотека миграций не вводится: четыре миграции и таблица версий проще `golang-migrate`/`goose`.
+- Внешняя библиотека миграций не вводится: одна миграция и таблица версий проще `golang-migrate`/`goose`.
 
 ### 3.4 Зависимость pgx
 
@@ -273,6 +276,12 @@ CREATE TABLE s3vault_users (
 `target_uid` — неизменяемый случайный идентификатор, поэтому переименование цели не требует перешифровки. Ciphertext нельзя переставить ни в другую строку цели, ни в другую колонку. Прямая SQL-правка `uid` делает секреты нечитаемыми, и старт падает.
 
 `secret_key`/`session_token` цели **никогда** не попадают в `config jsonb`, в `target list`/`user list`, в логи или в argv. Их принимает только файл/stdin при `target add`/`target update`.
+
+Native KEK профиля шифрования защищён тем же мастер-ключом и лежит в строке профиля:
+
+- `kek_nonce` + `kek_ciphertext` — 32-байтовый KEK; `NULL` означает, что ключ берётся из `key_file`/`key_env` профиля;
+- AAD: `encryption.kek:<profile_uid>`, поэтому ciphertext нельзя перенести в другой профиль;
+- в `config jsonb` ключа нет; `profile update` без `--native-key-env` очищает запечатанный ключ.
 
 ---
 

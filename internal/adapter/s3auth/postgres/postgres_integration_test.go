@@ -48,8 +48,8 @@ func testIdentity(t *testing.T) (*Identity, []byte) {
 		QueryTimeout: 2 * time.Second,
 		MasterKey:    key,
 		Bucket:       "s3vault",
-		ValidateEncryption: func(raw json.RawMessage) error {
-			_, err := profiles.ResolveRaw(raw)
+		ValidateEncryption: func(raw json.RawMessage, kek []byte) error {
+			_, err := profiles.Resolve(raw, kek)
 
 			return err
 		},
@@ -86,7 +86,7 @@ func TestIntegrationUsers(t *testing.T) {
 	id, _ := testIdentity(t)
 	ctx := t.Context()
 
-	profile, err := id.AddEncryptionProfile(ctx, "shared-none", json.RawMessage(`{"mode":"none"}`))
+	profile, err := id.AddEncryptionProfile(ctx, "shared-none", json.RawMessage(`{"mode":"none"}`), nil)
 	require.NoError(t, err)
 	assert.NotEmpty(t, profile.UID)
 
@@ -169,7 +169,7 @@ func TestIntegrationUsers(t *testing.T) {
 	require.Len(t, users, 3)
 
 	// Renaming a shared profile is visible to every assigned user.
-	renamed, err := id.UpdateEncryptionProfile(ctx, profile.Name, json.RawMessage(`{"mode":"none"}`), "renamed-none")
+	renamed, err := id.UpdateEncryptionProfile(ctx, profile.Name, json.RawMessage(`{"mode":"none"}`), "renamed-none", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "renamed-none", renamed.Name)
 	assert.Equal(t, int64(2), renamed.Users)
@@ -353,13 +353,13 @@ func TestIntegrationStartupValidation(t *testing.T) {
 		QueryTimeout: 2 * time.Second,
 		MasterKey:    key,
 		Bucket:       "s3vault",
-		ValidateEncryption: func(raw json.RawMessage) error {
+		ValidateEncryption: func(raw json.RawMessage, kek []byte) error {
 			resolver, err := encrypt.NewResolver(config.EncryptionConfig{Mode: "none"})
 			if err != nil {
 				return err
 			}
 
-			_, err = resolver.ResolveRaw(raw)
+			_, err = resolver.Resolve(raw, kek)
 
 			return err
 		},
@@ -402,6 +402,67 @@ func TestIntegrationDisabledLookup(t *testing.T) {
 	_, ok, err := id.Lookup(ctx, u.AccessKeyID)
 	assert.False(t, ok)
 	assert.True(t, errors.Is(err, port.ErrAccessDenied))
+}
+
+func TestIntegrationSealedProfileKEK(t *testing.T) {
+	id, key := testIdentity(t)
+	ctx := t.Context()
+
+	kek := []byte("0123456789abcdef0123456789abcdef")
+	profile, err := id.AddEncryptionProfile(ctx, "shared-native",
+		json.RawMessage(`{"mode":"native","native":{"wrap":"keyfile"}}`), kek)
+	require.NoError(t, err)
+
+	u, _, err := id.AddUser(ctx, AddParams{
+		Name: "alice", Prefix: "tenant-a", EncryptionProfileName: profile.Name,
+	})
+	require.NoError(t, err)
+
+	p, ok, err := id.Lookup(ctx, u.AccessKeyID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, kek, p.User.EncryptionKEK)
+	assert.NotContains(t, string(p.User.Encryption), string(kek))
+
+	// The startup validation path must decrypt the sealed key before resolving
+	// the profile, otherwise every restart would reject a valid row.
+	reopened, err := Open(ctx, Config{
+		DSN:          os.Getenv("S3VAULT_TEST_POSTGRES_DSN"),
+		MaxConns:     1,
+		QueryTimeout: 2 * time.Second,
+		MasterKey:    key,
+		Bucket:       "s3vault",
+		ValidateEncryption: func(raw json.RawMessage, injected []byte) error {
+			resolver, err := encrypt.NewResolver(config.EncryptionConfig{Mode: "none"})
+			if err != nil {
+				return err
+			}
+
+			_, err = resolver.Resolve(raw, injected)
+
+			return err
+		},
+	})
+	require.NoError(t, err)
+	reopened.Close()
+
+	var stored []byte
+	require.NoError(t, id.pool.QueryRow(ctx,
+		"SELECT kek_ciphertext FROM s3vault_encryption_profiles WHERE uid = $1", profile.UID,
+	).Scan(&stored))
+	assert.NotEmpty(t, stored)
+	assert.NotEqual(t, kek, stored)
+
+	// Updating the profile replaces the sealed key under the same uid.
+	next := []byte("fedcba9876543210fedcba9876543210")
+	_, err = id.UpdateEncryptionProfile(ctx, profile.Name,
+		json.RawMessage(`{"mode":"native","native":{"wrap":"keyfile"}}`), "", next)
+	require.NoError(t, err)
+
+	p, ok, err = id.Lookup(ctx, u.AccessKeyID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, next, p.User.EncryptionKEK)
 }
 
 func ptr[T any](v T) *T { return &v }
