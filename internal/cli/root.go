@@ -1,3 +1,5 @@
+// Package cli implements the s3vault command tree: archive, upload, download,
+// the S3 gateway server, cache maintenance and configuration commands.
 package cli
 
 import (
@@ -244,14 +246,15 @@ func newArchiveCmd(state *runState) *cobra.Command {
 			}
 			defer closeStore()
 			svc = svc.WithMetrics(met)
+			delAfter, delIfExist := destructiveFlags(cmd, deleteAfter, cfg.Archive.DeleteAfterUpload, deleteIfExist, cfg.Archive.DeleteIfExists)
 			st, err := svc.Run(ctx, service.ArchiveOptions{
 				Root:              args[0],
 				OlderThan:         d,
 				DryRun:            dryRun,
 				Workers:           cfg.Archive.Workers,
 				FailFast:          failFast || cfg.Archive.FailFast,
-				DeleteAfterUpload: deleteAfter || cfg.Archive.DeleteAfterUpload,
-				DeleteIfExists:    deleteIfExist || cfg.Archive.DeleteIfExists,
+				DeleteAfterUpload: delAfter,
+				DeleteIfExists:    delIfExist,
 			})
 			if printErr := printStats(cmd.OutOrStdout(), output, st); printErr != nil {
 				return printErr
@@ -276,6 +279,25 @@ func newArchiveCmd(state *runState) *cobra.Command {
 	cmd.Flags().BoolVar(&deleteIfExist, "delete-if-exists", false, "delete local file when remote already has identical content (skip)")
 	cmd.Flags().StringVar(&metricsListen, "metrics-listen", "", "prometheus bind address for the duration of the run")
 	return cmd
+}
+
+// destructiveFlags merges the delete switches with config. A flag passed on
+// the command line wins in both directions; without the Changed() check
+// `flag || config` made `--delete-after-upload=false` unable to disable
+// `archive.delete_after_upload: true` from YAML or env (problems.md D4).
+func destructiveFlags(cmd *cobra.Command, flagAfter, cfgAfter, flagIfExists, cfgIfExists bool) (after, ifExists bool) {
+	after = cfgAfter
+	ifExists = cfgIfExists
+
+	if cmd.Flags().Changed("delete-after-upload") {
+		after = flagAfter
+	}
+
+	if cmd.Flags().Changed("delete-if-exists") {
+		ifExists = flagIfExists
+	}
+
+	return after, ifExists
 }
 
 func printStats(w io.Writer, format string, st domain.ArchiveStats) error {
@@ -345,11 +367,12 @@ func newUploadCmd(state *runState) *cobra.Command {
 			}
 			defer closeStore()
 			svc = svc.WithMetrics(met)
+			delAfter, delIfExist := destructiveFlags(cmd, deleteAfter, cfg.Archive.DeleteAfterUpload, deleteIfExist, cfg.Archive.DeleteIfExists)
 			st, _, err := svc.UploadFile(ctx, info, service.ArchiveOptions{
 				Root:              root,
 				DryRun:            dryRun,
-				DeleteAfterUpload: deleteAfter || cfg.Archive.DeleteAfterUpload,
-				DeleteIfExists:    deleteIfExist || cfg.Archive.DeleteIfExists,
+				DeleteAfterUpload: delAfter,
+				DeleteIfExists:    delIfExist,
 				ExplicitKey:       key,
 				Op:                metrics.OpUpload,
 			})

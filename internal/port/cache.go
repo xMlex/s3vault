@@ -21,7 +21,12 @@ type EntryMeta struct {
 type PlaintextCache interface {
 	Get(ctx context.Context, id CacheID) (path string, hit bool, err error)
 	Lookup(ctx context.Context, id CacheID) (path string, meta EntryMeta, hit bool, err error)
-	Populate(ctx context.Context, id CacheID, meta EntryMeta, fill func(w io.Writer) error) (path string, err error)
+	// Populate fills the entry when its stored identity differs from meta.
+	// The fill may report the identity it discovered while streaming (a cold
+	// miss has no container header before the body); non-empty reported
+	// fields override the declared meta in the sidecar, so the sidecar always
+	// describes the body it was written beside.
+	Populate(ctx context.Context, id CacheID, meta EntryMeta, fill func(w io.Writer) (EntryMeta, error)) (path string, err error)
 	MarkValidated(ctx context.Context, id CacheID, meta EntryMeta) error
 	// Remove drops a plaintext entry if present (best-effort after DeleteObject).
 	Remove(ctx context.Context, id CacheID) error

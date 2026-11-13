@@ -3,6 +3,7 @@
 package cache
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -14,6 +15,20 @@ func lockExclusive(f *os.File) error {
 		return fmt.Errorf("flock: %w", err)
 	}
 	return nil
+}
+
+// tryLockExclusive takes LOCK_EX without blocking: ok=false means another
+// holder has the lock right now.
+func tryLockExclusive(f *os.File) (ok bool, err error) {
+	err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, unix.EWOULDBLOCK):
+		return false, nil
+	default:
+		return false, fmt.Errorf("flock: %w", err)
+	}
 }
 
 func unlockExclusive(f *os.File) error {

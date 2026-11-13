@@ -1,6 +1,7 @@
 package encrypt
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -225,8 +226,14 @@ func (n *Native) Decrypt(ctx context.Context, dst io.Writer, src io.Reader) erro
 
 		if _, err := io.ReadFull(src, lenBuf[:]); err != nil {
 			if err == io.EOF {
+				// A cut exactly on a frame boundary is indistinguishable from a
+				// complete stream here: the expected plaintext length lives in
+				// the outer S3VCTR01 header, not in this inner one. The caller
+				// that has the header verifies the stream after decrypting
+				// (plaintextCheck).
 				return nil
 			}
+
 			return fmt.Errorf("chunk length: %w", err)
 		}
 
@@ -493,6 +500,13 @@ func loadKEK(cfg config.NativeEnc) ([]byte, error) {
 	if cfg.KeyFile != "" {
 		b, err := os.ReadFile(cfg.KeyFile)
 		if err == nil {
+			// An empty (or blank) file would hash into a publicly known KEK —
+			// sha256("") — and every deployment that lost its key material to a
+			// truncated mount would silently share it.
+			if len(bytes.TrimSpace(b)) == 0 {
+				return nil, fmt.Errorf("key file %s is empty: write 32 random bytes or a non-empty passphrase", cfg.KeyFile)
+			}
+
 			return kekFromBytes(b), nil
 		}
 

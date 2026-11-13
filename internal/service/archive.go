@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	stdhash "hash"
 	"io"
 	"log/slog"
 	"mime"
@@ -394,7 +396,8 @@ func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, 
 		}
 	}
 
-	pr, wait := a.encryptPipe(ctx, info.AbsPath)
+	digest := &digestReader{h: sha256.New()}
+	pr, wait := a.encryptPipe(ctx, info.AbsPath, digest)
 
 	body := pr
 	if len(hdrBytes) > 0 {
@@ -412,15 +415,50 @@ func (a *Archive) upload(ctx context.Context, key string, info domain.FileInfo, 
 		return waitErr
 	}
 
+	// The header/PutMeta identity came from an earlier snapshot: the scanner's
+	// stat plus a separate hash read. Prove the streamed bytes are still that
+	// snapshot. A file that changed mid-read would otherwise be committed under
+	// a header that lies about it, and a later Decide could call it identical
+	// and let --delete-if-exists remove the only good copy (problems.md D8).
+	if got := digest.hex(); digest.n != info.Size || got != sum {
+		// The object that was just written describes bytes it does not contain:
+		// drop it rather than leave a lying entry for the next Decide/GET.
+		_ = a.store.Delete(ctx, key)
+
+		return fmt.Errorf("source changed during upload: declared %d bytes sha256 %s, streamed %d bytes sha256 %s",
+			info.Size, sum, digest.n, got)
+	}
+
 	a.metrics.ObserveUpload(time.Since(started), info.Size)
 
 	return nil
 }
 
+// digestReader hashes and counts the plaintext as the encryptor pulls it, so
+// upload can prove the streamed bytes are the ones the header declares.
+type digestReader struct {
+	r io.Reader
+	h stdhash.Hash
+	n int64
+}
+
+func (d *digestReader) Read(p []byte) (int, error) {
+	n, err := d.r.Read(p)
+	if n > 0 {
+		d.n += int64(n)
+		_, _ = d.h.Write(p[:n])
+	}
+
+	return n, err
+}
+
+func (d *digestReader) hex() string { return hex.EncodeToString(d.h.Sum(nil)) }
+
 // encryptPipe opens path and streams a.enc.Encrypt over it through an io.Pipe.
 // The returned reader yields the ciphertext; wait joins the producer goroutine
 // and must be called exactly once after the reader is consumed (or abandoned).
-func (a *Archive) encryptPipe(ctx context.Context, path string) (io.Reader, func() error) {
+// A non-nil digest observes the plaintext the encryptor reads.
+func (a *Archive) encryptPipe(ctx context.Context, path string, digest *digestReader) (io.Reader, func() error) {
 	pr, pw := io.Pipe()
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -434,7 +472,14 @@ func (a *Archive) encryptPipe(ctx context.Context, path string) (io.Reader, func
 		// handoff to the uploader. A buffered writer turns a chunk (64 KiB by
 		// default) into a quarter of a pipe round trip.
 		bw := bufio.NewWriterSize(pw, iocopy.BufferSize)
-		if err = a.enc.Encrypt(ctx, bw, f); err != nil {
+
+		var src io.Reader = f
+		if digest != nil {
+			digest.r = f
+			src = digest
+		}
+
+		if err = a.enc.Encrypt(ctx, bw, src); err != nil {
 			_ = pw.CloseWithError(err)
 			return err
 		}

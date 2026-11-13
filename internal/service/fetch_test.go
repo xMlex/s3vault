@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/xMlex/s3vault/internal/adapter/cache"
 	"github.com/xMlex/s3vault/internal/adapter/encrypt"
 	"github.com/xMlex/s3vault/internal/config"
 	"github.com/xMlex/s3vault/internal/container"
@@ -248,17 +249,134 @@ func TestFetchDownloadPlain(t *testing.T) {
 	assert.Equal(t, "hello", string(b))
 }
 
+// A truncated object whose cut lands exactly on a chunk boundary decrypts
+// "successfully": Native.Decrypt cannot tell EOF-after-a-complete-chunk from the
+// end of the object, because the expected plaintext length lives in the outer
+// S3VCTR01 header. Download must compare the streamed bytes against that header
+// and leave the existing destination untouched (problems.md D5).
+func TestFetchDownloadRejectsTruncatedObject(t *testing.T) {
+	t.Parallel()
+
+	enc := nativeEncryptor(t)                  // 1 KiB chunks
+	plain := bytes.Repeat([]byte("abcd"), 512) // exactly two chunks
+
+	var cipher bytes.Buffer
+	require.NoError(t, enc.Encrypt(context.Background(), &cipher, bytes.NewReader(plain)))
+
+	const frame = 4 + 1024 + 16 // length prefix + chunk + GCM tag
+	require.Greater(t, cipher.Len(), frame)
+	truncated := cipher.Bytes()[:cipher.Len()-frame]
+
+	sum := sha256.Sum256(plain)
+	hdr, err := container.Marshal(container.Header{
+		Version:       container.VersionV1,
+		PlaintextSize: int64(len(plain)),
+		SHA256:        sum[:],
+		Enc:           container.EncNative,
+		Wrap:          container.WrapFromName("keyfile"),
+	})
+	require.NoError(t, err)
+
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k",
+		io.MultiReader(bytes.NewReader(hdr), bytes.NewReader(truncated)), domain.PutMeta{}))
+
+	dest := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.WriteFile(dest, []byte("good copy"), 0o600))
+
+	err = service.NewFetch(store, enc).Download(context.Background(), "k", dest, io.Discard)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "truncated")
+
+	b, readErr := os.ReadFile(dest) //nolint:gosec // dest is a path under t.TempDir()
+	require.NoError(t, readErr)
+	assert.Equal(t, "good copy", string(b), "a truncated stream must not replace the existing destination")
+}
+
+// The cache must not store plaintext that does not match the header it arrived
+// with: a later hit would advertise an identity those bytes do not have.
+func TestFetchMaterializeRejectsTruncatedObject(t *testing.T) {
+	t.Parallel()
+
+	enc := nativeEncryptor(t)
+	plain := bytes.Repeat([]byte("abcd"), 512)
+
+	var cipher bytes.Buffer
+	require.NoError(t, enc.Encrypt(context.Background(), &cipher, bytes.NewReader(plain)))
+
+	const frame = 4 + 1024 + 16
+
+	truncated := cipher.Bytes()[:cipher.Len()-frame]
+
+	sum := sha256.Sum256(plain)
+	hdr, err := container.Marshal(container.Header{
+		Version:       container.VersionV1,
+		PlaintextSize: int64(len(plain)),
+		SHA256:        sum[:],
+		Enc:           container.EncNative,
+		Wrap:          container.WrapFromName("keyfile"),
+	})
+	require.NoError(t, err)
+
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k",
+		io.MultiReader(bytes.NewReader(hdr), bytes.NewReader(truncated)), domain.PutMeta{}))
+
+	disk, err := cache.New(cache.Options{Dir: t.TempDir(), TTL: time.Hour})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = disk.Close() })
+
+	f := service.NewFetch(store, enc).WithCache(disk, "bucket", "fp").WithSoftTTL(time.Minute)
+	_, err = f.Materialize(context.Background(), "k")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "truncated")
+
+	_, hit, err := disk.Get(context.Background(), cache.ID("bucket", "k", "fp"))
+	require.NoError(t, err)
+	assert.False(t, hit, "a truncated stream must not be committed to the cache")
+}
+
+// A non-native payload has no authentication of its own, so the header digest
+// is its only integrity check: a body that does not match must be refused.
+func TestFetchDownloadRejectsDigestMismatch(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("payload bytes")
+	wrong := sha256.Sum256([]byte("some other content"))
+	hdr, err := container.Marshal(container.Header{
+		Version:       container.VersionV1,
+		PlaintextSize: int64(len(payload)),
+		SHA256:        wrong[:],
+		Enc:           container.EncNone,
+	})
+	require.NoError(t, err)
+
+	store := newMemStore()
+	require.NoError(t, store.Put(context.Background(), "k",
+		io.MultiReader(bytes.NewReader(hdr), bytes.NewReader(payload)), domain.PutMeta{}))
+
+	dest := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.WriteFile(dest, []byte("good copy"), 0o600))
+
+	err = service.NewFetch(store, encrypt.Passthrough{}).Download(context.Background(), "k", dest, io.Discard)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match container header")
+
+	b, readErr := os.ReadFile(dest) //nolint:gosec // dest is a path under t.TempDir()
+	require.NoError(t, readErr)
+	assert.Equal(t, "good copy", string(b))
+}
+
 func TestFetchDownloadUsesContainerThumbprint(t *testing.T) {
 	t.Parallel()
 	headerTP := "cccccccccccccccccccccccccccccccccccccccc"
-	sum, err := container.SHA256FromHex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-	require.NoError(t, err)
+	sum := sha256.Sum256([]byte(headerTP))
 	tp, err := container.ThumbprintFromHex(headerTP)
 	require.NoError(t, err)
 	hdr, err := container.Marshal(container.Header{
 		Version:       container.VersionV1,
-		PlaintextSize: 6,
-		SHA256:        sum,
+		PlaintextSize: int64(len(headerTP)),
+		SHA256:        sum[:],
 		Enc:           container.EncCommand,
 		Provider:      "cryptopro",
 		Thumbprint:    tp,
@@ -290,14 +408,13 @@ func TestFetchDownloadPrefersContainerThumbprintOverConfig(t *testing.T) {
 	t.Parallel()
 	headerTP := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	cfgTP := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	sum, err := container.SHA256FromHex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-	require.NoError(t, err)
+	sum := sha256.Sum256([]byte(headerTP))
 	tp, err := container.ThumbprintFromHex(headerTP)
 	require.NoError(t, err)
 	hdr, err := container.Marshal(container.Header{
 		Version:       container.VersionV1,
-		PlaintextSize: 1,
-		SHA256:        sum,
+		PlaintextSize: int64(len(headerTP)),
+		SHA256:        sum[:],
 		Enc:           container.EncCommand,
 		Provider:      "cryptopro",
 		Thumbprint:    tp,

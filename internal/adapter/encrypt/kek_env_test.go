@@ -42,6 +42,25 @@ func TestParseKEKEnv(t *testing.T) {
 	})
 }
 
+// An empty (or blank) key file would hash into sha256(""), a publicly known
+// KEK: every deployment that lost its key material to a truncated mount would
+// silently share one key. A readable-but-empty file must fail, not fall back.
+func TestLoadKEKRejectsEmptyKeyFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "kek.bin")
+
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+	_, err := loadKEK(config.NativeEnc{KeyFile: path})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty")
+
+	require.NoError(t, os.WriteFile(path, []byte("\n\t "), 0o600))
+	_, err = loadKEK(config.NativeEnc{KeyFile: path})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty")
+}
+
 func TestLoadKEKPrefersReadableFile(t *testing.T) {
 	envKey := []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	fileKey := []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")

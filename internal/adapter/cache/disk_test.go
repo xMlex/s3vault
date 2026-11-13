@@ -22,9 +22,9 @@ func TestDiskPopulateGet(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
-	p, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "abc"}, func(w io.Writer) error {
+	p, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "abc"}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "hello")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 	b, err := os.ReadFile(p)
@@ -52,9 +52,9 @@ func TestDiskMarkValidated(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "a", ETag: "e1"}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "a", ETag: "e1"}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "x")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 	_, before, hit, err := d.Lookup(context.Background(), id)
@@ -75,14 +75,14 @@ func TestDiskPopulateReplacesOnIdentityChange(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "old"}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "old"}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "old")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
-	p, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "new"}, func(w io.Writer) error {
+	p, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "new"}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "new")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 	b, err := os.ReadFile(p)
@@ -98,9 +98,9 @@ func TestDiskTTLExpiry(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: 20 * time.Millisecond, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "x")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 	time.Sleep(40 * time.Millisecond)
@@ -119,11 +119,13 @@ func TestDiskStampede(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "s"}, func(w io.Writer) error {
+
+			_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "s"}, func(w io.Writer) (port.EntryMeta, error) {
 				fills.Add(1)
 				time.Sleep(30 * time.Millisecond)
 				_, err := io.WriteString(w, "body")
-				return err
+
+				return port.EntryMeta{}, err
 			})
 			assert.NoError(t, err)
 		}()
@@ -136,9 +138,9 @@ func TestDiskGetSkipsFreshAtimeWrite(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "body")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 
@@ -161,9 +163,9 @@ func TestDiskConcurrentGetMeta(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "x"}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "x"}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "body")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 
@@ -205,9 +207,9 @@ func TestDiskLRU(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 8})
 	fill := func(id port.CacheID, s string) {
-		_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+		_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 			_, err := io.WriteString(w, s)
-			return err
+			return port.EntryMeta{}, err
 		})
 		require.NoError(t, err)
 	}
@@ -232,14 +234,14 @@ func TestDiskSweepExpired(t *testing.T) {
 	d := newTestDisk(t, Options{TTL: 20 * time.Millisecond, MaxBytes: 1 << 20})
 	keep := ID("b", "keep", "fp")
 	drop := ID("b", "drop", "fp")
-	_, err := d.Populate(context.Background(), keep, port.EntryMeta{}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), keep, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "keep")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
-	_, err = d.Populate(context.Background(), drop, port.EntryMeta{}, func(w io.Writer) error {
+	_, err = d.Populate(context.Background(), drop, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "drop")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 
@@ -270,9 +272,9 @@ func TestDiskStartSweeper(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: 30 * time.Millisecond, MaxBytes: 1 << 20})
 	id := ID("b", "sweep", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "x")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 
@@ -290,9 +292,9 @@ func TestDiskRemoveCleansLockAndShard(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "hello")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 
@@ -317,9 +319,9 @@ func TestDiskSweepExpiredCleansLockAndShard(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{TTL: 20 * time.Millisecond, MaxBytes: 1 << 20})
 	id := ID("b", "drop", "fp")
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "drop")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 
@@ -341,6 +343,127 @@ func TestDiskSweepExpiredCleansLockAndShard(t *testing.T) {
 	require.True(t, os.IsNotExist(err), "empty shard directory should be removed after sweep")
 }
 
+func TestDiskMarkValidatedKeepsFresherIdentity(t *testing.T) {
+	t.Parallel()
+	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
+	id := ID("b", "k", "fp")
+
+	fill := func(sha, body string) {
+		_, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: sha}, func(w io.Writer) (port.EntryMeta, error) {
+			_, werr := io.WriteString(w, body)
+			return port.EntryMeta{SHA256: sha}, werr
+		})
+		require.NoError(t, err)
+	}
+	fill("v1", "v1")
+
+	_, cached, hit, err := d.Lookup(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, hit)
+	require.Equal(t, "v1", cached.SHA256)
+
+	// A concurrent populate replaced the entry with a newer version after the
+	// reader captured the v1 identity.
+	fill("v2", "v2")
+
+	// The reader's validation result is now stale: committing it would
+	// describe v2 bytes with v1 identity (problems.md D14).
+	time.Sleep(5 * time.Millisecond)
+	require.NoError(t, d.MarkValidated(context.Background(), id, port.EntryMeta{
+		SHA256: "v1", ValidatedAt: time.Now().UTC(),
+	}))
+	_, after, hit, err := d.Lookup(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, hit)
+	assert.Equal(t, "v2", after.SHA256, "a stale validation must not clobber the fresher identity")
+
+	// Validating the version that is actually stored updates as before.
+	time.Sleep(5 * time.Millisecond)
+	require.NoError(t, d.MarkValidated(context.Background(), id, port.EntryMeta{
+		SHA256: "v2", ValidatedAt: time.Now().UTC(),
+	}))
+	_, after2, hit, err := d.Lookup(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, hit)
+	assert.Equal(t, "v2", after2.SHA256)
+	assert.True(t, after2.ValidatedAt.After(after.ValidatedAt))
+}
+
+// The invalidation must land while a populate is blocked in its fill: the
+// removal may not delete the fill's temp or lock, and the fill may not
+// resurrect the pre-removal version past the completed invalidation
+// (problems.md D6).
+func TestDiskPopulateDiscardsWhenEntryInvalidated(t *testing.T) {
+	t.Parallel()
+	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
+	id := ID("b", "k", "fp")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	type populateResult struct {
+		p   string
+		err error
+	}
+
+	ch := make(chan populateResult, 1)
+
+	go func() {
+		p, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "v1"}, func(w io.Writer) (port.EntryMeta, error) {
+			close(started)
+			<-release
+
+			_, werr := io.WriteString(w, "v1")
+
+			return port.EntryMeta{SHA256: "v1"}, werr
+		})
+		ch <- populateResult{p, err}
+	}()
+
+	<-started
+
+	require.NoError(t, d.Remove(context.Background(), id))
+	close(release)
+
+	res := <-ch
+	require.ErrorIs(t, res.err, ErrInvalidated)
+
+	_, _, hit, err := d.Lookup(context.Background(), id)
+	require.NoError(t, err)
+	assert.False(t, hit, "the invalidated version must not be committed")
+
+	// Nothing the abandoned fill wrote survives: no data, no sidecar, no temp.
+	dataRel, _, _, _, err := d.rel(id)
+	require.NoError(t, err)
+
+	shard := path.Dir(dataRel)
+	sf, err := d.root.Open(shard)
+	require.NoError(t, err)
+	names, err := sf.ReadDir(-1)
+	_ = sf.Close()
+
+	require.NoError(t, err)
+
+	for _, n := range names {
+		assert.NotContains(t, n.Name(), ".tmp", "no in-flight fill temp may survive the discard")
+	}
+
+	// A later populate commits the current version cleanly.
+	p, err := d.Populate(context.Background(), id, port.EntryMeta{SHA256: "v2"}, func(w io.Writer) (port.EntryMeta, error) {
+		_, werr := io.WriteString(w, "v2")
+		return port.EntryMeta{SHA256: "v2"}, werr
+	})
+	require.NoError(t, err)
+	b, err := os.ReadFile(p) //nolint:gosec // p is the cache entry path under t.TempDir()
+	require.NoError(t, err)
+	assert.Equal(t, "v2", string(b))
+
+	_, meta, hit, err := d.Lookup(context.Background(), id)
+	require.NoError(t, err)
+	require.True(t, hit)
+	assert.Equal(t, "v2", meta.SHA256)
+}
+
 func TestDiskRejectsBadID(t *testing.T) {
 	t.Parallel()
 	d := newTestDisk(t, Options{})
@@ -358,9 +481,9 @@ func TestDiskClearLeavesNeighbourDirectoriesAlone(t *testing.T) {
 	d := newTestDisk(t, Options{TTL: time.Hour, MaxBytes: 1 << 20})
 	id := ID("b", "k", "fp")
 
-	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) error {
+	_, err := d.Populate(context.Background(), id, port.EntryMeta{}, func(w io.Writer) (port.EntryMeta, error) {
 		_, err := io.WriteString(w, "cached")
-		return err
+		return port.EntryMeta{}, err
 	})
 	require.NoError(t, err)
 

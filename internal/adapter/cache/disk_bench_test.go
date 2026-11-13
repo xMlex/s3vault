@@ -22,10 +22,10 @@ func newBenchDisk(b *testing.B, opt Options) *Disk {
 	return d
 }
 
-func benchFill(payload []byte) func(io.Writer) error {
-	return func(w io.Writer) error {
+func benchFill(payload []byte) func(io.Writer) (port.EntryMeta, error) {
+	return func(w io.Writer) (port.EntryMeta, error) {
 		_, err := w.Write(payload)
-		return err
+		return port.EntryMeta{}, err
 	}
 }
 

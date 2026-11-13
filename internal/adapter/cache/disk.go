@@ -3,8 +3,10 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
@@ -21,8 +23,18 @@ import (
 	"github.com/xMlex/s3vault/internal/port"
 )
 
+// ErrInvalidated reports that the entry was removed (invalidated after a PUT,
+// evicted, swept) while its populate was still filling it. The caller treats it
+// as a plain miss: a retry downloads the version that is current now, instead
+// of committing a pre-invalidation body over the fresh removal.
+var ErrInvalidated = errors.New("cache entry removed while populating")
+
 // metaTmpSeq makes concurrent sidecar writes use distinct temp names.
 var metaTmpSeq atomic.Uint64
+
+// dataTmpSeq gives each populate its own temp name, so a removal that races a
+// fill can never truncate or rename over another fill's file (problems.md D6).
+var dataTmpSeq atomic.Uint64
 
 const (
 	hexIDLen = sha256HexLen
@@ -49,6 +61,12 @@ type Disk struct {
 	idxMu      sync.RWMutex
 	index      map[string]indexEntry // key = 64-hex cache id
 	totalBytes int64
+
+	// gens counts removals per id (guarded by idxMu). A populate captures the
+	// count after taking the entry's flock and discards its result at commit
+	// time when it changed: the entry was invalidated while the fill ran, and
+	// committing would resurrect the pre-invalidation version.
+	gens map[string]uint64
 }
 
 var _ port.PlaintextCache = (*Disk)(nil)
@@ -106,6 +124,7 @@ func New(opt Options) (*Disk, error) {
 		ttl:      opt.TTL,
 		maxBytes: opt.MaxBytes,
 		index:    make(map[string]indexEntry),
+		gens:     make(map[string]uint64),
 	}
 	if err := d.loadIndex(); err != nil {
 		_ = root.Close()
@@ -220,6 +239,13 @@ func (d *Disk) Remove(ctx context.Context, id port.CacheID) error {
 }
 
 // MarkValidated refreshes soft-TTL identity fields without rewriting plaintext.
+//
+// The caller validated the cached body against meta's identity. A concurrent
+// Populate may have replaced body and sidecar with a newer version since the
+// check: committing would describe fresh bytes with stale identity (problems.md
+// D14), so a mismatching sidecar is left untouched and the next revalidation
+// refreshes the entry. The entry's flock serializes the read-check-write against
+// a populate's rename+sidecar sequence.
 func (d *Disk) MarkValidated(ctx context.Context, id port.CacheID, meta port.EntryMeta) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -228,13 +254,39 @@ func (d *Disk) MarkValidated(ctx context.Context, id port.CacheID, meta port.Ent
 	if !validCacheID(key) {
 		return fmt.Errorf("invalid cache id")
 	}
-	dataRel, metaRel, _, _, err := d.rel(id)
+
+	dataRel, metaRel, lockRel, _, err := d.rel(id)
 	if err != nil {
 		return err
 	}
+
+	lf, err := d.acquireLock(lockRel)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // shard pruned with the entry: nothing to validate
+		}
+
+		return err
+	}
+
+	defer func() {
+		_ = unlockExclusive(lf)
+		_ = lf.Close()
+	}()
 	sc, err := d.readMeta(metaRel)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // the entry is gone; there is nothing to validate
+		}
 		return err
+	}
+
+	if sc.SHA256 != "" && meta.SHA256 != "" && sc.SHA256 != meta.SHA256 {
+		return nil
+	}
+
+	if sc.SHA256 == "" && sc.ETag != "" && meta.ETag != "" && sc.ETag != meta.ETag {
+		return nil
 	}
 	now := time.Now().UTC()
 	if meta.ETag != "" {
@@ -363,28 +415,155 @@ func (d *Disk) writeMeta(rel string, sc sidecar) error {
 	return nil
 }
 
+// removeEntry drops the committed entry (data + sidecar). It never destroys
+// what an in-flight populate owns: the entry's flock is tried first, and when
+// another populate holds it, only the committed files are removed. The running
+// fill notices the removal through the generation counter and discards itself
+// (ErrInvalidated) instead of renaming a stale body over the fresh removal
+// (problems.md D6).
 func (d *Disk) removeEntry(key, dataRel, metaRel string) error {
+	d.dropGen(key)
 	lockRel := dataRel + ".lock"
-	tmpRel := dataRel + ".tmp"
-	err1 := d.root.Remove(dataRel)
-	err2 := d.root.Remove(metaRel)
-	err3 := d.root.Remove(lockRel)
-	err4 := d.root.Remove(tmpRel)
+
+	lf, locked, lerr := d.tryLockEntry(lockRel)
+	if lerr == nil && lf != nil {
+		defer func() {
+			_ = unlockExclusive(lf)
+			_ = lf.Close()
+		}()
+	}
+
+	if lf == nil {
+		locked = false
+	}
+
+	var firstErr error
+
+	noteErr := func(err error) {
+		if err == nil || os.IsNotExist(err) {
+			return
+		}
+
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	if locked {
+		// No populate is in flight: the fixed-name tmp of a crashed older
+		// populate and the lock file itself are safe to remove. A unique
+		// in-flight tmp cannot exist in this state — it lives only while the
+		// lock is held. Unlinking the held lock is safe for later openers:
+		// acquireLock re-verifies the flocked inode against the path.
+		noteErr(d.root.Remove(lockRel))
+		noteErr(d.root.Remove(dataRel + ".tmp"))
+	}
+
+	noteErr(d.root.Remove(dataRel))
+	noteErr(d.root.Remove(metaRel))
 	d.forget(key)
-	d.pruneShardIfEmpty(dataRel)
-	if err1 != nil && !os.IsNotExist(err1) {
-		return err1
+
+	if locked {
+		// With the lock still present (busy path) the shard is not empty.
+		d.pruneShardIfEmpty(dataRel)
 	}
-	if err2 != nil && !os.IsNotExist(err2) {
-		return err2
+
+	return firstErr
+}
+
+// tryLockEntry opens the entry's lock file and takes its flock without
+// blocking. locked=false means a populate is in flight (or the lock does not
+// exist yet and there is nothing to exclude).
+func (d *Disk) tryLockEntry(lockRel string) (lf *os.File, locked bool, err error) {
+	lf, err = d.root.OpenFile(lockRel, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil // no shard directory: nothing to lock
+		}
+
+		return nil, false, err
 	}
-	if err3 != nil && !os.IsNotExist(err3) {
-		return err3
+
+	ok, lerr := tryLockExclusive(lf)
+	if lerr != nil || !ok {
+		_ = lf.Close()
+		return nil, false, lerr
 	}
-	if err4 != nil && !os.IsNotExist(err4) {
-		return err4
+
+	return lf, true, nil
+}
+
+// acquireLock opens and flocks the entry's lock file, verifying that the
+// flocked inode is still the one reachable at lockRel. A lock file removed
+// while it was held (a populate's deferred cleanup, removeEntry) can race a
+// concurrent opener into locking a stale inode beside a fresh one; re-checking
+// turns that race into an ordinary retry instead of two writers past one mutex.
+func (d *Disk) acquireLock(lockRel string) (*os.File, error) {
+	for range 64 {
+		lf, err := d.root.OpenFile(lockRel, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("cache lock: %w", err)
+		}
+
+		if err := lockExclusive(lf); err != nil {
+			_ = lf.Close()
+			return nil, err
+		}
+
+		same, statErr := sameLockInode(lf, d, lockRel)
+		if statErr == nil && same {
+			return lf, nil
+		}
+
+		_ = unlockExclusive(lf)
+		_ = lf.Close()
+
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return nil, fmt.Errorf("cache lock: %w", statErr)
+		}
+		// The lock file was replaced or removed while we waited: retry.
 	}
-	return nil
+
+	return nil, fmt.Errorf("cache lock: contention on %s did not settle", lockRel)
+}
+
+func sameLockInode(lf *os.File, d *Disk, lockRel string) (bool, error) {
+	st1, err := lf.Stat()
+	if err != nil {
+		return false, err
+	}
+
+	st2, err := d.root.Stat(lockRel)
+	if err != nil {
+		return false, err
+	}
+
+	return os.SameFile(st1, st2), nil
+}
+
+// dropGen counts one more removal of key. Every removeEntry bumps, so a
+// populate that started before the removal discards its result.
+func (d *Disk) dropGen(key string) {
+	d.idxMu.Lock()
+	d.gens[key]++
+	d.idxMu.Unlock()
+}
+
+func (d *Disk) loadGen(key string) uint64 {
+	d.idxMu.RLock()
+	defer d.idxMu.RUnlock()
+
+	return d.gens[key]
+}
+
+// clearGenIf forgets the counter when no removal happened since gen, keeping
+// the map bounded by ids that actually raced a removal.
+func (d *Disk) clearGenIf(key string, gen uint64) {
+	d.idxMu.Lock()
+	defer d.idxMu.Unlock()
+
+	if d.gens[key] == gen {
+		delete(d.gens, key)
+	}
 }
 
 func (d *Disk) pruneShardIfEmpty(dataRel string) {
@@ -474,7 +653,7 @@ func (d *Disk) loadIndex() error {
 }
 
 // Populate decrypts into the cache once per id+identity (singleflight + lockfile).
-func (d *Disk) Populate(ctx context.Context, id port.CacheID, meta port.EntryMeta, fill func(w io.Writer) error) (string, error) {
+func (d *Disk) Populate(ctx context.Context, id port.CacheID, meta port.EntryMeta, fill func(w io.Writer) (port.EntryMeta, error)) (string, error) {
 	flight := string(id) + "\x00" + meta.SHA256 + "\x00" + meta.ETag
 	v, err, _ := d.group.Do(flight, func() (any, error) {
 		return d.populate(ctx, id, meta, fill)
@@ -485,17 +664,22 @@ func (d *Disk) Populate(ctx context.Context, id port.CacheID, meta port.EntryMet
 	return v.(string), nil
 }
 
-func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMeta, fill func(w io.Writer) error) (string, error) {
+func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMeta, fill func(w io.Writer) (port.EntryMeta, error)) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	// Capture before anything else: any removal that lands after this point —
+	// invalidation after a PUT, eviction, sweep — must discard this fill
+	// (checked again at commit time), so a GET that raced a PUT cannot commit
+	// the pre-PUT version over the completed invalidation.
+	gen := d.loadGen(string(id))
 	if p, stored, hit, err := d.Lookup(ctx, id); err != nil {
 		return "", err
 	} else if hit && entryUnchanged(stored, meta) {
 		return p, nil
 	}
 
-	dataRel, metaRel, lockRel, tmpRel, err := d.rel(id)
+	dataRel, metaRel, lockRel, _, err := d.rel(id)
 	if err != nil {
 		return "", err
 	}
@@ -503,12 +687,8 @@ func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMet
 		return "", fmt.Errorf("mkdir shard: %w", err)
 	}
 
-	lf, err := d.root.OpenFile(lockRel, os.O_CREATE|os.O_RDWR, 0o600)
+	lf, err := d.acquireLock(lockRel)
 	if err != nil {
-		return "", fmt.Errorf("cache lock: %w", err)
-	}
-	if err := lockExclusive(lf); err != nil {
-		_ = lf.Close()
 		return "", err
 	}
 	defer func() {
@@ -526,6 +706,18 @@ func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMet
 		return "", err
 	}
 
+	return d.fillEntry(id, meta, fill, gen, dataRel, metaRel)
+}
+
+// fillEntry streams one fill into a unique temp, renames it into place and
+// commits the sidecar. It runs under the entry's lock; gen is the removal
+// counter captured before the fill, and a change means the entry was
+// invalidated while the fill ran.
+func (d *Disk) fillEntry(id port.CacheID, meta port.EntryMeta, fill func(w io.Writer) (port.EntryMeta, error), gen uint64, dataRel, metaRel string) (string, error) {
+	// Unique per-fill temp: a removal that races this fill can never truncate
+	// or rename over another fill's file, and two retries of one part number
+	// cannot collide either (problems.md D6).
+	tmpRel := dataRel + "." + strconv.FormatUint(dataTmpSeq.Add(1), 10) + ".tmp"
 	tf, err := d.root.OpenFile(tmpRel, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("cache tmp: %w", err)
@@ -536,9 +728,11 @@ func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMet
 			_ = d.root.Remove(tmpRel)
 		}
 	}()
-	if err := fill(tf); err != nil {
+
+	filled, ferr := fill(tf)
+	if ferr != nil {
 		_ = tf.Close()
-		return "", err
+		return "", ferr
 	}
 	if err := tf.Sync(); err != nil {
 		_ = tf.Close()
@@ -560,9 +754,37 @@ func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMet
 	}
 	tmpOK = true
 
+	sc := commitSidecar(st.Size(), meta, filled, d.ttl)
+	if err := d.writeMeta(metaRel, sc); err != nil {
+		_ = d.removeEntry(string(id), dataRel, metaRel)
+		return "", err
+	}
+
+	if d.loadGen(string(id)) != gen {
+		// The entry was removed while this fill was running. Committing would
+		// resurrect the pre-removal version past a completed invalidation.
+		_ = d.root.Remove(dataRel)
+		_ = d.root.Remove(metaRel)
+		d.forget(string(id))
+
+		return "", ErrInvalidated
+	}
+
+	d.remember(string(id), dataRel, metaRel, sc)
+	d.clearGenIf(string(id), gen)
+	d.evict()
+
+	return d.abs(dataRel), nil
+}
+
+// commitSidecar builds the sidecar for a just-renamed body. The fill may learn
+// the identity only while streaming (a cold miss has no container header before
+// the body), so its discovered fields win over the declared meta: the sidecar
+// written beside the rename always describes exactly these bytes.
+func commitSidecar(size int64, meta, filled port.EntryMeta, ttl time.Duration) sidecar {
 	now := time.Now().UTC()
 	sc := sidecar{
-		Size:         st.Size(),
+		Size:         size,
 		CachedAt:     now,
 		ATime:        now,
 		ETag:         meta.ETag,
@@ -573,16 +795,24 @@ func (d *Disk) populate(ctx context.Context, id port.CacheID, meta port.EntryMet
 	if sc.ValidatedAt.IsZero() {
 		sc.ValidatedAt = now
 	}
-	if d.ttl > 0 {
-		sc.ExpiresAt = now.Add(d.ttl)
+
+	if filled.SHA256 != "" {
+		sc.SHA256 = filled.SHA256
 	}
-	if err := d.writeMeta(metaRel, sc); err != nil {
-		_ = d.removeEntry(string(id), dataRel, metaRel)
-		return "", err
+
+	if filled.ETag != "" {
+		sc.ETag = filled.ETag
 	}
-	d.remember(string(id), dataRel, metaRel, sc)
-	d.evict()
-	return d.abs(dataRel), nil
+
+	if !filled.LastModified.IsZero() {
+		sc.LastModified = filled.LastModified
+	}
+
+	if ttl > 0 {
+		sc.ExpiresAt = now.Add(ttl)
+	}
+
+	return sc
 }
 
 type entry struct {

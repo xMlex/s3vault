@@ -2,9 +2,12 @@ package service
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	stdhash "hash"
 	"io"
 	"log/slog"
 	"os"
@@ -64,6 +67,11 @@ type CachedPlaintext struct {
 	// Ephemeral is true when Path is a per-request temp file (cache disabled).
 	// Caller must Release after serving.
 	Ephemeral bool
+
+	// revalidate marks a stale hit served under soft-TTL. The caller must
+	// schedule the background refresh only after pinning the body it is about
+	// to serve (Fetch.Open); Stat has no body and revalidates immediately.
+	revalidate bool
 
 	release func()
 }
@@ -211,6 +219,57 @@ func (f *Fetch) Download(ctx context.Context, key, dest string, stdout io.Writer
 	return err
 }
 
+// plaintextCheck verifies a decrypted stream against the S3VCTR01 header before
+// the bytes are committed anywhere. A truncated object whose cut lands exactly
+// on a chunk or frame boundary is otherwise indistinguishable from a complete
+// one, and the header is the only place that can tell (problems.md D5).
+//
+// The digest is hashed only where it adds something: native chunks are
+// individually GCM-authenticated, so their SHA-256 would merely re-prove what
+// the tags already guarantee — the size check is what catches a frame-boundary
+// cut there. Payloads with no authentication of their own (none, command) are
+// hashed, and containerless objects have nothing to check at all.
+type plaintextCheck struct {
+	hdr          container.Header
+	hasContainer bool
+	hash         stdhash.Hash
+}
+
+func newPlaintextCheck(hdr container.Header, hasContainer bool) *plaintextCheck {
+	c := &plaintextCheck{hdr: hdr, hasContainer: hasContainer}
+	if hasContainer && hdr.Enc != container.EncNative {
+		c.hash = sha256.New()
+	}
+
+	return c
+}
+
+// Writer wraps dst with the digest when one is needed; otherwise it returns dst
+// untouched, so the common containerless path pays nothing.
+func (c *plaintextCheck) Writer(dst io.Writer) io.Writer {
+	if c.hash == nil {
+		return dst
+	}
+
+	return io.MultiWriter(dst, c.hash)
+}
+
+func (c *plaintextCheck) Verify(n int64) error {
+	if !c.hasContainer {
+		return nil
+	}
+
+	if n != c.hdr.PlaintextSize {
+		return fmt.Errorf("plaintext is %d bytes, container header declares %d: truncated or corrupted object", n, c.hdr.PlaintextSize)
+	}
+
+	if c.hash != nil && len(c.hdr.SHA256) == sha256.Size && !bytes.Equal(c.hash.Sum(nil), c.hdr.SHA256) {
+		return fmt.Errorf("plaintext sha256 %x does not match container header %x", c.hash.Sum(nil), c.hdr.SHA256)
+	}
+
+	return nil
+}
+
 func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer) (int64, error) {
 	body, meta, err := f.store.Get(ctx, key)
 	if err != nil {
@@ -218,7 +277,7 @@ func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer
 	}
 	defer body.Close()
 
-	ctx, payload, objEnc, _, hasContainer, err := unwrapForDecrypt(ctx, body, meta)
+	ctx, payload, objEnc, hdr, hasContainer, err := unwrapForDecrypt(ctx, body, meta)
 	if err != nil {
 		return 0, err
 	}
@@ -227,10 +286,23 @@ func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer
 		f.warnLegacy(key)
 	}
 
-	if dest == "-" {
-		cw := &countWriter{w: stdout}
+	check := newPlaintextCheck(hdr, hasContainer)
 
-		return cw.n, f.decryptStream(ctx, cw, payload, objEnc)
+	if dest == "-" {
+		// The bytes have already left the process when a mismatch is known, so
+		// the caller cannot be handed a clean file — but a non-zero exit still
+		// tells a script that the stream was not the object it claimed to be.
+		cw := &countWriter{w: check.Writer(stdout)}
+
+		if err := f.decryptStream(ctx, cw, payload, objEnc); err != nil {
+			return cw.n, err
+		}
+
+		if err := check.Verify(cw.n); err != nil {
+			return cw.n, err
+		}
+
+		return cw.n, nil
 	}
 
 	dir := filepath.Dir(dest)
@@ -244,7 +316,7 @@ func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer
 	tmpName := tmp.Name()
 	defer func() { _ = os.Remove(tmpName) }()
 
-	cw, bw := newBufferedCounter(tmp)
+	cw, bw := newBufferedCounter(check.Writer(tmp))
 	if err := f.decryptStream(ctx, cw, payload, objEnc); err != nil {
 		_ = tmp.Close()
 		return 0, err
@@ -254,6 +326,14 @@ func (f *Fetch) download(ctx context.Context, key, dest string, stdout io.Writer
 		_ = tmp.Close()
 		return 0, fmt.Errorf("flush: %w", err)
 	}
+
+	// Verify before the rename: a bad stream must leave the existing dest
+	// untouched instead of replacing a good copy with a truncated one.
+	if err := check.Verify(cw.n); err != nil {
+		_ = tmp.Close()
+		return 0, err
+	}
+
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return 0, fmt.Errorf("fsync: %w", err)
@@ -390,6 +470,12 @@ func (f *Fetch) statByMaterialize(ctx context.Context, key string, remote domain
 		cached.Size = st.Size()
 	}
 
+	// Stat serves no body, so there is nothing to pin: the background refresh
+	// can start right away.
+	if cached.revalidate {
+		f.scheduleRevalidate(key, cache.ID(f.bucket, key, f.encFP))
+	}
+
 	f.statSize.store(f.memoKey(key), remote, cached.Size)
 
 	cached.Release()
@@ -408,15 +494,32 @@ func (f *Fetch) statByMaterialize(ctx context.Context, key string, remote domain
 // back to a full materialization.
 func (f *Fetch) Open(ctx context.Context, key string) (io.ReadSeekCloser, CachedPlaintext, error) {
 	if f.cache != nil {
+		id := cache.ID(f.bucket, key, f.encFP)
 		cached, err := f.Materialize(ctx, key)
 		if err != nil {
 			return nil, CachedPlaintext{}, err
 		}
 
 		fh, err := os.Open(cached.Path)
+		if err != nil && os.IsNotExist(err) {
+			// Evicted between Lookup and Open (LRU pressure, sweep): populate
+			// again and retry the open once.
+			cached, err = f.materializeMiss(ctx, key, id)
+			if err == nil {
+				fh, err = os.Open(cached.Path)
+			}
+		}
 		if err != nil {
 			cached.Release()
 			return nil, CachedPlaintext{}, fmt.Errorf("open %s: %w", cached.Path, err)
+		}
+
+		// The body is pinned before the background refresh is scheduled, so a
+		// revalidation's repopulate cannot swap the file under the descriptor:
+		// the served bytes and the advertised identity come from one
+		// generation (problems.md D13).
+		if cached.revalidate {
+			f.scheduleRevalidate(key, id)
 		}
 
 		return &releasedFile{File: fh, release: cached.Release}, cached, nil
@@ -640,13 +743,19 @@ func (f *Fetch) fillEphemeral(ctx context.Context, key string, e *ephemeralFile)
 		}
 	}()
 
-	cw, bw := newBufferedCounter(tmp)
+	check := newPlaintextCheck(hdr, hasContainer)
+	cw, bw := newBufferedCounter(check.Writer(tmp))
+
 	if err := f.decryptStream(decCtx, cw, payload, objEnc); err != nil {
 		return err
 	}
 
 	if err := bw.Flush(); err != nil {
 		return fmt.Errorf("flush: %w", err)
+	}
+
+	if err := check.Verify(cw.n); err != nil {
+		return err
 	}
 	// No fsync: the file is deleted as soon as the response is served, so it
 	// only has to survive this process, and every reader sees it through the
@@ -700,9 +809,14 @@ func (f *Fetch) Materialize(ctx context.Context, key string) (CachedPlaintext, e
 		}
 
 		if f.softTTL > 0 {
-			// Stale-while-revalidate: serve now, refresh in background.
+			// Stale-while-revalidate: serve now, refresh in background. The
+			// caller schedules the refresh only after pinning the returned
+			// file (Fetch.Open), so a mid-serve repopulate cannot swap the
+			// body under open descriptors and pair v1 headers with v2 bytes
+			// (problems.md D13).
 			f.metrics.CacheHit()
-			f.scheduleRevalidate(key, id)
+
+			out.revalidate = true
 
 			return out, nil
 		}
@@ -751,47 +865,29 @@ func (f *Fetch) materializeMiss(ctx context.Context, key string, id port.CacheID
 // populateFromStore fills the cache from one store.Get. The object's identity
 // comes from the S3VCTR01 header of that same stream, so a cold read makes one
 // request instead of a HEAD plus a 128-byte Range before it.
+//
+// If the entry was invalidated while the fill was streaming (a PUT landed
+// mid-download), one retry downloads the version that is current after the
+// invalidation instead of failing the read.
 func (f *Fetch) populateFromStore(ctx context.Context, key string, id port.CacheID, remote domain.ObjectMeta) (CachedPlaintext, error) {
+	cached, err := f.populateFromStoreOnce(ctx, key, id, remote)
+	if errors.Is(err, cache.ErrInvalidated) {
+		return f.populateFromStoreOnce(ctx, key, id, remote)
+	}
+
+	return cached, err
+}
+
+func (f *Fetch) populateFromStoreOnce(ctx context.Context, key string, id port.CacheID, remote domain.ObjectMeta) (CachedPlaintext, error) {
 	entry := entryMetaFromRemote(remote)
 	started := time.Now()
 
-	var (
-		hdr          container.Header
-		getMeta      domain.ObjectMeta
-		hasContainer bool
-		produced     int64
-	)
+	var filled cacheFillResult
 
-	p, err := f.cache.Populate(ctx, id, entry, func(w io.Writer) error {
-		body, meta, getErr := f.store.Get(ctx, key)
-		if getErr != nil {
-			return getErr
-		}
-		defer body.Close()
-
-		decCtx, payload, objEnc, h, ok, unwrapErr := unwrapForDecrypt(ctx, body, meta)
-		if unwrapErr != nil {
-			return unwrapErr
-		}
-
-		hdr, hasContainer, getMeta = h, ok, meta
-		if !hasContainer {
-			f.warnLegacy(key)
-		}
-
-		cw, bw := newBufferedCounter(w)
-		if decErr := f.decryptStream(decCtx, cw, payload, objEnc); decErr != nil {
-			return decErr
-		}
-
-		if flushErr := bw.Flush(); flushErr != nil {
-			return flushErr
-		}
-
-		produced = cw.n
-
-		return nil
+	p, err := f.cache.Populate(ctx, id, entry, func(w io.Writer) (port.EntryMeta, error) {
+		return f.fillCacheEntry(ctx, key, w, &filled)
 	})
+	hdr, hasContainer, getMeta, produced := filled.hdr, filled.hasContainer, filled.getMeta, filled.produced
 	f.recordDownload(started, produced, err)
 	if err != nil {
 		return CachedPlaintext{}, err
@@ -818,20 +914,73 @@ func (f *Fetch) populateFromStore(ctx context.Context, key string, id port.Cache
 	if hasContainer {
 		out.Size = hdr.PlaintextSize
 	}
-	// Populate wrote the sidecar before the body was read, so it has no identity.
-	// Record it now: without this the next hit advertises the cache id as its
-	// ETag, and revalidation has no digest to compare and re-downloads.
-	// Best-effort by design — a failed patch only leaves the entry to the usual
-	// soft-TTL revalidation.
-	_ = f.cache.MarkValidated(ctx, id, meta)
 
 	return out, nil
 }
 
+// cacheFillResult carries what a fill discovered while streaming: the container
+// header, the store metadata and the plaintext length.
+type cacheFillResult struct {
+	hdr          container.Header
+	getMeta      domain.ObjectMeta
+	hasContainer bool
+	produced     int64
+}
+
+// fillCacheEntry downloads key, removes its layer, verifies the stream against
+// the container header and writes the plaintext into w. It returns the identity
+// the sidecar must carry. Never cache a stream that does not match its header:
+// the sidecar would advertise an identity these bytes do not have.
+func (f *Fetch) fillCacheEntry(ctx context.Context, key string, w io.Writer, res *cacheFillResult) (port.EntryMeta, error) {
+	body, meta, err := f.store.Get(ctx, key)
+	if err != nil {
+		return port.EntryMeta{}, err
+	}
+	defer func() { _ = body.Close() }()
+
+	decCtx, payload, objEnc, hdr, hasContainer, err := unwrapForDecrypt(ctx, body, meta)
+	if err != nil {
+		return port.EntryMeta{}, err
+	}
+
+	res.hdr, res.hasContainer, res.getMeta = hdr, hasContainer, meta
+	if !hasContainer {
+		f.warnLegacy(key)
+	}
+
+	check := newPlaintextCheck(hdr, hasContainer)
+	cw, bw := newBufferedCounter(check.Writer(w))
+
+	if err := f.decryptStream(decCtx, cw, payload, objEnc); err != nil {
+		return port.EntryMeta{}, err
+	}
+
+	if err := bw.Flush(); err != nil {
+		return port.EntryMeta{}, err
+	}
+
+	if err := check.Verify(cw.n); err != nil {
+		return port.EntryMeta{}, err
+	}
+
+	res.produced = cw.n
+
+	// The identity discovered while streaming: Populate writes it into the
+	// sidecar beside the rename, so a hit never advertises a digest these
+	// bytes do not have.
+	filled := entryMetaFromRemote(meta)
+	if hasContainer {
+		filled.SHA256 = hdr.SHA256Hex()
+	}
+
+	return filled, nil
+}
+
 // servedEntry returns the cache entry another reader populated while this one
-// was blocked in Populate. The sidecar is written before the body is read, so
-// the owner may not have patched SHA256 yet; resolve it once here rather than
-// returning an empty checksum to the client.
+// was blocked in Populate. A populate writes the sidecar beside its rename, so
+// a current entry carries identity; an older version's entry (or a store that
+// reports none) may still have an empty digest — resolve it once here rather
+// than returning an empty checksum to the client.
 func (f *Fetch) servedEntry(ctx context.Context, key string, id port.CacheID, p string) (CachedPlaintext, bool) {
 	_, stored, hit, err := f.cache.Lookup(ctx, id)
 	if err != nil || !hit {

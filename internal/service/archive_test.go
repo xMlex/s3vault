@@ -27,6 +27,8 @@ import (
 	"github.com/xMlex/s3vault/internal/service"
 )
 
+const testKeyPrefix = "pre"
+
 type memStore struct {
 	mu             sync.Mutex
 	meta           map[string]domain.ObjectMeta
@@ -170,6 +172,72 @@ func putContained(t *testing.T, store *memStore, key string, plain []byte) {
 	require.NoError(t, store.Put(context.Background(), key, io.MultiReader(bytes.NewReader(hdr), bytes.NewReader(plain)), domain.PutMeta{}))
 }
 
+// The header/PutMeta identity comes from an earlier snapshot (scanner stat plus
+// a separate hash read). If the streamed bytes no longer match it — a file
+// rotated between hashing and upload, or a caller-supplied digest that lies —
+// the upload must fail and drop the object instead of committing a header that
+// misdescribes its body (problems.md D8).
+func TestArchiveUploadRejectsChangedSource(t *testing.T) {
+	t.Parallel()
+
+	newUpload := func(t *testing.T) (*memStore, *service.Archive, domain.FileInfo, string) {
+		t.Helper()
+		root := t.TempDir()
+		p := filepath.Join(root, "a.log")
+		require.NoError(t, os.WriteFile(p, []byte("payload"), 0o600))
+		info := domain.FileInfo{
+			AbsPath: p,
+			RelPath: "a.log",
+			Size:    int64(len("payload")),
+			ModTime: time.Now(),
+		}
+		store := newMemStore()
+		svc := service.NewArchive(
+			scanner.New(scanner.Options{}),
+			keying.Mapper{Prefix: testKeyPrefix},
+			store,
+			encrypt.Passthrough{},
+			nil,
+		)
+
+		return store, svc, info, root
+	}
+
+	t.Run("declared digest does not match the stream", func(t *testing.T) {
+		t.Parallel()
+		store, svc, info, root := newUpload(t)
+
+		_, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
+			Root:            root,
+			PlaintextSHA256: sumHex([]byte("some other content")),
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "source changed during upload")
+
+		_, stored := store.body["pre/a.log"]
+		assert.False(t, stored, "the object whose header lies must be dropped")
+
+		_, statErr := os.Stat(info.AbsPath)
+		require.NoError(t, statErr, "a failed upload must not delete the source")
+	})
+
+	t.Run("declared size does not match the stream", func(t *testing.T) {
+		t.Parallel()
+		store, svc, info, root := newUpload(t)
+
+		info.Size = 4096 // the scanner snapshot lies about the file
+		_, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
+			Root:            root,
+			PlaintextSHA256: sumHex([]byte("payload")),
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "source changed during upload")
+
+		_, stored := store.body["pre/a.log"]
+		assert.False(t, stored, "the object whose header lies must be dropped")
+	})
+}
+
 func TestArchiveUploadAndSkip(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -181,7 +249,7 @@ func TestArchiveUploadAndSkip(t *testing.T) {
 	store := newMemStore()
 	svc := service.NewArchive(
 		scanner.New(scanner.Options{}),
-		keying.Mapper{Prefix: "pre"},
+		keying.Mapper{Prefix: testKeyPrefix},
 		store,
 		encrypt.Passthrough{},
 		nil,
@@ -221,7 +289,7 @@ func TestArchiveUploadAndSkipEncryptingMode(t *testing.T) {
 	store := newMemStore()
 	svc := service.NewArchive(
 		scanner.New(scanner.Options{}),
-		keying.Mapper{Prefix: "pre"},
+		keying.Mapper{Prefix: testKeyPrefix},
 		store,
 		&namedEncryptor{name: "native"},
 		nil,
@@ -264,7 +332,7 @@ func TestArchiveSkipViaContainerWithoutMetadata(t *testing.T) {
 	store.omitMetaOnHead = true
 	svc := service.NewArchive(
 		scanner.New(scanner.Options{}),
-		keying.Mapper{Prefix: "pre"},
+		keying.Mapper{Prefix: testKeyPrefix},
 		store,
 		&namedEncryptor{name: "native"},
 		nil,
@@ -296,7 +364,7 @@ func TestArchiveContainerlessContentSkips(t *testing.T) {
 	store := newMemStore()
 	svc := service.NewArchive(
 		scanner.New(scanner.Options{}),
-		keying.Mapper{Prefix: "pre"},
+		keying.Mapper{Prefix: testKeyPrefix},
 		store,
 		encrypt.Passthrough{},
 		nil,
@@ -329,7 +397,7 @@ func TestArchiveContainerlessOverwritesChangedContent(t *testing.T) {
 	store := newMemStore()
 	svc := service.NewArchive(
 		scanner.New(scanner.Options{}),
-		keying.Mapper{Prefix: "pre"},
+		keying.Mapper{Prefix: testKeyPrefix},
 		store,
 		encrypt.Passthrough{},
 		nil,
@@ -449,7 +517,7 @@ func TestArchiveFetchNativeThroughContainer(t *testing.T) {
 	require.NoError(t, os.Chtimes(p, old, old))
 
 	store := newMemStore()
-	arch := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, enc, nil)
+	arch := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: testKeyPrefix}, store, enc, nil)
 	st, err := arch.Run(context.Background(), service.ArchiveOptions{
 		Root: root, OlderThan: time.Hour, Workers: 1,
 	})
@@ -485,7 +553,7 @@ func TestArchiveWritesCryptoProThumbprint(t *testing.T) {
 	require.NoError(t, err)
 
 	store := newMemStore()
-	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, enc, nil)
+	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: testKeyPrefix}, store, enc, nil)
 	st, err := svc.Run(context.Background(), service.ArchiveOptions{
 		Root: root, OlderThan: time.Hour, Workers: 1,
 	})
@@ -513,7 +581,7 @@ func TestUploadFileIgnoresMtimeAndHonorsKey(t *testing.T) {
 	info, err := scan.Stat(root, p)
 	require.NoError(t, err)
 
-	svc := service.NewArchive(scan, keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
+	svc := service.NewArchive(scan, keying.Mapper{Prefix: testKeyPrefix}, store, encrypt.Passthrough{}, nil)
 	st, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
 		Root: root,
 	})
@@ -551,7 +619,7 @@ func TestUploadFileUsesPrecomputedSHA256(t *testing.T) {
 	// object on HEAD also answers that range; only the fake could disagree.
 	store.body["pre/a.log"] = []byte("stored-body")
 
-	svc := service.NewArchive(scan, keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
+	svc := service.NewArchive(scan, keying.Mapper{Prefix: testKeyPrefix}, store, encrypt.Passthrough{}, nil)
 	st, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
 		Root:            root,
 		PlaintextSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -575,7 +643,7 @@ func TestDeleteAfterUploadAndDeleteIfExists(t *testing.T) {
 	require.NoError(t, os.Chtimes(p, old, old))
 
 	store := newMemStore()
-	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
+	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: testKeyPrefix}, store, encrypt.Passthrough{}, nil)
 
 	st, err := svc.Run(context.Background(), service.ArchiveOptions{
 		Root: root, OlderThan: time.Hour, Workers: 1,
@@ -628,7 +696,7 @@ func TestDeleteIfExistsOnlyRemovesOnIdenticalSkip(t *testing.T) {
 		SHA256:      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		ContentSize: 9,
 	}
-	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
+	svc := service.NewArchive(scanner.New(scanner.Options{}), keying.Mapper{Prefix: testKeyPrefix}, store, encrypt.Passthrough{}, nil)
 	st, err := svc.Run(context.Background(), service.ArchiveOptions{
 		Root: root, OlderThan: time.Hour, Workers: 1,
 		DeleteIfExists: true,
