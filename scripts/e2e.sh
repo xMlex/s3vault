@@ -299,6 +299,8 @@ pg_vault() {
 
 # start_vault_pg поднимает шлюз на локальном backend с identity из PostgreSQL.
 # Статические ключи намеренно пусты: postgres-режим их отвергает.
+# S3VAULT_SERVER_AUTH_CACHE_TTL=0: фаза проверяет отзыв «со следующего запроса»,
+# который TTL-кэш identity скрыл бы на время TTL.
 start_vault_pg() {
 	: >"$VAULT_LOG"
 	env "${S3_ENV[@]}" \
@@ -311,6 +313,7 @@ start_vault_pg() {
 		S3VAULT_SERVER_AUTH_BACKEND=postgres \
 		S3VAULT_SERVER_AUTH_DSN="$PG_DSN" \
 		S3VAULT_SERVER_AUTH_MASTER_KEY="$PG_MASTER" \
+		S3VAULT_SERVER_AUTH_CACHE_TTL=0 \
 		S3VAULT_SERVER_S3_ACCESS_KEY= \
 		S3VAULT_SERVER_S3_SECRET_KEY= \
 		S3VAULT_SERVER_S3_BUCKET="$S3_BUCKET" \
@@ -336,6 +339,7 @@ start_vault_pg_s3() {
 		S3VAULT_SERVER_AUTH_BACKEND=postgres \
 		S3VAULT_SERVER_AUTH_DSN="$PG_DSN" \
 		S3VAULT_SERVER_AUTH_MASTER_KEY="$PG_MASTER" \
+		S3VAULT_SERVER_AUTH_CACHE_TTL=0 \
 		S3VAULT_SERVER_S3_ACCESS_KEY= \
 		S3VAULT_SERVER_S3_SECRET_KEY= \
 		S3VAULT_SERVER_S3_BUCKET="$S3_BUCKET" \

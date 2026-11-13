@@ -46,6 +46,7 @@ type Fetch struct {
 	spoolDir string
 	eph      *ephemeralSet
 	ephNS    string // target namespace, separates concurrent ephemeral entries per destination
+	statSize *statSizeMemo
 	metrics  *metrics.Collector
 	logger   *slog.Logger
 }
@@ -82,11 +83,12 @@ func (c CachedPlaintext) Release() {
 // NewFetch constructs a downloader.
 func NewFetch(store port.ObjectStore, enc port.Encryptor) *Fetch {
 	return &Fetch{
-		store:  store,
-		enc:    enc,
-		logger: slog.Default(),
-		reval:  &singleflight.Group{},
-		eph:    newEphemeralSet(),
+		store:    store,
+		enc:      enc,
+		logger:   slog.Default(),
+		reval:    &singleflight.Group{},
+		eph:      newEphemeralSet(),
+		statSize: newStatSizeMemo(defaultStatSizeMemoMax),
 	}
 }
 
@@ -130,6 +132,7 @@ func (f *Fetch) WithProfile(primary, fallback port.Encryptor, cacheBucket, fp st
 		spoolDir: f.spoolDir,
 		eph:      f.eph,
 		ephNS:    f.ephNS,
+		statSize: f.statSize,
 		metrics:  f.metrics,
 		logger:   f.logger,
 	}
@@ -144,6 +147,13 @@ func (f *Fetch) WithStore(store port.ObjectStore, namespace string) *Fetch {
 	c.ephNS = namespace
 
 	return &c
+}
+
+// memoKey scopes a per-process memo to the store this view reads. Two
+// destinations can hold the same key, so a bare key would let one destination
+// answer a size for the other.
+func (f *Fetch) memoKey(key string) string {
+	return f.ephNS + "\x00" + key
 }
 
 // WithSoftTTL sets how long a cache hit may be served without an S3 HEAD.
@@ -303,7 +313,21 @@ func (f *Fetch) Stat(ctx context.Context, key string) (CachedPlaintext, error) {
 			}, nil
 		}
 
-		return f.statByMaterialize(ctx, key)
+		// The size was learned by materializing this exact object version on an
+		// earlier HEAD; answer from metadata instead of downloading it again.
+		if size, ok := f.statSize.lookup(f.memoKey(key), remote); ok {
+			meta := entryMetaFromRemote(remote)
+
+			return CachedPlaintext{
+				Name:    path.Base(key),
+				Size:    size,
+				ModTime: meta.LastModified,
+				ETag:    etagForHTTP(meta, ""),
+				SHA256:  meta.SHA256,
+			}, nil
+		}
+
+		return f.statByMaterialize(ctx, key, remote)
 	}
 
 	meta := entryMetaFromRemote(remote)
@@ -353,7 +377,10 @@ func (f *Fetch) statFromCache(ctx context.Context, key string) (CachedPlaintext,
 	return out, true
 }
 
-func (f *Fetch) statByMaterialize(ctx context.Context, key string) (CachedPlaintext, error) {
+// statByMaterialize is the documented fallback for an object that carries
+// neither a container nor a declared plaintext size. The size it learns is
+// memoized for that object version, so only the first HEAD pays the download.
+func (f *Fetch) statByMaterialize(ctx context.Context, key string, remote domain.ObjectMeta) (CachedPlaintext, error) {
 	cached, err := f.Materialize(ctx, key)
 	if err != nil {
 		return CachedPlaintext{}, err
@@ -362,6 +389,8 @@ func (f *Fetch) statByMaterialize(ctx context.Context, key string) (CachedPlaint
 	if st, statErr := os.Stat(cached.Path); statErr == nil {
 		cached.Size = st.Size()
 	}
+
+	f.statSize.store(f.memoKey(key), remote, cached.Size)
 
 	cached.Release()
 	cached.Path = ""

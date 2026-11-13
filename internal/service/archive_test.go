@@ -33,6 +33,8 @@ type memStore struct {
 	body           map[string][]byte
 	omitMetaOnHead bool // simulate S3 that strips user-metadata
 	rangeCalls     int
+	getCalls       int
+	putCalls       int
 }
 
 func newMemStore() *memStore {
@@ -88,6 +90,8 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, meta domain.P
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.putCalls++
 	m.body[key] = b
 	m.meta[key] = om
 	return nil
@@ -96,6 +100,8 @@ func (m *memStore) Put(_ context.Context, key string, r io.Reader, meta domain.P
 func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, domain.ObjectMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	m.getCalls++
 	b, ok := m.body[key]
 	if !ok {
 		return nil, domain.ObjectMeta{}, domain.ErrNotFound
@@ -541,6 +547,9 @@ func TestUploadFileUsesPrecomputedSHA256(t *testing.T) {
 		SHA256:      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		ContentSize: info.Size,
 	}
+	// ResolveRemote peeks the body before HEAD. A real store that reports an
+	// object on HEAD also answers that range; only the fake could disagree.
+	store.body["pre/a.log"] = []byte("stored-body")
 
 	svc := service.NewArchive(scan, keying.Mapper{Prefix: "pre"}, store, encrypt.Passthrough{}, nil)
 	st, _, err := svc.UploadFile(context.Background(), info, service.ArchiveOptions{
@@ -550,7 +559,11 @@ func TestUploadFileUsesPrecomputedSHA256(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, st.Skipped)
 	assert.Equal(t, 0, st.Uploaded)
-	assert.Nil(t, store.body["pre/a.log"]) // Put never called
+
+	store.mu.Lock()
+	puts := store.putCalls
+	store.mu.Unlock()
+	assert.Zero(t, puts, "Put must never run for an identical skip")
 }
 
 func TestDeleteAfterUploadAndDeleteIfExists(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -174,6 +175,55 @@ func TestFetchDownloadContainerlessRead(t *testing.T) {
 // drift: it must be reported rather than written to disk.
 // A read is the last hop on the path, so a layer the reader cannot remove is
 // drift: it must be reported rather than written to disk.
+// A legacy containerless object declares no size, so the first HEAD has to
+// materialize it. The learned size is memoized for that object version, so a
+// HEAD storm downloads it once, not once per request.
+func TestFetchStatMemoizesMaterializedSize(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := newMemStore()
+	require.NoError(t, store.Put(ctx, "legacy.bin", bytes.NewReader(make([]byte, 1024)), domain.PutMeta{}))
+
+	setVersion := func(etag string) {
+		store.mu.Lock()
+		meta := store.meta["legacy.bin"]
+		meta.ETag = etag
+		meta.LastModified = time.Unix(1700000000, 0)
+		store.meta["legacy.bin"] = meta
+		store.mu.Unlock()
+	}
+	setVersion(`"v1"`)
+
+	f := service.NewFetch(store, encrypt.Passthrough{})
+
+	first, err := f.Stat(ctx, "legacy.bin")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1024), first.Size)
+
+	second, err := f.Stat(ctx, "legacy.bin")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1024), second.Size)
+
+	store.mu.Lock()
+	calls := store.getCalls
+	store.mu.Unlock()
+	assert.Equal(t, 1, calls, "second HEAD must be answered from the size memo")
+
+	// A new object version must not reuse the old size.
+	require.NoError(t, store.Put(ctx, "legacy.bin", bytes.NewReader(make([]byte, 2048)), domain.PutMeta{}))
+	setVersion(`"v2"`)
+
+	third, err := f.Stat(ctx, "legacy.bin")
+	require.NoError(t, err)
+	assert.Equal(t, int64(2048), third.Size)
+
+	store.mu.Lock()
+	calls = store.getCalls
+	store.mu.Unlock()
+	assert.Equal(t, 2, calls, "a changed version is materialized again")
+}
+
 func TestFetchReadRefusesForeignLayer(t *testing.T) {
 	t.Parallel()
 

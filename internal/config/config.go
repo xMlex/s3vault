@@ -179,6 +179,7 @@ const (
 
 	DefaultAuthMaxConns       int32 = 8
 	DefaultAuthQueryTimeout         = 2 * time.Second
+	DefaultAuthCacheTTL             = time.Second
 	DefaultAuthTargetPoolMax        = 64
 	DefaultAuthTargetPoolIdle       = 15 * time.Minute
 )
@@ -190,6 +191,11 @@ type ServerAuthConfig struct {
 	DSN          string        `mapstructure:"dsn"`
 	MaxConns     int32         `mapstructure:"max_conns"`
 	QueryTimeout time.Duration `mapstructure:"query_timeout"`
+	// CacheTTL is how long a resolved principal may be reused so that a burst
+	// of requests does not repeat the database lookup on every request. It is
+	// the bound on revocation staleness (disable/rotate/profile change visible
+	// within it). Zero disables the cache; the viper default is 1s.
+	CacheTTL time.Duration `mapstructure:"cache_ttl"`
 	// TargetPoolMax bounds the per-process pool of ObjectStores for users with
 	// their own destination S3. It does not limit users, only simultaneous
 	// stores; exceeding it causes LRU rebuilds.
@@ -261,6 +267,7 @@ func SetDefaults(v *viper.Viper) {
 	v.SetDefault("server.auth.backend", AuthBackendStatic)
 	v.SetDefault("server.auth.max_conns", DefaultAuthMaxConns)
 	v.SetDefault("server.auth.query_timeout", DefaultAuthQueryTimeout)
+	v.SetDefault("server.auth.cache_ttl", DefaultAuthCacheTTL)
 	v.SetDefault("server.auth.target_pool_max", DefaultAuthTargetPoolMax)
 	v.SetDefault("server.auth.target_pool_idle", DefaultAuthTargetPoolIdle)
 	v.SetDefault("server.s3_region", "us-east-1")
@@ -318,6 +325,7 @@ var envKeys = []string{
 	"server.auth.dsn",
 	"server.auth.max_conns",
 	"server.auth.query_timeout",
+	"server.auth.cache_ttl",
 	"server.auth.target_pool_max",
 	"server.auth.target_pool_idle",
 	"server.s3_listen",
@@ -538,6 +546,13 @@ func (c *Config) normalizeAuth() error {
 
 	if c.Server.Auth.QueryTimeout == 0 {
 		c.Server.Auth.QueryTimeout = DefaultAuthQueryTimeout
+	}
+
+	// CacheTTL zero deliberately survives Normalize: it disables the Lookup
+	// cache. The 1s default is registered in SetDefaults, so an unset key still
+	// arrives here as DefaultAuthCacheTTL and only an explicit 0 opts out.
+	if c.Server.Auth.CacheTTL < 0 {
+		return fmt.Errorf("server.auth.cache_ttl: must not be negative, got %s", c.Server.Auth.CacheTTL)
 	}
 
 	if c.Server.Auth.TargetPoolMax < 0 {

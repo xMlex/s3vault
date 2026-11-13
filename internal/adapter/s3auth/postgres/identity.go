@@ -16,9 +16,15 @@ import (
 var _ port.S3Identity = (*Identity)(nil)
 
 // Lookup resolves a SigV4 access key to its secret and per-user policy. It is
-// called on every request: there is no auth cache, so a disabled key, rotated
-// secret, or changed profile/target is visible on the next request.
+// called on every request. Results are reused for Config.CacheTTL: a disabled
+// key, a rotated secret or a changed profile/target is visible within that
+// window, and immediately at CacheTTL=0. The database stays authoritative on
+// every miss, and a database error is never masked by the cache.
 func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Principal, bool, error) {
+	if principal, ok := i.cache.get(accessKeyID); ok {
+		return principal, true, nil
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, i.timeout)
 	defer cancel()
 
@@ -104,7 +110,7 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 		return port.Principal{}, false, fmt.Errorf("%w: %w", port.ErrAuthInternal, err)
 	}
 
-	return port.Principal{
+	principal := port.Principal{
 		AccessKeyID:    key,
 		SecretKey:      secret,
 		AllowedBuckets: []string{i.bucket},
@@ -115,7 +121,11 @@ func (i *Identity) Lookup(ctx context.Context, accessKeyID string) (port.Princip
 			EncryptionKEK: kek,
 			Target:        s3Target,
 		},
-	}, true, nil
+	}
+
+	i.cache.put(key, principal)
+
+	return principal, true, nil
 }
 
 func (i *Identity) principalTarget(targetUID, targetName *string, config, secretN, secretC, sessionN, sessionC []byte) (*port.S3Target, error) {

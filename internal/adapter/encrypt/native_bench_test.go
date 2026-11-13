@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -52,6 +56,78 @@ func nativeForBench(b *testing.B, chunk int) *Native {
 		b.Fatal(err)
 	}
 	return n
+}
+
+// rsaKeyFiles writes a fresh RSA key pair as PEM and returns the two paths.
+func rsaKeyFiles(b *testing.B, bits int) (privPath, pubPath string) {
+	b.Helper()
+
+	priv, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	dir := b.TempDir()
+	privPath = filepath.Join(dir, "priv.pem")
+	pubPath = filepath.Join(dir, "pub.pem")
+
+	privDER := x509.MarshalPKCS1PrivateKey(priv)
+	if err := os.WriteFile(privPath, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER}), 0o600); err != nil {
+		b.Fatal(err)
+	}
+
+	pubDER, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if err := os.WriteFile(pubPath, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}), 0o600); err != nil {
+		b.Fatal(err)
+	}
+
+	return privPath, pubPath
+}
+
+// BenchmarkNativeNewPerRequest measures building an encryptor the way
+// profile.Resolver does for a non-global profile: every request re-reads and
+// re-parses the key material instead of reusing a cached encryptor.
+func BenchmarkNativeNewPerRequest(b *testing.B) {
+	for _, bits := range []int{2048, 4096} {
+		b.Run(fmt.Sprintf("rsa=%d", bits), func(b *testing.B) {
+			privPath, pubPath := rsaKeyFiles(b, bits)
+			cfg := config.NativeEnc{
+				Wrap:           WrapRSAOAEP,
+				PublicKeyPath:  pubPath,
+				PrivateKeyPath: privPath,
+				ChunkSize:      65536,
+			}
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				if _, err := NewNative(cfg); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+
+	b.Run("keyfile", func(b *testing.B) {
+		keyPath := filepath.Join(b.TempDir(), "kek")
+		if err := os.WriteFile(keyPath, make([]byte, 32), 0o600); err != nil {
+			b.Fatal(err)
+		}
+
+		cfg := config.NativeEnc{Wrap: WrapKeyfile, KeyFile: keyPath, ChunkSize: 65536}
+
+		b.ReportAllocs()
+
+		for b.Loop() {
+			if _, err := NewNative(cfg); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func BenchmarkNativeEncrypt(b *testing.B) {

@@ -68,6 +68,46 @@ func TestResolverNativeKeyfile(t *testing.T) {
 	assert.NotEqual(t, fp, profile.Fingerprint)
 }
 
+// The parsed encryptor is reused while the key material is unchanged, and the
+// cache key is content-based: rotating the KEK file invalidates it on the next
+// call, preserving "a changed key file is visible on the next request".
+func TestResolverCachesProfileByKeyMaterial(t *testing.T) {
+	t.Parallel()
+
+	path := keyFile(t)
+	resolver, _ := testResolver(t, config.EncryptionConfig{Mode: NameNone})
+	raw := json.RawMessage(`{
+		"mode": "native",
+		"native": {"wrap": "keyfile", "key_file": "` + path + `", "chunk_size": 4096}
+	}`)
+
+	first, err := resolver.ResolveRaw(raw)
+	require.NoError(t, err)
+	second, err := resolver.ResolveRaw(raw)
+	require.NoError(t, err)
+
+	firstNative, ok := first.Primary.(*Native)
+	require.True(t, ok)
+	secondNative, ok := second.Primary.(*Native)
+	require.True(t, ok)
+	assert.Same(t, firstNative, secondNative, "unchanged key material must reuse the encryptor")
+
+	differentChunk := json.RawMessage(`{
+		"mode": "native",
+		"native": {"wrap": "keyfile", "key_file": "` + path + `", "chunk_size": 8192}
+	}`)
+	third, err := resolver.ResolveRaw(differentChunk)
+	require.NoError(t, err)
+	assert.NotSame(t, firstNative, third.Primary, "chunk size is part of the cache key")
+
+	require.NoError(t, os.WriteFile(path, []byte("fedcba9876543210fedcba9876543210"), 0o600))
+
+	rotated, err := resolver.ResolveRaw(raw)
+	require.NoError(t, err)
+	assert.NotSame(t, firstNative, rotated.Primary, "rotated key material must rebuild the encryptor")
+	assert.NotEqual(t, first.Fingerprint, rotated.Fingerprint)
+}
+
 func TestResolverNativeFromEnv(t *testing.T) {
 	t.Setenv("S3VAULT_TEST_PROFILE_KEK", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 

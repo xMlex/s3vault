@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/xMlex/s3vault/internal/adapter/encrypt"
 	"github.com/xMlex/s3vault/internal/container"
@@ -56,6 +57,78 @@ func BenchmarkFetchStat(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkFetchStatCostByObjectShape contrasts the two HEAD shapes. A framed
+// object answers from its 128-byte S3VCTR01 header; a legacy containerless
+// object that declares no size makes Fetch.Stat materialize and decrypt the
+// whole object just to learn the plaintext length (the documented fallback).
+func BenchmarkFetchStatCostByObjectShape(b *testing.B) {
+	const size = 16 << 20
+
+	ctx := context.Background()
+
+	b.Run("container", func(b *testing.B) {
+		store := benchObject(b, size)
+		f := service.NewFetch(store, encrypt.Passthrough{})
+
+		b.ReportAllocs()
+
+		for b.Loop() {
+			if _, err := f.Stat(ctx, "k"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("legacy-containerless", func(b *testing.B) {
+		store := newMemStore()
+		if err := store.Put(ctx, "k", bytes.NewReader(make([]byte, size)), domain.PutMeta{}); err != nil {
+			b.Fatal(err)
+		}
+
+		f := service.NewFetch(store, encrypt.Passthrough{})
+
+		b.SetBytes(size)
+		b.ReportAllocs()
+
+		for b.Loop() {
+			if _, err := f.Stat(ctx, "k"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	// With a validator present the learned size is memoized: only the first HEAD
+	// materializes, the rest answer from metadata. The backend reports an ETag
+	// for every real object; the store above deliberately has none, which is why
+	// its loop measures the uncached cost.
+	b.Run("legacy-containerless-versioned", func(b *testing.B) {
+		store := newMemStore()
+		if err := store.Put(ctx, "k", bytes.NewReader(make([]byte, size)), domain.PutMeta{}); err != nil {
+			b.Fatal(err)
+		}
+
+		store.mu.Lock()
+		meta := store.meta["k"]
+		meta.ETag = `"v1"`
+		meta.LastModified = time.Unix(1700000000, 0)
+		store.meta["k"] = meta
+		store.mu.Unlock()
+
+		f := service.NewFetch(store, encrypt.Passthrough{})
+		if _, err := f.Stat(ctx, "k"); err != nil {
+			b.Fatal(err)
+		}
+
+		b.ReportAllocs()
+
+		for b.Loop() {
+			if _, err := f.Stat(ctx, "k"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func BenchmarkFetchOpenRange1KiB(b *testing.B) {

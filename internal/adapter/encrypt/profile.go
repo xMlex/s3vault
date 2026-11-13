@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xMlex/s3vault/internal/config"
@@ -30,13 +32,23 @@ type Profile struct {
 // Resolver builds profiles from the user's JSONB value. It holds the gateway's
 // global encryption config, which is both the default profile and the fallback.
 //
-// Profiles are built per request rather than cached: with the expected ~10 RPS
-// this is cheap, and it means a changed key file or DB row is visible on the
-// next request without an invalidation protocol.
+// A non-global profile is cached by its key material, not by the user: the cache
+// key includes Fingerprint(cfg), which hashes the actual PEM / KEK file contents
+// and the KEK environment value. A rotated key or an edited config therefore
+// misses on the next request and is rebuilt, while an unchanged profile reuses
+// the parsed RSA key instead of re-reading and re-parsing the PEM per request.
 type Resolver struct {
 	defaultEnc port.Encryptor
 	defaultFP  string
+
+	mu       sync.Mutex
+	profiles map[string]Profile
 }
+
+// maxCachedProfiles bounds the profile cache. The number of distinct profile
+// configurations is operator-driven and small; on overflow the whole cache is
+// dropped, which costs one rebuild each on the next request.
+const maxCachedProfiles = 64
 
 // NewResolver validates the global config and builds the default profile.
 func NewResolver(cfg config.EncryptionConfig) (*Resolver, error) {
@@ -45,7 +57,7 @@ func NewResolver(cfg config.EncryptionConfig) (*Resolver, error) {
 		return nil, fmt.Errorf("default encryption: %w", err)
 	}
 
-	return &Resolver{defaultEnc: enc, defaultFP: Fingerprint(cfg)}, nil
+	return &Resolver{defaultEnc: enc, defaultFP: Fingerprint(cfg), profiles: map[string]Profile{}}, nil
 }
 
 // Default returns the global profile. The caller may keep it; it is immutable.
@@ -81,12 +93,21 @@ func (r *Resolver) Resolve(raw json.RawMessage, kek []byte) (Profile, error) {
 		return Profile{}, err
 	}
 
+	// Fingerprint hashes the key material itself (PEM/KEK file bytes, env value),
+	// so it is both the cache-id input and the invalidation signal. It is
+	// computed once here and reused below.
+	fp := Fingerprint(cfg)
+	key := profileCacheKey(cfg, fp)
+
+	if cached, ok := r.cachedProfile(key); ok {
+		return cached, nil
+	}
+
 	enc, err := New(cfg)
 	if err != nil {
 		return Profile{}, fmt.Errorf("user encryption: %w", err)
 	}
 
-	fp := Fingerprint(cfg)
 	profile := Profile{Primary: enc, Fingerprint: fp}
 
 	if Name(r.defaultEnc) != Name(enc) {
@@ -94,7 +115,53 @@ func (r *Resolver) Resolve(raw json.RawMessage, kek []byte) (Profile, error) {
 		profile.Fingerprint = combineFingerprint(fp, r.defaultFP)
 	}
 
+	r.rememberProfile(key, profile)
+
 	return profile, nil
+}
+
+// profileCacheKey combines the key-material fingerprint with the settings that
+// Fingerprint does not cover (chunk size, encrypt argv, command timeout). Two
+// profiles that differ in any of them must not share an encryptor.
+func profileCacheKey(cfg config.EncryptionConfig, fp string) string {
+	h := sha256.New()
+	_, _ = io.WriteString(h, fp)
+	_, _ = h.Write([]byte{0})
+	_, _ = io.WriteString(h, strconv.Itoa(cfg.Native.ChunkSize))
+	_, _ = h.Write([]byte{0})
+
+	for _, a := range cfg.Command.Encrypt {
+		_, _ = io.WriteString(h, a)
+		_, _ = h.Write([]byte{0})
+	}
+
+	_, _ = io.WriteString(h, cfg.Command.Timeout.String())
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (r *Resolver) cachedProfile(key string) (Profile, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	p, ok := r.profiles[key]
+
+	return p, ok
+}
+
+func (r *Resolver) rememberProfile(key string, p Profile) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.profiles == nil {
+		r.profiles = make(map[string]Profile)
+	}
+
+	if len(r.profiles) >= maxCachedProfiles {
+		clear(r.profiles)
+	}
+
+	r.profiles[key] = p
 }
 
 func isGlobalProfile(raw json.RawMessage) bool {

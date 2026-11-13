@@ -21,8 +21,9 @@ import (
 
 type countingStore struct {
 	*memStore
-	heads atomic.Int64
-	gets  atomic.Int64
+	heads  atomic.Int64
+	gets   atomic.Int64
+	ranges atomic.Int64
 }
 
 func (c *countingStore) Head(ctx context.Context, key string) (domain.ObjectMeta, error) {
@@ -33,6 +34,11 @@ func (c *countingStore) Head(ctx context.Context, key string) (domain.ObjectMeta
 func (c *countingStore) Get(ctx context.Context, key string) (io.ReadCloser, domain.ObjectMeta, error) {
 	c.gets.Add(1)
 	return c.memStore.Get(ctx, key)
+}
+
+func (c *countingStore) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error) {
+	c.ranges.Add(1)
+	return c.memStore.GetRange(ctx, key, start, end)
 }
 
 func TestFetchMaterialize(t *testing.T) {
@@ -137,14 +143,16 @@ func TestFetchMaterializeSWRRevalidates(t *testing.T) {
 	time.Sleep(40 * time.Millisecond)
 
 	headsBefore := store.heads.Load()
+	rangesBefore := store.ranges.Load()
 	getsBefore := store.gets.Load()
 	got, err := f.Materialize(context.Background(), "k")
 	require.NoError(t, err)
 	assert.True(t, got.Hit)
 
 	require.Eventually(t, func() bool {
-		return store.heads.Load() > headsBefore
+		return store.ranges.Load() > rangesBefore
 	}, time.Second, 5*time.Millisecond)
+	assert.Equal(t, headsBefore, store.heads.Load(), "container identity comes from the header range, not HEAD")
 	assert.Equal(t, getsBefore, store.gets.Load(), "unchanged object must not re-GET")
 }
 

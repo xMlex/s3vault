@@ -51,6 +51,11 @@ type Config struct {
 	Bucket             string
 	Logger             *slog.Logger
 	ValidateEncryption func(json.RawMessage, []byte) error
+	// CacheTTL is how long Lookup may reuse a resolved principal. Zero disables
+	// the cache (every request hits the database); the gateway sets the config
+	// default of one second. The TTL is the freshest-revocation bound: disable,
+	// rotate and profile/target changes are visible within it.
+	CacheTTL time.Duration
 	// SkipValidation disables the startup pass over existing rows. The server
 	// must leave it false; admin commands use it so one corrupt user, profile or
 	// target cannot lock the operator out of listing or removing it.
@@ -65,6 +70,7 @@ type Identity struct {
 	masterKey   []byte
 	log         *slog.Logger
 	validateEnc func(json.RawMessage, []byte) error
+	cache       *principalCache
 }
 
 // Open connects, migrates, and validates every existing user. Any failure is
@@ -120,6 +126,10 @@ func Open(ctx context.Context, cfg Config) (*Identity, error) {
 	}
 	if id.log == nil {
 		id.log = slog.Default()
+	}
+
+	if cfg.CacheTTL > 0 {
+		id.cache = newPrincipalCache(cfg.CacheTTL)
 	}
 
 	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)

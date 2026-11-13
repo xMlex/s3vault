@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,19 +19,30 @@ import (
 )
 
 type rangeStore struct {
-	mu   sync.Mutex
-	meta map[string]domain.ObjectMeta
-	body map[string][]byte
+	mu         sync.Mutex
+	meta       map[string]domain.ObjectMeta
+	body       map[string][]byte
+	headCalls  int
+	rangeCalls int
 }
 
 func (s *rangeStore) Head(_ context.Context, key string) (domain.ObjectMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.headCalls++
 	m, ok := s.meta[key]
 	if !ok {
 		return domain.ObjectMeta{Key: key, Exists: false}, nil
 	}
 	return m, nil
+}
+
+func (s *rangeStore) calls() (head, ranges int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.headCalls, s.rangeCalls
 }
 
 func (s *rangeStore) Put(context.Context, string, io.Reader, domain.PutMeta) error {
@@ -50,6 +62,8 @@ func (s *rangeStore) Get(_ context.Context, key string) (io.ReadCloser, domain.O
 func (s *rangeStore) GetRange(_ context.Context, key string, start, end int64) (io.ReadCloser, domain.ObjectMeta, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.rangeCalls++
 	b, ok := s.body[key]
 	if !ok {
 		return nil, domain.ObjectMeta{}, domain.ErrNotFound
@@ -84,26 +98,28 @@ var (
 	errRead  = errors.New("read failed")
 )
 
-func TestResolveRemoteHeadError(t *testing.T) {
+func TestResolveRemoteHeadErrorAfterContainerlessPeek(t *testing.T) {
 	t.Parallel()
 	store := stubStore{
 		head: func(context.Context, string) (domain.ObjectMeta, error) {
 			return domain.ObjectMeta{}, errHead
 		},
 		getRange: func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error) {
-			t.Fatal("GetRange must not run when Head fails")
-			return nil, domain.ObjectMeta{}, nil
+			return io.NopCloser(bytes.NewReader([]byte("not-a-container"))), domain.ObjectMeta{Exists: true}, nil
 		},
 	}
 	_, err := identity.ResolveRemote(context.Background(), store, "k")
 	require.ErrorIs(t, err, errHead)
 }
 
-func TestResolveRemoteRangeNotFoundKeepsHead(t *testing.T) {
+// The range answers a missing object in one call. HEAD is not consulted: on a
+// strongly consistent store it would only repeat the same answer.
+func TestResolveRemoteMissingObjectSkipsHead(t *testing.T) {
 	t.Parallel()
 	store := stubStore{
 		head: func(context.Context, string) (domain.ObjectMeta, error) {
-			return domain.ObjectMeta{Key: "k", Exists: true, SHA256: "aa"}, nil
+			t.Fatal("Head must not run once the range reports the object missing")
+			return domain.ObjectMeta{}, nil
 		},
 		getRange: func(context.Context, string, int64, int64) (io.ReadCloser, domain.ObjectMeta, error) {
 			return nil, domain.ObjectMeta{}, domain.ErrNotFound
@@ -111,7 +127,8 @@ func TestResolveRemoteRangeNotFoundKeepsHead(t *testing.T) {
 	}
 	got, err := identity.ResolveRemote(context.Background(), store, "k")
 	require.NoError(t, err)
-	assert.Equal(t, "aa", got.SHA256)
+	assert.False(t, got.Exists)
+	assert.Equal(t, "k", got.Key)
 }
 
 func TestResolveRemoteRangeError(t *testing.T) {
@@ -184,6 +201,41 @@ func TestResolveRemotePrefersContainerOverHEAD(t *testing.T) {
 	assert.Equal(t, "native", got.Encrypted)
 	assert.Equal(t, "rsa-oaep", got.Wrap)
 	assert.Equal(t, container.FormatVersion, got.FormatVersion)
+}
+
+// A container object is resolved without HeadObject: one header range answers
+// existence, identity and validators.
+func TestResolveRemoteContainerUsesOneRange(t *testing.T) {
+	t.Parallel()
+
+	sum, err := container.SHA256FromHex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+	require.NoError(t, err)
+	hdr, err := container.Marshal(container.Header{
+		Version:       container.VersionV1,
+		PlaintextSize: 7,
+		SHA256:        sum,
+		Enc:           container.EncNone,
+	})
+	require.NoError(t, err)
+
+	modified := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	store := &rangeStore{
+		meta: map[string]domain.ObjectMeta{
+			"k": {Key: "k", Exists: true, Size: 135, ETag: `"etag"`, LastModified: modified},
+		},
+		body: map[string][]byte{"k": append(hdr, []byte("payload")...)},
+	}
+
+	got, err := identity.ResolveRemote(context.Background(), store, "k")
+	require.NoError(t, err)
+	assert.Equal(t, int64(7), got.ContentSize)
+	assert.Equal(t, int64(135), got.Size)
+	assert.Equal(t, `"etag"`, got.ETag)
+	assert.Equal(t, modified, got.LastModified)
+
+	head, ranges := store.calls()
+	assert.Zero(t, head, "a container identity must not spend a HeadObject")
+	assert.Equal(t, 1, ranges)
 }
 
 func TestResolveRemoteLegacyHEADMeta(t *testing.T) {

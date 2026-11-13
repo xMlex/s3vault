@@ -79,6 +79,20 @@ func TestNormalizeAuthBounds(t *testing.T) {
 	c = Config{}
 	c.Server.Auth.TargetPoolIdle = -time.Second
 	require.ErrorContains(t, c.normalizeAuth(), "target_pool_idle")
+
+	c = Config{}
+	c.Server.Auth.CacheTTL = -time.Second
+	require.ErrorContains(t, c.normalizeAuth(), "cache_ttl")
+}
+
+// Zero is an explicit opt-out from the Lookup cache, so Normalize must not turn
+// it into the default; the default reaches Normalize through viper instead.
+func TestNormalizeAuthKeepsZeroCacheTTL(t *testing.T) {
+	t.Parallel()
+
+	var c Config
+	require.NoError(t, c.normalizeAuth())
+	assert.Zero(t, c.Server.Auth.CacheTTL)
 }
 
 func TestAuthFromEnv(t *testing.T) {
@@ -86,6 +100,7 @@ func TestAuthFromEnv(t *testing.T) {
 	t.Setenv("S3VAULT_SERVER_AUTH_DSN", "postgres://localhost/db")
 	t.Setenv("S3VAULT_SERVER_AUTH_MAX_CONNS", "12")
 	t.Setenv("S3VAULT_SERVER_AUTH_QUERY_TIMEOUT", "3s")
+	t.Setenv("S3VAULT_SERVER_AUTH_CACHE_TTL", "250ms")
 	t.Setenv("S3VAULT_SERVER_AUTH_TARGET_POOL_MAX", "16")
 	t.Setenv("S3VAULT_SERVER_AUTH_TARGET_POOL_IDLE", "5m")
 	t.Setenv("S3VAULT_SERVER_S3_ACCESS_KEY", "")
@@ -103,6 +118,7 @@ func TestAuthFromEnv(t *testing.T) {
 	assert.Equal(t, AuthBackendPostgres, cfg.Server.Auth.Backend)
 	assert.Equal(t, int32(12), cfg.Server.Auth.MaxConns)
 	assert.Equal(t, 3*time.Second, cfg.Server.Auth.QueryTimeout)
+	assert.Equal(t, 250*time.Millisecond, cfg.Server.Auth.CacheTTL)
 	assert.Equal(t, 16, cfg.Server.Auth.TargetPoolMax)
 	assert.Equal(t, 5*time.Minute, cfg.Server.Auth.TargetPoolIdle)
 }

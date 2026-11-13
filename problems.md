@@ -187,12 +187,12 @@ PUT и удалял его, не записав (`docs/reliability-review.md` H2
 **Где:** `internal/adapter/cache/disk.go:223-259`; вызовы — `internal/service/fetch.go:303,380`.
 **Механика:** reader A прошёл проверку на v1, конкурентный `Populate` записал v2, затем A пишет sidecar v1 поверх → sidecar v1 при теле v2.
 
-### D15 — `ResolveRemote` глотает `ErrNotFound` от range-GET
+### D15 — ❌ снят: `ResolveRemote` больше не глотает `ErrNotFound` от range
 
-**Проверка:** ✅ unit — `go test -run TestD15 ./internal/identity/`: `Head` `Exists=true` + `GetRange` → `ErrNotFound` → `ResolveRemote` вернул stale-identity, `Decide` дал `ActionSkip`. Поведение уже зафиксировано контрактным тестом `internal/identity/resolve_test.go:100` (`TestResolveRemoteRangeNotFoundKeepsHead`) — правка потребует пересмотра этого контракта, а не только кода.
+**Проверка:** ❌ не воспроизводится после перестановки порядка вызовов: `GetRange 0-127` идёт первым, и `ErrNotFound` от него авторитетен — `ResolveRemote` сразу возвращает `Exists=false`, не подмешивая identity из `Head`. Контракт закреплён `TestResolveRemoteMissingObjectSkipsHead` и `TestResolveRemoteMissingObject` (`internal/identity/resolve_test.go`).
 
-**Где:** `internal/identity/resolve.go:32-38`, `internal/identity/decide.go:21-31`, `internal/service/archive.go:247-253`.
-**Механика:** объект удалён между `Head` и `GetRange`; `GetRange → ErrNotFound` возвращает meta с `Exists=true` и старой identity. `Decide → Skip`; с `--delete-if-exists` источник удаляется, хотя на бэкенде объекта уже нет.
+**Где:** `internal/identity/resolve.go` (`ResolveRemote`), `internal/identity/decide.go:21-31`, `internal/service/archive.go:247-253`.
+**Механика (историческая):** объект удалён между `Head` и `GetRange`; `GetRange → ErrNotFound` возвращал meta с `Exists=true` и старой identity → `Decide → Skip`. Identity теперь читается заголовком первым, поэтому такой пары вызовов больше нет.
 
 ### D16 — `keying.FromRequestPath` схлопывает `..`
 

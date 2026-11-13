@@ -217,6 +217,8 @@ func (i *Identity) RotateSecret(ctx context.Context, accessKeyID string) (string
 		return "", ErrUserNotFound
 	}
 
+	i.cache.delete(accessKeyID)
+
 	return secret, nil
 }
 
@@ -234,6 +236,8 @@ func (i *Identity) SetEnabled(ctx context.Context, accessKeyID string, enabled b
 	if tag.RowsAffected() == 0 {
 		return ErrUserNotFound
 	}
+
+	i.cache.delete(accessKeyID)
 
 	return nil
 }
@@ -337,6 +341,8 @@ func (i *Identity) UpdateUser(ctx context.Context, accessKeyID string, p UpdateP
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, fmt.Errorf("postgres auth: commit update user: %w", err)
 	}
+
+	i.cache.delete(accessKeyID)
 
 	return u, nil
 }

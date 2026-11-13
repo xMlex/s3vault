@@ -155,7 +155,7 @@ func TestFetchStatReadsNoBody(t *testing.T) {
 	assert.Empty(t, got.Path, "a HEAD has nothing to open")
 
 	bytesRead, _, heads, gets, ranges := store.counts()
-	assert.Equal(t, 1, heads)
+	assert.Zero(t, heads, "a container identity is answered by the header range alone")
 	assert.Equal(t, 0, gets, "HEAD must not download the body")
 	assert.Equal(t, 1, ranges, "identity comes from the 128-byte header range")
 	assert.LessOrEqual(t, bytesRead, int64(container.HeaderSize))

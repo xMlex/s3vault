@@ -87,6 +87,7 @@ server:
   #   dsn: ""                      # postgres://user@host:5432/db?sslmode=disable
   #   max_conns: 8
   #   query_timeout: 2s
+  #   cache_ttl: 1s                # сколько запросов живёт закэшированный principal; 0 = выключить
   #   # Пул ObjectStore для пользовательских s3_target (только postgres).
   #   # Цель задаётся в БД через `s3vault target add/update --profile`, не здесь;
   #   # файл цели может содержать sse_kms и storage_class.
